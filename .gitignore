@@ -1,0 +1,59 @@
+# Unreal Engine
+
+# Build artifacts
+Binaries/
+Intermediate/
+DerivedDataCache/
+Build/
+
+# Plugin build artifacts
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+
+# Editor/runtime generated
+Saved/
+
+# Visual Studio
+.vs/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+
+# Compiled objects
+*.o
+*.obj
+*.lo
+*.slo
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lai
+*.so
+*.dylib
+*.dll
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Built map data
+*_BuiltData.uasset
+
+# Bundled third-party plugins (restore separately)
+Plugins/RealtimeMeshComponent/
+
+# OS files
+.DS_Store
+Thumbs.db

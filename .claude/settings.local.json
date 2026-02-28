@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "WebFetch(domain:dev.epicgames.com)",
+      "Bash(grep:*)",
+      "WebSearch",
+      "Bash(ls:*)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}
