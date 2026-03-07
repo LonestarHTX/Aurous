@@ -42,6 +42,14 @@ enum class EPlatePersistencePolicy : uint8
 	Retirable
 };
 
+UENUM()
+enum class EContinentalStabilizerMode : uint8
+{
+	Legacy,
+	Incremental,
+	Shadow
+};
+
 // One sample point on the canonical sphere.
 struct FCanonicalSample
 {
@@ -123,6 +131,7 @@ struct FContainmentQueryResult
 
 struct FReconcilePhaseTimings
 {
+	double SampleBufferCopyMs = 0.0;
 	double Phase1BuildSpatialMs = 0.0;
 	double Phase1SoupExtractTotalMs = 0.0;
 	double Phase1SoupExtractMaxMs = 0.0;
@@ -145,8 +154,26 @@ struct FReconcilePhaseTimings
 	double Phase7TerraneMs = 0.0;
 	double Phase8CollisionMs = 0.0;
 	double Phase8PostCollisionRefreshMs = 0.0;
+	double ContinentalStabilizerMs = 0.0;
+	double StabilizerPromoteToMinimumMs = 0.0;
+	double StabilizerBuildComponentsMs = 0.0;
+	double StabilizerComponentPruneMs = 0.0;
+	double StabilizerPromoteToTargetMs = 0.0;
+	double StabilizerTrimMs = 0.0;
+	double PrevPlateWritebackMs = 0.0;
 	double Phase9SubductionMs = 0.0;
+	double PhaseSumMs = 0.0;
+	double UnaccountedMs = 0.0;
+	double UnaccountedPct = 0.0;
 	double TotalMs = 0.0;
+	int32 StabilizerPromotionCount = 0;
+	int32 StabilizerComponentDemotionCount = 0;
+	int32 StabilizerTrimDemotionCount = 0;
+	int32 StabilizerHeapPushCount = 0;
+	int32 StabilizerHeapStalePopCount = 0;
+	bool bContinentalStabilizerShadowMatched = true;
+	int32 ContinentalStabilizerShadowMismatchSampleIndex = INDEX_NONE;
+	FString ContinentalStabilizerShadowMismatchField;
 	int32 GapSamples = 0;
 	int32 ArtifactGapResolvedSamples = 0;
 	int32 DivergentGapSamples = 0;
@@ -259,6 +286,8 @@ public:
 	float GetBoundaryConfidenceThreshold() const { return BoundaryConfidenceThreshold; }
 	void SetBoundaryConfidenceThreshold(float InValue) { BoundaryConfidenceThreshold = FMath::Max(0.0f, InValue); }
 	int32 GetLastGapSampleCount() const { return LastGapSampleCount; }
+	EContinentalStabilizerMode GetContinentalStabilizerMode() const { return ContinentalStabilizerMode; }
+	void SetContinentalStabilizerMode(const EContinentalStabilizerMode InMode) { ContinentalStabilizerMode = (InMode == EContinentalStabilizerMode::Incremental) ? InMode : EContinentalStabilizerMode::Incremental; }
 	int32 GetLastOverlapSampleCount() const { return LastOverlapSampleCount; }
 	double GetTimestepDurationYears() const { return TimestepDurationYears; }
 	double GetTimestepDurationMy() const { return TimestepDurationMy; }
@@ -323,7 +352,12 @@ private:
 	void UpdateBoundaryAndContinentDiagnosticsForSamples(const TArray<FCanonicalSample>& InSamples);
 	void StabilizeContinentalCrustForSamples(
 		const TArray<FCanonicalSample>& PreviousSamples,
-		TArray<FCanonicalSample>& InOutSamples) const;
+		TArray<FCanonicalSample>& InOutSamples,
+		FReconcilePhaseTimings* InOutTimings = nullptr) const;
+	void StabilizeContinentalCrustForSamplesIncremental(
+		const TArray<FCanonicalSample>& PreviousSamples,
+		TArray<FCanonicalSample>& InOutSamples,
+		FReconcilePhaseTimings* InOutTimings = nullptr) const;
 	bool ResolveGapSamplePhase4(
 		int32 SampleIndex,
 		const TArray<uint8>& GapFlags,
@@ -332,12 +366,13 @@ private:
 	void RunBoundaryLikeLocalOwnershipSanitizePass(
 		const TArray<FPhase2SampleState>& Phase2States,
 		TArray<FCanonicalSample>& InOutSamples,
-		int32 NumIterations) const;
+		int32 NumIterations,
+		const TArray<uint8>* SeedSampleFlags = nullptr) const;
 	// Pre-M5 invariant: non-gap ownership for each plate must remain connected until rifting exists.
-	void EnforceConnectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples) const;
-	bool RescueProtectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples);
-	void RebuildPlateMembershipFromSamples(const TArray<FCanonicalSample>& InSamples);
-	void UpdatePlateCanonicalCentersFromSamples(const TArray<FCanonicalSample>& InSamples);
+	void EnforceConnectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr) const;
+	bool RescueProtectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr);
+	void RebuildPlateMembershipFromSamples(const TArray<FCanonicalSample>& InSamples, const TArray<uint8>* DirtyPlateFlags = nullptr);
+	void UpdatePlateCanonicalCentersFromSamples(const TArray<FCanonicalSample>& InSamples, const TArray<uint8>* DirtyPlateFlags = nullptr);
 	bool IsPlateActive(int32 PlateId) const;
 	bool IsPlateProtected(int32 PlateId) const;
 	int32 GetInitialPlateFloorSamples(int32 TotalSampleCount, int32 PlateCount) const;
@@ -351,10 +386,11 @@ private:
 		int32& OutRepresentativeNeighborIndex,
 		float& OutConvergenceSpeedMmPerYear) const;
 	void DetectTerranesForSamples(TArray<FCanonicalSample>& InOutSamples);
-	bool ApplyContinentalCollisionEventsForSamples(TArray<FCanonicalSample>& InOutSamples);
+	bool ApplyContinentalCollisionEventsForSamples(TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* OutDirtyPlateFlags = nullptr);
 	void RefreshCanonicalStateAfterCollision(
 		const TArray<FPhase2SampleState>& Phase2States,
-		TArray<FCanonicalSample>& InOutSamples);
+		TArray<FCanonicalSample>& InOutSamples,
+		const TArray<uint8>* DirtyPlateFlags = nullptr);
 	void RefreshCanonicalStateAfterCollision(TArray<FCanonicalSample>& InOutSamples);
 	void UpdateSubductionFieldsForSamples(TArray<FCanonicalSample>& InOutSamples);
 	void RefreshSubductionMetricsFromCarriedSamples();
@@ -427,6 +463,7 @@ private:
 	double MinContinentalAreaFraction = 0.25;
 	double MaxContinentalAreaFraction = 0.40;
 	double MinContinentalPlateFraction = 0.15;
+	EContinentalStabilizerMode ContinentalStabilizerMode = EContinentalStabilizerMode::Incremental;
 	FReconcilePhaseTimings LastReconcileTimings;
 
 	static constexpr float OceanicDampeningRateMmPerYear = 0.04f;
@@ -451,3 +488,6 @@ private:
 	friend struct FTectonicPlanetTestAccess;
 #endif
 };
+
+
+

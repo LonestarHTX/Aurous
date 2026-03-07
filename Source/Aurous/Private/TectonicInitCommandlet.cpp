@@ -1,9 +1,11 @@
 #include "TectonicInitCommandlet.h"
 
+#include "CoreGlobals.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/Parse.h"
 #include "ShewchukPredicates.h"
 #include "TectonicPlanet.h"
+#include "TectonicReferenceScenarios.h"
 
 namespace
 {
@@ -23,6 +25,31 @@ namespace
 	{
 		++Summary.WarningCount;
 		UE_LOG(LogTemp, Warning, TEXT("%s"), Message);
+	}
+
+	bool TryParseContinentalStabilizerMode(const FString& Value, EContinentalStabilizerMode& OutMode)
+	{
+		if (Value.Equals(TEXT("Legacy"), ESearchCase::IgnoreCase) ||
+			Value.Equals(TEXT("Incremental"), ESearchCase::IgnoreCase) ||
+			Value.Equals(TEXT("Shadow"), ESearchCase::IgnoreCase))
+		{
+			OutMode = EContinentalStabilizerMode::Incremental;
+			return true;
+		}
+
+		return false;
+	}
+
+	const TCHAR* ContinentalStabilizerModeToString(const EContinentalStabilizerMode Mode)
+	{
+		switch (Mode)
+		{
+		case EContinentalStabilizerMode::Incremental:
+		case EContinentalStabilizerMode::Legacy:
+		case EContinentalStabilizerMode::Shadow:
+		default:
+			return TEXT("Incremental");
+		}
 	}
 }
 
@@ -57,7 +84,106 @@ int32 UTectonicInitCommandlet::Main(const FString& Params)
 
 	const bool bStrict = FParse::Param(*Params, TEXT("Strict"));
 	const double StartSeconds = FPlatformTime::Seconds();
+	const double StartupToMainMs = FMath::Max(0.0, (StartSeconds - GStartTime) * 1000.0);
 
+	FString ScenarioName;
+	FParse::Value(*Params, TEXT("Scenario="), ScenarioName);
+
+	EContinentalStabilizerMode StabilizerMode = EContinentalStabilizerMode::Incremental;
+	FString StabilizerModeValue;
+	if (FParse::Value(*Params, TEXT("StabilizerMode="), StabilizerModeValue) && !TryParseContinentalStabilizerMode(StabilizerModeValue, StabilizerMode))
+	{
+		UE_LOG(LogTemp, Error, TEXT("Unknown stabilizer mode '%s'. Expected Incremental (Legacy and Shadow remain accepted aliases)."), *StabilizerModeValue);
+		return 1;
+	}
+
+	const bool bSeedSweep = FParse::Param(*Params, TEXT("SeedSweep")) || FParse::Param(*Params, TEXT("SweepReferenceSeeds"));
+	const bool bRunReferenceScenario = !ScenarioName.IsEmpty() || bSeedSweep;
+	if (bRunReferenceScenario)
+	{
+		TArray<FReferenceScenarioDefinition> ScenariosToRun;
+		if (!ScenarioName.IsEmpty())
+		{
+			const FReferenceScenarioDefinition* LockedScenario = FindLockedReferenceScenarioByName(ScenarioName);
+			if (!LockedScenario)
+			{
+				UE_LOG(LogTemp, Error, TEXT("Unknown reference scenario '%s'."), *ScenarioName);
+				return 1;
+			}
+
+			ScenariosToRun.Add(*LockedScenario);
+		}
+		else
+		{
+			ScenariosToRun = GetLockedReferenceScenarios();
+		}
+
+		TMap<int32, FTectonicPlanet> BasePlanets;
+		auto GetBasePlanet = [&BasePlanets](const int32 SampleCount) -> FTectonicPlanet&
+		{
+			FTectonicPlanet& BasePlanet = BasePlanets.FindOrAdd(SampleCount);
+			if (BasePlanet.GetNumSamples() != SampleCount)
+			{
+				BasePlanet.Initialize(SampleCount);
+			}
+			return BasePlanet;
+		};
+
+		int32 ExitCode = 0;
+		for (const FReferenceScenarioDefinition& LockedScenario : ScenariosToRun)
+		{
+			FTectonicPlanet& BasePlanet = GetBasePlanet(LockedScenario.SampleCount);
+			if (bSeedSweep)
+			{
+				int32 LockedSeed = INDEX_NONE;
+				FReferenceScenarioObservedMetrics Metrics;
+				if (!TryDiscoverLowestPassingReferenceScenarioSeed(LockedScenario, BasePlanet, LockedSeed, Metrics))
+				{
+					UE_LOG(LogTemp, Error, TEXT("Reference scenario sweep failed for %s: no passing seed in [1, 256]."), LockedScenario.Name);
+					return 1;
+				}
+
+				FReferenceScenarioDefinition SummaryScenario = LockedScenario;
+				SummaryScenario.Seed = LockedSeed;
+				const bool bPass = DoesReferenceScenarioObservedMetricsPass(SummaryScenario, Metrics);
+				UE_LOG(
+					LogTemp,
+					Display,
+					TEXT("%s stabilizer_mode=%s sweep=true"),
+					*FormatReferenceScenarioSummary(SummaryScenario, Metrics, bPass),
+					ContinentalStabilizerModeToString(EContinentalStabilizerMode::Incremental));
+				continue;
+			}
+
+			FReferenceScenarioDefinition Scenario = LockedScenario;
+			int32 OverrideSeed = Scenario.Seed;
+			if (FParse::Value(*Params, TEXT("Seed="), OverrideSeed))
+			{
+				Scenario.Seed = OverrideSeed;
+			}
+			int32 OverrideSteps = Scenario.NumSteps;
+			if (FParse::Value(*Params, TEXT("Steps="), OverrideSteps))
+			{
+				Scenario.NumSteps = OverrideSteps;
+			}
+
+			FReferenceScenarioObservedMetrics Metrics;
+			const bool bCollected = CollectReferenceScenarioObservedMetrics(Scenario, BasePlanet, Metrics, StartupToMainMs, StabilizerMode);
+			const bool bPass = bCollected && DoesReferenceScenarioObservedMetricsPass(Scenario, Metrics);
+			UE_LOG(
+				LogTemp,
+				Display,
+				TEXT("%s stabilizer_mode=%s"),
+				*FormatReferenceScenarioSummary(Scenario, Metrics, bPass),
+				ContinentalStabilizerModeToString(StabilizerMode));
+			if (!bCollected || !bPass)
+			{
+				ExitCode = 1;
+			}
+		}
+
+		return ExitCode;
+	}
 	UE_LOG(LogTemp, Display, TEXT("TectonicInitCommandlet: Initializing planet with %d samples"), NumSamples);
 
 	FTectonicPlanet Planet;

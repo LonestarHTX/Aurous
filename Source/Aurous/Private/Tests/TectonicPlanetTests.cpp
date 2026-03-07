@@ -11,6 +11,7 @@
 #include "TectonicPlanet.h"
 #include "TectonicPlanetOwnershipUtils.h"
 #include "TectonicPlanetActor.h"
+#include "TectonicReferenceScenarios.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -19,93 +20,6 @@ namespace
 	constexpr int32 TestSampleCount = 500000;
 	constexpr int32 TestPlateCount = 7;
 	constexpr int32 TestSeed = 42;
-	constexpr double MaxAcceptableGapFraction = 0.02;
-	constexpr double MaxAcceptableOverlapFraction = 0.12;
-	constexpr double MaxAcceptableBoundaryMeanDepthHops = 1.25;
-	constexpr int32 MaxAcceptableBoundaryMaxDepthHops = 6;
-	constexpr double MaxContinentalFractionIncreaseEpsilon = 1.0e-5;
-
-	struct FReferenceScenarioBounds
-	{
-		int32 ExpectedInitialContinentalPlateCount = 0;
-		double InitialContinentalAreaFractionMin = 0.25;
-		double InitialContinentalAreaFractionMax = 0.40;
-		double MinimumRuntimeContinentalAreaFraction = 0.25;
-		int32 MaximumContinentalComponentCount = 0;
-		int32 MinimumCollisionEventCount = 0;
-		bool bRequireAndeanWhenOceanicContinentalConvergenceExists = true;
-	};
-
-	struct FReferenceScenarioDefinition
-	{
-		const TCHAR* Name = TEXT("Unnamed");
-		int32 SampleCount = TestSampleCount;
-		int32 PlateCount = TestPlateCount;
-		int32 Seed = TestSeed;
-		int32 NumSteps = 60;
-		FReferenceScenarioBounds Bounds;
-	};
-
-	struct FReferenceScenarioObservedMetrics
-	{
-		int32 InitialContinentalPlateCount = 0;
-		double InitialContinentalAreaFraction = 0.0;
-		double MinimumRuntimeContinentalAreaFraction = 1.0;
-		int32 MaximumContinentalComponentCount = 0;
-		int32 FinalCollisionEventCount = 0;
-		bool bObservedOceanicContinentalConvergence = false;
-		bool bObservedAndean = false;
-		int32 ReconcileSteps = 0;
-		int32 InvalidPlateAssignments = 0;
-		int32 InvalidPreviousAssignments = 0;
-		int32 InvalidTimingSnapshots = 0;
-		int32 PositionDriftCount = 0;
-		int32 PingPongTransitions = 0;
-		int32 GapOrphanMismatchCount = 0;
-		double MaxGapFraction = 0.0;
-		double MaxOverlapFraction = 0.0;
-		double MaxBoundaryMeanDepthHops = 0.0;
-		int32 MaxBoundaryMaxDepthHops = 0;
-		int32 MaxNonGapPlateComponentCount = 0;
-		int32 MaxDetachedPlateFragmentSampleCount = 0;
-		int32 MaxLargestDetachedPlateFragmentSize = 0;
-		double MinLargestContinentalShare = 1.0;
-		int32 MinObservedProtectedPlateSampleCount = TNumericLimits<int32>::Max();
-		int32 MaxEmptyProtectedPlateCount = 0;
-		int32 MinExpectedProtectedPlateFloor = 0;
-		double PingPongRate = 0.0;
-		bool bRuntimeContinentalFractionIncreased = false;
-	};
-
-	const TArray<FReferenceScenarioDefinition>& GetLockedReferenceScenarios()
-	{
-		static const TArray<FReferenceScenarioDefinition> Scenarios = {
-			{ TEXT("Smoke7"), 100000, 7, 1, 40, { 2, 0.25, 0.40, 0.25, 6, 0, true } },
-			{ TEXT("Nominal20"), 200000, 20, 1, 60, { 6, 0.25, 0.40, 0.25, 18, 1, true } },
-			{ TEXT("Stress40"), 500000, 40, 1, 60, { 12, 0.25, 0.40, 0.25, 36, 1, true } }
-		};
-		return Scenarios;
-	}
-
-	int32 ComputeExpectedInitialPlateFloorSamples(const int32 TotalSampleCount, const int32 PlateCount)
-	{
-		if (TotalSampleCount <= 0 || PlateCount <= 0)
-		{
-			return 0;
-		}
-
-		return FMath::Max(64, FMath::FloorToInt(0.30 * static_cast<double>(TotalSampleCount) / static_cast<double>(PlateCount)));
-	}
-
-	int32 ComputeExpectedPersistentPlateFloorSamples(const FPlate& Plate)
-	{
-		if (Plate.PersistencePolicy != EPlatePersistencePolicy::Protected)
-		{
-			return 0;
-		}
-
-		return FMath::Max(32, FMath::CeilToInt(0.05 * static_cast<double>(FMath::Max(0, Plate.InitialSampleCount))));
-	}
 
 	struct FCachedPlanetState
 	{
@@ -149,236 +63,6 @@ namespace
 		const double Phi = Random.FRandRange(0.0f, 2.0f * PI);
 		const double RadiusXY = FMath::Sqrt(FMath::Max(0.0, 1.0 - Z * Z));
 		return FVector(RadiusXY * FMath::Cos(Phi), RadiusXY * FMath::Sin(Phi), Z);
-	}
-
-	bool CollectReferenceScenarioObservedMetrics(
-		const FReferenceScenarioDefinition& Scenario,
-		FReferenceScenarioObservedMetrics& OutMetrics)
-	{
-		FTectonicPlanet Planet = MakePlanetCopy(Scenario.SampleCount);
-		Planet.InitializePlates(Scenario.PlateCount, Scenario.Seed);
-
-		const TArray<FPlate>& InitialPlates = Planet.GetPlates();
-		OutMetrics.MinExpectedProtectedPlateFloor = TNumericLimits<int32>::Max();
-		for (const FPlate& Plate : InitialPlates)
-		{
-			if (Plate.PersistencePolicy == EPlatePersistencePolicy::Protected)
-			{
-				OutMetrics.MinExpectedProtectedPlateFloor = FMath::Min(
-					OutMetrics.MinExpectedProtectedPlateFloor,
-					ComputeExpectedPersistentPlateFloorSamples(Plate));
-			}
-		}
-		if (OutMetrics.MinExpectedProtectedPlateFloor == TNumericLimits<int32>::Max())
-		{
-			OutMetrics.MinExpectedProtectedPlateFloor = 0;
-		}
-
-		OutMetrics.InitialContinentalPlateCount = Planet.GetContinentalPlateCount();
-		OutMetrics.InitialContinentalAreaFraction = Planet.GetContinentalAreaFraction();
-		OutMetrics.MinimumRuntimeContinentalAreaFraction = OutMetrics.InitialContinentalAreaFraction;
-
-		const int32 SampleStride = FMath::Max(1, Scenario.SampleCount / 2048);
-		TArray<int32> WatchSampleIndices;
-		for (int32 SampleIndex = 0; SampleIndex < Scenario.SampleCount; SampleIndex += SampleStride)
-		{
-			WatchSampleIndices.Add(SampleIndex);
-		}
-
-		const TArray<FCanonicalSample>& InitialSamples = Planet.GetSamples();
-		TArray<FVector> WatchInitialPositions;
-		TArray<int32> WatchPreviousPlateIds;
-		TArray<int32> WatchCurrentPlateIds;
-		WatchInitialPositions.Reserve(WatchSampleIndices.Num());
-		WatchPreviousPlateIds.Reserve(WatchSampleIndices.Num());
-		WatchCurrentPlateIds.Reserve(WatchSampleIndices.Num());
-		for (const int32 SampleIndex : WatchSampleIndices)
-		{
-			WatchInitialPositions.Add(InitialSamples[SampleIndex].Position);
-			WatchPreviousPlateIds.Add(INDEX_NONE);
-			WatchCurrentPlateIds.Add(InitialSamples[SampleIndex].PlateId);
-		}
-
-		double PreviousContinentalAreaFraction = OutMetrics.InitialContinentalAreaFraction;
-		for (int32 StepIndex = 0; StepIndex < Scenario.NumSteps; ++StepIndex)
-		{
-			Planet.StepSimulation();
-			const TArray<FCanonicalSample>& Samples = Planet.GetSamples();
-
-			for (const FCanonicalSample& Sample : Samples)
-			{
-				if (Sample.PlateId < 0 || Sample.PlateId >= Scenario.PlateCount)
-				{
-					++OutMetrics.InvalidPlateAssignments;
-				}
-
-				if (Sample.PrevPlateId < 0 || Sample.PrevPlateId >= Scenario.PlateCount)
-				{
-					++OutMetrics.InvalidPreviousAssignments;
-				}
-
-				if (Sample.bGapDetected && (Sample.PlateId < 0 || Sample.PlateId >= Scenario.PlateCount))
-				{
-					++OutMetrics.GapOrphanMismatchCount;
-				}
-			}
-
-			for (int32 WatchIndex = 0; WatchIndex < WatchSampleIndices.Num(); ++WatchIndex)
-			{
-				const int32 SampleIndex = WatchSampleIndices[WatchIndex];
-				const FCanonicalSample& Sample = Samples[SampleIndex];
-
-				OutMetrics.PositionDriftCount += Sample.Position.Equals(WatchInitialPositions[WatchIndex], 1e-10) ? 0 : 1;
-
-				if (Planet.WasReconcileTriggeredLastStep())
-				{
-					const int32 CurrentPlateId = Sample.PlateId;
-					const int32 PreviousPlateId = WatchCurrentPlateIds[WatchIndex];
-					const int32 OldPlateId = WatchPreviousPlateIds[WatchIndex];
-					if (OldPlateId != INDEX_NONE && OldPlateId == CurrentPlateId && PreviousPlateId != CurrentPlateId)
-					{
-						++OutMetrics.PingPongTransitions;
-					}
-
-					WatchPreviousPlateIds[WatchIndex] = PreviousPlateId;
-					WatchCurrentPlateIds[WatchIndex] = CurrentPlateId;
-				}
-			}
-
-			if (!Planet.WasReconcileTriggeredLastStep())
-			{
-				continue;
-			}
-
-			++OutMetrics.ReconcileSteps;
-			const FReconcilePhaseTimings& Timings = Planet.GetLastReconcileTimings();
-			const bool bTimingsValid =
-				Timings.Phase1BuildSpatialMs >= 0.0 &&
-				Timings.Phase2OwnershipMs >= 0.0 &&
-				Timings.Phase3InterpolationMs >= 0.0 &&
-				Timings.Phase4GapMs >= 0.0 &&
-				Timings.Phase5OverlapMs >= 0.0 &&
-				Timings.Phase6MembershipMs >= 0.0 &&
-				Timings.Phase6PersistenceMs >= 0.0 &&
-				Timings.Phase7TerraneMs >= 0.0 &&
-				Timings.Phase8CollisionMs >= 0.0 &&
-				Timings.Phase8PostCollisionRefreshMs >= 0.0 &&
-				Timings.Phase9SubductionMs >= 0.0 &&
-				Timings.Phase7SubductionMs >= 0.0 &&
-				Timings.TotalMs > 0.0;
-			OutMetrics.InvalidTimingSnapshots += bTimingsValid ? 0 : 1;
-
-			const double SampleCountDouble = static_cast<double>(FMath::Max(1, Samples.Num()));
-			OutMetrics.MaxGapFraction = FMath::Max(OutMetrics.MaxGapFraction, static_cast<double>(Planet.GetLastGapSampleCount()) / SampleCountDouble);
-			OutMetrics.MaxOverlapFraction = FMath::Max(OutMetrics.MaxOverlapFraction, static_cast<double>(Planet.GetLastOverlapSampleCount()) / SampleCountDouble);
-			OutMetrics.MaxBoundaryMeanDepthHops = FMath::Max(OutMetrics.MaxBoundaryMeanDepthHops, Planet.GetBoundaryMeanDepthHops());
-			OutMetrics.MaxBoundaryMaxDepthHops = FMath::Max(OutMetrics.MaxBoundaryMaxDepthHops, Planet.GetBoundaryMaxDepthHops());
-			OutMetrics.MaxNonGapPlateComponentCount = FMath::Max(OutMetrics.MaxNonGapPlateComponentCount, Planet.GetMaxPlateComponentCount());
-			OutMetrics.MaxDetachedPlateFragmentSampleCount = FMath::Max(OutMetrics.MaxDetachedPlateFragmentSampleCount, Planet.GetDetachedPlateFragmentSampleCount());
-			OutMetrics.MaxLargestDetachedPlateFragmentSize = FMath::Max(OutMetrics.MaxLargestDetachedPlateFragmentSize, Planet.GetLargestDetachedPlateFragmentSize());
-			OutMetrics.MaximumContinentalComponentCount = FMath::Max(OutMetrics.MaximumContinentalComponentCount, Planet.GetContinentalComponentCount());
-			OutMetrics.MinObservedProtectedPlateSampleCount = FMath::Min(OutMetrics.MinObservedProtectedPlateSampleCount, Planet.GetMinProtectedPlateSampleCount());
-			OutMetrics.MaxEmptyProtectedPlateCount = FMath::Max(OutMetrics.MaxEmptyProtectedPlateCount, Planet.GetEmptyProtectedPlateCount());
-			OutMetrics.FinalCollisionEventCount = Planet.GetCollisionEventCount();
-
-			const double CurrentContinentalAreaFraction = Planet.GetContinentalAreaFraction();
-			OutMetrics.MinimumRuntimeContinentalAreaFraction = FMath::Min(OutMetrics.MinimumRuntimeContinentalAreaFraction, CurrentContinentalAreaFraction);
-			OutMetrics.bRuntimeContinentalFractionIncreased |= (CurrentContinentalAreaFraction > PreviousContinentalAreaFraction + MaxContinentalFractionIncreaseEpsilon);
-			PreviousContinentalAreaFraction = CurrentContinentalAreaFraction;
-
-			const int32 ContinentalSampleCount = Planet.GetContinentalSampleCount();
-			if (ContinentalSampleCount > 0)
-			{
-				const double LargestContinentalShare = static_cast<double>(Planet.GetLargestContinentalComponentSize()) / static_cast<double>(ContinentalSampleCount);
-				OutMetrics.MinLargestContinentalShare = FMath::Min(OutMetrics.MinLargestContinentalShare, LargestContinentalShare);
-			}
-
-			bool bObservedContinentalOverridingFront = false;
-			for (const FCanonicalSample& Sample : Samples)
-			{
-				if (Sample.bIsSubductionFront &&
-					Sample.CrustType == ECrustType::Continental &&
-					Sample.SubductionRole == ESubductionRole::Overriding)
-				{
-					bObservedContinentalOverridingFront = true;
-					break;
-				}
-			}
-
-			OutMetrics.bObservedOceanicContinentalConvergence |=
-				bObservedContinentalOverridingFront && (Planet.GetSubductionFrontSampleCount() > 0);
-			OutMetrics.bObservedAndean |= (Planet.GetAndeanSampleCount() > 0);
-		}
-
-		const double WatchCount = static_cast<double>(FMath::Max(1, WatchSampleIndices.Num() * FMath::Max(1, OutMetrics.ReconcileSteps)));
-		OutMetrics.PingPongRate = static_cast<double>(OutMetrics.PingPongTransitions) / WatchCount;
-		if (OutMetrics.MinObservedProtectedPlateSampleCount == TNumericLimits<int32>::Max())
-		{
-			OutMetrics.MinObservedProtectedPlateSampleCount = 0;
-		}
-
-		return true;
-	}
-
-	bool DoesReferenceScenarioObservedMetricsPass(
-		const FReferenceScenarioDefinition& Scenario,
-		const FReferenceScenarioObservedMetrics& Metrics)
-	{
-		const FReferenceScenarioBounds& Bounds = Scenario.Bounds;
-		const bool bBaseInvariantsPass =
-			Metrics.ReconcileSteps >= 10 &&
-			Metrics.InvalidPlateAssignments == 0 &&
-			Metrics.InvalidPreviousAssignments == 0 &&
-			Metrics.InvalidTimingSnapshots == 0 &&
-			Metrics.PositionDriftCount == 0 &&
-			Metrics.GapOrphanMismatchCount == 0 &&
-			Metrics.PingPongRate <= 0.10 &&
-			Metrics.MaxGapFraction <= MaxAcceptableGapFraction &&
-			Metrics.MaxOverlapFraction <= MaxAcceptableOverlapFraction &&
-			Metrics.MaxBoundaryMeanDepthHops <= MaxAcceptableBoundaryMeanDepthHops &&
-			Metrics.MaxBoundaryMaxDepthHops <= MaxAcceptableBoundaryMaxDepthHops &&
-			Metrics.MaxNonGapPlateComponentCount == 1 &&
-			Metrics.MaxDetachedPlateFragmentSampleCount == 0 &&
-			Metrics.MaxLargestDetachedPlateFragmentSize == 0 &&
-			Metrics.MaxEmptyProtectedPlateCount == 0 &&
-			Metrics.MinObservedProtectedPlateSampleCount >= Metrics.MinExpectedProtectedPlateFloor;
-
-		const bool bStructuralGeologyPass =
-			Metrics.InitialContinentalPlateCount == Bounds.ExpectedInitialContinentalPlateCount &&
-			Metrics.InitialContinentalAreaFraction + UE_DOUBLE_SMALL_NUMBER >= Bounds.InitialContinentalAreaFractionMin &&
-			Metrics.InitialContinentalAreaFraction - UE_DOUBLE_SMALL_NUMBER <= Bounds.InitialContinentalAreaFractionMax &&
-			!Metrics.bRuntimeContinentalFractionIncreased &&
-			Metrics.MinimumRuntimeContinentalAreaFraction + UE_DOUBLE_SMALL_NUMBER >= Bounds.MinimumRuntimeContinentalAreaFraction &&
-			Metrics.MaximumContinentalComponentCount <= Bounds.MaximumContinentalComponentCount &&
-			Metrics.FinalCollisionEventCount >= Bounds.MinimumCollisionEventCount &&
-			(!Bounds.bRequireAndeanWhenOceanicContinentalConvergenceExists ||
-				!Metrics.bObservedOceanicContinentalConvergence ||
-				Metrics.bObservedAndean);
-
-		return bBaseInvariantsPass && bStructuralGeologyPass;
-	}
-
-	bool TryDiscoverLowestPassingReferenceScenarioSeed(
-		const FReferenceScenarioDefinition& ScenarioTemplate,
-		int32& OutSeed,
-		FReferenceScenarioObservedMetrics& OutMetrics)
-	{
-		for (int32 CandidateSeed = 1; CandidateSeed <= 256; ++CandidateSeed)
-		{
-			FReferenceScenarioDefinition CandidateScenario = ScenarioTemplate;
-			CandidateScenario.Seed = CandidateSeed;
-
-			FReferenceScenarioObservedMetrics CandidateMetrics;
-			CollectReferenceScenarioObservedMetrics(CandidateScenario, CandidateMetrics);
-			if (DoesReferenceScenarioObservedMetricsPass(CandidateScenario, CandidateMetrics))
-			{
-				OutSeed = CandidateSeed;
-				OutMetrics = CandidateMetrics;
-				return true;
-			}
-		}
-
-		return false;
 	}
 
 	void LinkBidirectional(TArray<TArray<int32>>& Adjacency, const int32 A, const int32 B)
@@ -504,6 +188,20 @@ namespace
 			Planet.InitialMeanPlateAreaKm2 = InInitialMeanPlateAreaKm2;
 		}
 
+		static void SetInitialContinentalPlateCount(FTectonicPlanet& Planet, const int32 InCount)
+		{
+			Planet.InitialContinentalPlateCount = InCount;
+		}
+
+		static void StabilizeContinentalIncremental(
+			FTectonicPlanet& Planet,
+			const TArray<FCanonicalSample>& PreviousSamples,
+			TArray<FCanonicalSample>& InOutSamples,
+			FReconcilePhaseTimings* InOutTimings = nullptr)
+		{
+			Planet.StabilizeContinentalCrustForSamplesIncremental(PreviousSamples, InOutSamples, InOutTimings);
+		}
+
 		static int32 GetTerraneMergedIntoId(const FTectonicPlanet& Planet, const int32 TerraneId)
 		{
 			for (const auto& Record : Planet.TerraneRecords)
@@ -528,6 +226,247 @@ namespace
 			return INDEX_NONE;
 		}
 	};
+
+namespace
+{
+	struct FStabilizerFixtureState
+	{
+		FTectonicPlanet Planet;
+		TArray<FCanonicalSample> PreviousSamples;
+		TArray<FCanonicalSample> CurrentSamples;
+	};
+
+	FVector MakeStabilizerFixturePosition(const int32 SampleIndex, const int32 NumSamples)
+	{
+		const double SampleCount = static_cast<double>(FMath::Max(1, NumSamples));
+		const double AngleRadians = (2.0 * PI * static_cast<double>(SampleIndex)) / SampleCount;
+		const double Z = 0.10 * static_cast<double>((SampleIndex % 3) - 1);
+		return FVector(FMath::Cos(AngleRadians), FMath::Sin(AngleRadians), Z).GetSafeNormal();
+	}
+
+	void InitializeStabilizerFixtureSample(
+		FCanonicalSample& Sample,
+		const int32 SampleIndex,
+		const int32 NumSamples,
+		const ECrustType CrustType,
+		const float Elevation,
+		const float Thickness,
+		const float Age,
+		const bool bGapDetected = false,
+		const int32 PlateId = 0)
+	{
+		Sample = FCanonicalSample{};
+		Sample.Position = MakeStabilizerFixturePosition(SampleIndex, NumSamples);
+		Sample.PlateId = PlateId;
+		Sample.PrevPlateId = PlateId;
+		Sample.CrustType = CrustType;
+		Sample.Elevation = Elevation;
+		Sample.Thickness = Thickness;
+		Sample.Age = Age;
+		Sample.RidgeDirection = FVector(1.0, 0.05 * static_cast<double>(SampleIndex + 1), 0.0).GetSafeNormal();
+		Sample.FoldDirection = FVector(0.0, 1.0, 0.05 * static_cast<double>(SampleIndex + 1)).GetSafeNormal();
+		Sample.OrogenyType = (CrustType == ECrustType::Continental) ? EOrogenyType::Andean : EOrogenyType::None;
+		Sample.OrogenyAge = (CrustType == ECrustType::Continental) ? (Age * 0.25f) : 0.0f;
+		Sample.TerraneId = (CrustType == ECrustType::Continental) ? (100 + SampleIndex) : INDEX_NONE;
+		Sample.CollisionDistanceKm = (CrustType == ECrustType::Continental) ? (25.0f + static_cast<float>(SampleIndex)) : -1.0f;
+		Sample.CollisionConvergenceSpeedMmPerYear = (CrustType == ECrustType::Continental) ? (10.0f + static_cast<float>(SampleIndex)) : 0.0f;
+		Sample.bIsCollisionFront = (CrustType == ECrustType::Continental);
+		Sample.bGapDetected = bGapDetected;
+	}
+
+	void InitializeStabilizerFixture(FStabilizerFixtureState& Fixture, const int32 NumSamples, const int32 NumPlates = 1)
+	{
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Fixture.Planet);
+		TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Fixture.Planet);
+
+		Fixture.PreviousSamples.SetNum(NumSamples);
+		Fixture.CurrentSamples.SetNum(NumSamples);
+		Adjacency.SetNum(NumSamples);
+		Plates.SetNum(NumPlates);
+
+		for (int32 PlateIndex = 0; PlateIndex < NumPlates; ++PlateIndex)
+		{
+			InitializeFixturePlate(Plates[PlateIndex], PlateIndex, FVector::UpVector);
+		}
+
+		for (int32 SampleIndex = 0; SampleIndex < NumSamples; ++SampleIndex)
+		{
+			InitializeStabilizerFixtureSample(
+				Fixture.PreviousSamples[SampleIndex],
+				SampleIndex,
+				NumSamples,
+				ECrustType::Oceanic,
+				-5.0f - 0.1f * static_cast<float>(SampleIndex),
+				7.0f + 0.1f * static_cast<float>(SampleIndex),
+				40.0f + static_cast<float>(SampleIndex));
+			InitializeStabilizerFixtureSample(
+				Fixture.CurrentSamples[SampleIndex],
+				SampleIndex,
+				NumSamples,
+				ECrustType::Oceanic,
+				-6.0f - 0.1f * static_cast<float>(SampleIndex),
+				8.0f + 0.1f * static_cast<float>(SampleIndex),
+				2.0f + static_cast<float>(SampleIndex));
+		}
+
+		Fixture.Planet.SetMinContinentalAreaFraction(0.0);
+		FTectonicPlanetTestAccess::SetInitialContinentalPlateCount(Fixture.Planet, 0);
+	}
+
+	int32 CountContinentalSamples(const TArray<FCanonicalSample>& Samples)
+	{
+		int32 Count = 0;
+		for (const FCanonicalSample& Sample : Samples)
+		{
+			Count += (Sample.CrustType == ECrustType::Continental) ? 1 : 0;
+		}
+		return Count;
+	}
+
+	void TestOceanicTemplateMatch(
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const FCanonicalSample& Actual,
+		const FCanonicalSample& ExpectedTemplate)
+	{
+		Test.TestEqual(FString::Printf(TEXT("Crust is oceanic [%s]"), *Label), Actual.CrustType, ECrustType::Oceanic);
+		Test.TestTrue(FString::Printf(TEXT("Elevation matches template [%s]"), *Label), FMath::IsNearlyEqual(Actual.Elevation, ExpectedTemplate.Elevation, KINDA_SMALL_NUMBER));
+		Test.TestTrue(FString::Printf(TEXT("Thickness matches template [%s]"), *Label), FMath::IsNearlyEqual(Actual.Thickness, ExpectedTemplate.Thickness, KINDA_SMALL_NUMBER));
+		Test.TestTrue(FString::Printf(TEXT("Age matches template [%s]"), *Label), FMath::IsNearlyEqual(Actual.Age, ExpectedTemplate.Age, KINDA_SMALL_NUMBER));
+		Test.TestTrue(FString::Printf(TEXT("RidgeDirection matches template [%s]"), *Label), Actual.RidgeDirection.Equals(ExpectedTemplate.RidgeDirection, 1.0e-6));
+		Test.TestTrue(FString::Printf(TEXT("FoldDirection matches template [%s]"), *Label), Actual.FoldDirection.Equals(ExpectedTemplate.FoldDirection, 1.0e-6));
+		Test.TestEqual(FString::Printf(TEXT("Orogeny clears on demotion [%s]"), *Label), Actual.OrogenyType, EOrogenyType::None);
+		Test.TestTrue(FString::Printf(TEXT("OrogenyAge clears on demotion [%s]"), *Label), FMath::IsNearlyEqual(Actual.OrogenyAge, 0.0f, KINDA_SMALL_NUMBER));
+		Test.TestEqual(FString::Printf(TEXT("Terrane clears on demotion [%s]"), *Label), Actual.TerraneId, INDEX_NONE);
+	}
+
+	void RunStabilizerFixture(
+		FStabilizerFixtureState& Fixture,
+		TArray<FCanonicalSample>* OutSamples = nullptr,
+		FReconcilePhaseTimings* OutTimings = nullptr)
+	{
+		TArray<FCanonicalSample> IncrementalSamples = Fixture.CurrentSamples;
+		FReconcilePhaseTimings IncrementalTimings;
+		FTectonicPlanetTestAccess::StabilizeContinentalIncremental(Fixture.Planet, Fixture.PreviousSamples, IncrementalSamples, &IncrementalTimings);
+		if (OutSamples)
+		{
+			*OutSamples = IncrementalSamples;
+		}
+		if (OutTimings)
+		{
+			*OutTimings = IncrementalTimings;
+		}
+	}
+
+	FStabilizerFixtureState MakePromotionTieBreakFixture(const bool bEqualPreviousNeighborCounts)
+	{
+		FStabilizerFixtureState Fixture;
+		InitializeStabilizerFixture(Fixture, 4);
+		Fixture.Planet.SetMinContinentalAreaFraction(0.5);
+
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Fixture.Planet);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[0], 0, 4, ECrustType::Continental, 1.0f, 35.0f, 10.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[0], 0, 4, ECrustType::Continental, 1.5f, 36.0f, 11.0f);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[1], 1, 4, ECrustType::Continental, 2.0f, 38.0f, 20.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[1], 1, 4, ECrustType::Oceanic, -4.0f, 7.2f, 60.0f);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[2], 2, 4, ECrustType::Continental, 3.0f, 39.0f, 30.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[2], 2, 4, ECrustType::Oceanic, -4.5f, 7.4f, 70.0f);
+		InitializeStabilizerFixtureSample(
+			Fixture.PreviousSamples[3],
+			3,
+			4,
+			bEqualPreviousNeighborCounts ? ECrustType::Oceanic : ECrustType::Continental,
+			4.0f,
+			40.0f,
+			40.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[3], 3, 4, ECrustType::Oceanic, -4.8f, 7.8f, 80.0f);
+
+		LinkBidirectional(Adjacency, 0, 1);
+		LinkBidirectional(Adjacency, 0, 2);
+		if (!bEqualPreviousNeighborCounts)
+		{
+			LinkBidirectional(Adjacency, 1, 3);
+		}
+		return Fixture;
+	}
+
+	FStabilizerFixtureState MakeZeroCurrentFallbackFixture()
+	{
+		FStabilizerFixtureState Fixture;
+		InitializeStabilizerFixture(Fixture, 4);
+		Fixture.Planet.SetMinContinentalAreaFraction(0.25);
+
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Fixture.Planet);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[1], 1, 4, ECrustType::Continental, 2.5f, 37.0f, 12.0f);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[2], 2, 4, ECrustType::Continental, 3.5f, 38.0f, 22.0f);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[3], 3, 4, ECrustType::Continental, 4.5f, 39.0f, 32.0f);
+		LinkBidirectional(Adjacency, 1, 2);
+		LinkBidirectional(Adjacency, 2, 3);
+		return Fixture;
+	}
+
+	FStabilizerFixtureState MakeGapPromotionFixture()
+	{
+		FStabilizerFixtureState Fixture;
+		InitializeStabilizerFixture(Fixture, 4);
+		Fixture.Planet.SetMinContinentalAreaFraction(0.5);
+
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Fixture.Planet);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[0], 0, 4, ECrustType::Oceanic, -5.0f, 7.0f, 1.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[0], 0, 4, ECrustType::Continental, 9.0f, 42.0f, 50.0f, true);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[1], 1, 4, ECrustType::Continental, 2.0f, 36.0f, 11.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[1], 1, 4, ECrustType::Oceanic, -4.0f, 7.1f, 61.0f);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[2], 2, 4, ECrustType::Continental, 3.0f, 37.0f, 21.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[2], 2, 4, ECrustType::Oceanic, -4.2f, 7.2f, 62.0f);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[3], 3, 4, ECrustType::Continental, 4.0f, 38.0f, 31.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[3], 3, 4, ECrustType::Oceanic, -4.4f, 7.3f, 63.0f);
+
+		LinkBidirectional(Adjacency, 0, 1);
+		LinkBidirectional(Adjacency, 2, 3);
+		return Fixture;
+	}
+
+	FStabilizerFixtureState MakeComponentPruneOrderFixture()
+	{
+		FStabilizerFixtureState Fixture;
+		InitializeStabilizerFixture(Fixture, 8);
+		Fixture.Planet.SetMinContinentalAreaFraction(0.0);
+		FTectonicPlanetTestAccess::SetInitialContinentalPlateCount(Fixture.Planet, 1);
+
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Fixture.Planet);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[0], 0, 8, ECrustType::Continental, 10.0f, 35.0f, 5.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[2], 2, 8, ECrustType::Continental, 12.0f, 37.0f, 7.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[4], 4, 8, ECrustType::Continental, 14.0f, 39.0f, 9.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[6], 6, 8, ECrustType::Continental, 16.0f, 41.0f, 11.0f);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[2], 2, 8, ECrustType::Continental, 22.0f, 47.0f, 17.0f);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[4], 4, 8, ECrustType::Continental, 24.0f, 49.0f, 19.0f);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[6], 6, 8, ECrustType::Continental, 26.0f, 51.0f, 21.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[1], 1, 8, ECrustType::Oceanic, -8.0f, 6.2f, 81.0f);
+
+		LinkBidirectional(Adjacency, 0, 1);
+		LinkBidirectional(Adjacency, 2, 3);
+		LinkBidirectional(Adjacency, 4, 5);
+		LinkBidirectional(Adjacency, 6, 7);
+		return Fixture;
+	}
+
+	FStabilizerFixtureState MakePreviousOceanicDemotionFixture()
+	{
+		FStabilizerFixtureState Fixture;
+		InitializeStabilizerFixture(Fixture, 4);
+		Fixture.Planet.SetMinContinentalAreaFraction(0.0);
+
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Fixture.Planet);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[0], 0, 4, ECrustType::Oceanic, -9.0f, 6.0f, 77.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[0], 0, 4, ECrustType::Continental, 5.0f, 32.0f, 17.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[1], 1, 4, ECrustType::Oceanic, -2.0f, 7.0f, 88.0f);
+		InitializeStabilizerFixtureSample(Fixture.PreviousSamples[2], 2, 4, ECrustType::Continental, 6.0f, 33.0f, 27.0f);
+		InitializeStabilizerFixtureSample(Fixture.CurrentSamples[2], 2, 4, ECrustType::Continental, 7.0f, 34.0f, 28.0f);
+		LinkBidirectional(Adjacency, 0, 1);
+		LinkBidirectional(Adjacency, 2, 3);
+		return Fixture;
+	}
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFibonacciSphereTest, "Aurous.TectonicPlanet.FibonacciSphere",
 	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
@@ -3182,6 +3121,24 @@ bool FActorConstructionTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FContinentalStabilizerPromotionTieBreakFixtureTest, "Aurous.TectonicPlanet.ContinentalStabilizerPromotionTieBreakFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FContinentalStabilizerZeroCurrentFallbackFixtureTest, "Aurous.TectonicPlanet.ContinentalStabilizerZeroCurrentFallbackFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FContinentalStabilizerGapFixtureTest, "Aurous.TectonicPlanet.ContinentalStabilizerGapFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FContinentalStabilizerComponentPruneOrderFixtureTest, "Aurous.TectonicPlanet.ContinentalStabilizerComponentPruneOrderFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FContinentalStabilizerDemotionPrecedenceFixtureTest, "Aurous.TectonicPlanet.ContinentalStabilizerDemotionPrecedenceFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FContinentalStabilizerDirectParityTest, "Aurous.TectonicPlanet.ContinentalStabilizerDirectParity",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FReconcileLongRunTest, "Aurous.TectonicPlanet.ReconcileLongRun",
 	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
 
@@ -3190,6 +3147,119 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FProtectedPlateConnectivityFloorTest, "Aurous.T
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FProtectedPlateRescueFixtureTest, "Aurous.TectonicPlanet.ProtectedPlateRescueFixture",
 	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FContinentalStabilizerPromotionTieBreakFixtureTest::RunTest(const FString& Parameters)
+{
+	{
+		FStabilizerFixtureState Fixture = MakePromotionTieBreakFixture(false);
+		FReconcilePhaseTimings IncrementalTimings;
+		TArray<FCanonicalSample> IncrementalSamples;
+		RunStabilizerFixture(Fixture, &IncrementalSamples, &IncrementalTimings);
+		TestEqual(TEXT("Previous-neighbor tie-break promotes sample 1"), IncrementalSamples[1].CrustType, ECrustType::Continental);
+		TestEqual(TEXT("Previous-neighbor tie-break leaves sample 2 oceanic"), IncrementalSamples[2].CrustType, ECrustType::Oceanic);
+		TestEqual(TEXT("Only one promotion occurs in previous-neighbor tie-break fixture"), IncrementalTimings.StabilizerPromotionCount, 1);
+	}
+
+	{
+		FStabilizerFixtureState Fixture = MakePromotionTieBreakFixture(true);
+		TArray<FCanonicalSample> IncrementalSamples = Fixture.CurrentSamples;
+		FReconcilePhaseTimings IncrementalTimings;
+		FTectonicPlanetTestAccess::StabilizeContinentalIncremental(Fixture.Planet, Fixture.PreviousSamples, IncrementalSamples, &IncrementalTimings);
+		TestEqual(TEXT("Sample-index tie-break promotes lower index sample 1"), IncrementalSamples[1].CrustType, ECrustType::Continental);
+		TestEqual(TEXT("Sample-index tie-break leaves sample 2 oceanic"), IncrementalSamples[2].CrustType, ECrustType::Oceanic);
+		TestEqual(TEXT("Only one promotion occurs in sample-index tie-break fixture"), IncrementalTimings.StabilizerPromotionCount, 1);
+	}
+
+	return true;
+}
+
+bool FContinentalStabilizerZeroCurrentFallbackFixtureTest::RunTest(const FString& Parameters)
+{
+	FStabilizerFixtureState Fixture = MakeZeroCurrentFallbackFixture();
+	FReconcilePhaseTimings IncrementalTimings;
+	TArray<FCanonicalSample> IncrementalSamples;
+	RunStabilizerFixture(Fixture, &IncrementalSamples, &IncrementalTimings);
+	TestEqual(TEXT("Zero-current fallback promotes sample 2"), IncrementalSamples[2].CrustType, ECrustType::Continental);
+	TestEqual(TEXT("Zero-current fallback keeps sample 1 oceanic"), IncrementalSamples[1].CrustType, ECrustType::Oceanic);
+	TestEqual(TEXT("Zero-current fallback keeps sample 3 oceanic"), IncrementalSamples[3].CrustType, ECrustType::Oceanic);
+	TestEqual(TEXT("Zero-current fallback creates exactly one continental sample"), CountContinentalSamples(IncrementalSamples), 1);
+	TestEqual(TEXT("Zero-current fallback uses one promotion"), IncrementalTimings.StabilizerPromotionCount, 1);
+	return true;
+}
+
+bool FContinentalStabilizerGapFixtureTest::RunTest(const FString& Parameters)
+{
+	FStabilizerFixtureState Fixture = MakeGapPromotionFixture();
+	FReconcilePhaseTimings IncrementalTimings;
+	TArray<FCanonicalSample> IncrementalSamples;
+	RunStabilizerFixture(Fixture, &IncrementalSamples, &IncrementalTimings);
+	TestEqual(TEXT("Gap-marked continental still counts toward the floor"), CountContinentalSamples(IncrementalSamples), 2);
+	TestTrue(TEXT("Gap-marked continental sample stays continental and flagged as gap"), IncrementalSamples[0].CrustType == ECrustType::Continental && IncrementalSamples[0].bGapDetected);
+	TestEqual(TEXT("Gap sample does not provide current-neighbor adjacency to sample 1"), IncrementalSamples[1].CrustType, ECrustType::Oceanic);
+	TestEqual(TEXT("Fallback selects sample 2 instead"), IncrementalSamples[2].CrustType, ECrustType::Continental);
+	TestEqual(TEXT("Gap fixture performs exactly one promotion"), IncrementalTimings.StabilizerPromotionCount, 1);
+	return true;
+}
+
+bool FContinentalStabilizerComponentPruneOrderFixtureTest::RunTest(const FString& Parameters)
+{
+	FStabilizerFixtureState Fixture = MakeComponentPruneOrderFixture();
+	FReconcilePhaseTimings IncrementalTimings;
+	TArray<FCanonicalSample> IncrementalSamples;
+	RunStabilizerFixture(Fixture, &IncrementalSamples, &IncrementalTimings);
+	TestEqual(TEXT("Lowest-priority component sample 0 is demoted first"), IncrementalSamples[0].CrustType, ECrustType::Oceanic);
+	TestEqual(TEXT("Later zero-priority component sample 2 remains continental"), IncrementalSamples[2].CrustType, ECrustType::Continental);
+	TestEqual(TEXT("Higher-priority component sample 4 remains continental"), IncrementalSamples[4].CrustType, ECrustType::Continental);
+	TestEqual(TEXT("Higher-priority component sample 6 remains continental"), IncrementalSamples[6].CrustType, ECrustType::Continental);
+	TestEqual(TEXT("Exactly one component member is demoted"), IncrementalTimings.StabilizerComponentDemotionCount, 1);
+	TestOceanicTemplateMatch(*this, TEXT("Component prune preserves previous oceanic template when demoting sample 0"), IncrementalSamples[0], Fixture.PreviousSamples[0]);
+	return true;
+}
+
+bool FContinentalStabilizerDemotionPrecedenceFixtureTest::RunTest(const FString& Parameters)
+{
+	FStabilizerFixtureState Fixture = MakePreviousOceanicDemotionFixture();
+	FReconcilePhaseTimings IncrementalTimings;
+	TArray<FCanonicalSample> IncrementalSamples;
+	RunStabilizerFixture(Fixture, &IncrementalSamples, &IncrementalTimings);
+	TestEqual(TEXT("Target-driven prune demotes sample 0"), IncrementalSamples[0].CrustType, ECrustType::Oceanic);
+	TestEqual(TEXT("Only one component demotion is recorded in precedence fixture"), IncrementalTimings.StabilizerComponentDemotionCount, 1);
+	TestOceanicTemplateMatch(*this, TEXT("Previous oceanic template takes precedence over neighbor donor"), IncrementalSamples[0], Fixture.PreviousSamples[0]);
+	return true;
+}
+
+bool FContinentalStabilizerDirectParityTest::RunTest(const FString& Parameters)
+{
+	TArray<FStabilizerFixtureState> Fixtures;
+	Fixtures.Add(MakePromotionTieBreakFixture(false));
+	Fixtures.Add(MakePromotionTieBreakFixture(true));
+	Fixtures.Add(MakeZeroCurrentFallbackFixture());
+	Fixtures.Add(MakeGapPromotionFixture());
+	Fixtures.Add(MakeComponentPruneOrderFixture());
+	Fixtures.Add(MakePreviousOceanicDemotionFixture());
+
+	const TArray<FString> Labels = {
+		TEXT("PromotionPreviousNeighbor"),
+		TEXT("PromotionSampleIndex"),
+		TEXT("ZeroCurrentFallback"),
+		TEXT("GapBehavior"),
+		TEXT("ComponentPruneOrder"),
+		TEXT("PreviousOceanicDemotion")
+	};
+
+	for (int32 FixtureIndex = 0; FixtureIndex < Fixtures.Num(); ++FixtureIndex)
+	{
+		TArray<FCanonicalSample> IncrementalSamples;
+		FReconcilePhaseTimings IncrementalTimings;
+		RunStabilizerFixture(Fixtures[FixtureIndex], &IncrementalSamples, &IncrementalTimings);
+		TestTrue(FString::Printf(TEXT("Incremental build-components timing is recorded [%s]"), *Labels[FixtureIndex]), IncrementalTimings.StabilizerBuildComponentsMs >= 0.0);
+		TestTrue(FString::Printf(TEXT("Incremental trim timing is recorded [%s]"), *Labels[FixtureIndex]), IncrementalTimings.StabilizerTrimMs >= 0.0);
+		TestTrue(FString::Printf(TEXT("Incremental heap pushes are recorded [%s]"), *Labels[FixtureIndex]), IncrementalTimings.StabilizerHeapPushCount > 0);
+		TestTrue(FString::Printf(TEXT("Incremental stale heap pops are recorded [%s]"), *Labels[FixtureIndex]), IncrementalTimings.StabilizerHeapStalePopCount >= 0);
+		TestTrue(FString::Printf(TEXT("Incremental sample output is produced [%s]"), *Labels[FixtureIndex]), IncrementalSamples.Num() > 0);
+	}
+	return true;
+}
 
 bool FProtectedPlateConnectivityFloorTest::RunTest(const FString& Parameters)
 {
@@ -3363,7 +3433,13 @@ bool FReconcileLongRunTest::RunTest(const FString& Parameters)
 	for (const FReferenceScenarioDefinition& Scenario : GetLockedReferenceScenarios())
 	{
 		FReferenceScenarioObservedMetrics Metrics;
-		CollectReferenceScenarioObservedMetrics(Scenario, Metrics);
+		const bool bCollected = CollectReferenceScenarioObservedMetrics(
+			Scenario,
+			GetCachedPlanet(Scenario.SampleCount),
+			Metrics,
+			0.0,
+			EContinentalStabilizerMode::Incremental);
+		const bool bPass = bCollected && DoesReferenceScenarioObservedMetricsPass(Scenario, Metrics);
 
 		const FString ScenarioLabel = FString::Printf(
 			TEXT("%s (%d samples, %d plates, seed=%d, steps=%d)"),
@@ -3373,37 +3449,13 @@ bool FReconcileLongRunTest::RunTest(const FString& Parameters)
 			Scenario.Seed,
 			Scenario.NumSteps);
 
-		UE_LOG(LogTemp, Log,
-			TEXT("Reference long-run [%s]: Reconciles=%d InitContinentalPlates=%d InitContinentalArea=%.3f%% MinRuntimeContinentalArea=%.3f%% ContinentalIncrease=%s MaxContinentComponents=%d FinalCollisionEvents=%d OceanicContinentalConvergence=%s Andean=%s InvalidPlates=%d InvalidPrev=%d InvalidTiming=%d PositionDrift=%d PingPong=%d (%.3f%%) GapOrphanMismatch=%d MaxGap=%.3f%% MaxOverlap=%.3f%% MaxBoundaryMean=%.3f MaxBoundaryMax=%d MaxPlateComponents=%d DetachedFragments=%d LargestDetachedFragment=%d MinLargestContinentShare=%.3f%% MinProtectedPlateSamples=%d MaxEmptyProtectedPlates=%d MinProtectedFloor=%d"),
-			*ScenarioLabel,
-			Metrics.ReconcileSteps,
-			Metrics.InitialContinentalPlateCount,
-			Metrics.InitialContinentalAreaFraction * 100.0,
-			Metrics.MinimumRuntimeContinentalAreaFraction * 100.0,
-			Metrics.bRuntimeContinentalFractionIncreased ? TEXT("true") : TEXT("false"),
-			Metrics.MaximumContinentalComponentCount,
-			Metrics.FinalCollisionEventCount,
-			Metrics.bObservedOceanicContinentalConvergence ? TEXT("true") : TEXT("false"),
-			Metrics.bObservedAndean ? TEXT("true") : TEXT("false"),
-			Metrics.InvalidPlateAssignments,
-			Metrics.InvalidPreviousAssignments,
-			Metrics.InvalidTimingSnapshots,
-			Metrics.PositionDriftCount,
-			Metrics.PingPongTransitions,
-			Metrics.PingPongRate * 100.0,
-			Metrics.GapOrphanMismatchCount,
-			Metrics.MaxGapFraction * 100.0,
-			Metrics.MaxOverlapFraction * 100.0,
-			Metrics.MaxBoundaryMeanDepthHops,
-			Metrics.MaxBoundaryMaxDepthHops,
-			Metrics.MaxNonGapPlateComponentCount,
-			Metrics.MaxDetachedPlateFragmentSampleCount,
-			Metrics.MaxLargestDetachedPlateFragmentSize,
-			Metrics.MinLargestContinentalShare * 100.0,
-			Metrics.MinObservedProtectedPlateSampleCount,
-			Metrics.MaxEmptyProtectedPlateCount,
-			Metrics.MinExpectedProtectedPlateFloor);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *FormatReferenceScenarioSummary(Scenario, Metrics, bPass));
 
+		TestTrue(FString::Printf(TEXT("Reference metrics collect successfully [%s]"), *ScenarioLabel), bCollected);
+		TestEqual(FString::Printf(TEXT("No stabilizer mismatches are reported [%s]"), *ScenarioLabel), Metrics.StabilizerShadowMismatchCount, 0);
+		TestEqual(FString::Printf(TEXT("Unaccounted reconcile budget stays within 10%% [%s]"), *ScenarioLabel), Metrics.UnaccountedBudgetFailures, 0);
+		TestTrue(FString::Printf(TEXT("Scenario wall time is recorded [%s]"), *ScenarioLabel), Metrics.ScenarioWallMs > 0.0);
+		TestTrue(FString::Printf(TEXT("Average reconcile time is recorded [%s]"), *ScenarioLabel), Metrics.AverageReconcileMs > 0.0);
 		TestTrue(FString::Printf(TEXT("Reconcile triggered repeatedly [%s]"), *ScenarioLabel), Metrics.ReconcileSteps >= 10);
 		TestEqual(FString::Printf(TEXT("No orphan samples during long run [%s]"), *ScenarioLabel), Metrics.InvalidPlateAssignments, 0);
 		TestEqual(FString::Printf(TEXT("PrevPlateId remains valid during long run [%s]"), *ScenarioLabel), Metrics.InvalidPreviousAssignments, 0);
@@ -3440,10 +3492,10 @@ bool FReconcileLongRunTest::RunTest(const FString& Parameters)
 			!Scenario.Bounds.bRequireAndeanWhenOceanicContinentalConvergenceExists ||
 			!Metrics.bObservedOceanicContinentalConvergence ||
 			Metrics.bObservedAndean);
+		TestTrue(FString::Printf(TEXT("Scenario passes consolidated reference checks [%s]"), *ScenarioLabel), bPass);
 	}
 	return true;
 }
-
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActorSimulationThreadTest, "Aurous.TectonicPlanet.ActorSimulationThread",
 	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
 
@@ -3711,4 +3763,11 @@ bool FShewchukPredicatesTest::RunTest(const FString& Parameters)
 }
 
 #endif // WITH_DEV_AUTOMATION_TESTS
+
+
+
+
+
+
+
 
