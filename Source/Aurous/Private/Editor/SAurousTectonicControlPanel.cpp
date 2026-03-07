@@ -3,6 +3,7 @@
 #if WITH_EDITOR
 
 #include "TectonicPlanetActor.h"
+#include "TectonicPlanetOwnershipUtils.h"
 #include "Editor.h"
 #include "Engine/Selection.h"
 #include "HAL/PlatformTime.h"
@@ -31,9 +32,159 @@
 
 namespace
 {
+	constexpr float ExportSubductionInfluenceRadiusKm = 1800.0f;
+	constexpr float ExportSubductionPeakDistanceKm = 350.0f;
+	constexpr float ExportSubductionTrenchRadiusKm = 400.0f;
+	constexpr float ExportCollisionInfluenceRadiusKm = 4200.0f;
+	constexpr float ExportMaxSubductionSpeedMmPerYear = 100.0f;
+
 	FORCEINLINE double Dot3(const FVector3d& A, const FVector3d& B)
 	{
 		return A.X * B.X + A.Y * B.Y + A.Z * B.Z;
+	}
+
+	float SmoothStep01(const float X)
+	{
+		const float Clamped = FMath::Clamp(X, 0.0f, 1.0f);
+		return (3.0f * Clamped * Clamped) - (2.0f * Clamped * Clamped * Clamped);
+	}
+
+	int32 ResolveWeightedDominantValueFromInts(const int32 Values[3], const FVector3d& Barycentric)
+	{
+		struct FValueWeight
+		{
+			int32 Value = INDEX_NONE;
+			double Weight = 0.0;
+		};
+
+		FValueWeight Weights[3];
+		auto Accumulate = [&Weights](const int32 Value, const double Weight)
+		{
+			if (Value == INDEX_NONE)
+			{
+				return;
+			}
+
+			for (FValueWeight& Entry : Weights)
+			{
+				if (Entry.Value == Value)
+				{
+					Entry.Weight += Weight;
+					return;
+				}
+				if (Entry.Value == INDEX_NONE)
+				{
+					Entry.Value = Value;
+					Entry.Weight = Weight;
+					return;
+				}
+			}
+		};
+
+		Accumulate(Values[0], Barycentric.X);
+		Accumulate(Values[1], Barycentric.Y);
+		Accumulate(Values[2], Barycentric.Z);
+
+		int32 BestValue = INDEX_NONE;
+		double BestWeight = -1.0;
+		for (const FValueWeight& Entry : Weights)
+		{
+			if (Entry.Value == INDEX_NONE)
+			{
+				continue;
+			}
+			if (Entry.Weight > BestWeight + UE_DOUBLE_SMALL_NUMBER ||
+				(FMath::IsNearlyEqual(Entry.Weight, BestWeight, UE_DOUBLE_SMALL_NUMBER) &&
+					(BestValue == INDEX_NONE || Entry.Value < BestValue)))
+			{
+				BestValue = Entry.Value;
+				BestWeight = Entry.Weight;
+			}
+		}
+
+		return BestValue;
+	}
+
+	FColor GetSubductionRoleColor(const ESubductionRole Role, const bool bIsFront)
+	{
+		if (bIsFront)
+		{
+			return FColor::White;
+		}
+
+		switch (Role)
+		{
+		case ESubductionRole::Overriding:
+			return FColor(255, 140, 40);
+		case ESubductionRole::Subducting:
+			return FColor(40, 180, 255);
+		case ESubductionRole::None:
+		default:
+			return FColor::Black;
+		}
+	}
+
+	FColor GetOrogenyColor(const EOrogenyType OrogenyType)
+	{
+		switch (OrogenyType)
+		{
+		case EOrogenyType::Andean:
+			return FColor(255, 120, 0);
+		case EOrogenyType::Himalayan:
+			return FColor(255, 0, 200);
+		case EOrogenyType::None:
+		default:
+			return FColor::Black;
+		}
+	}
+
+	float ComputeSubductionInfluenceForExport(const float DistanceKm, const float SpeedMmPerYear)
+	{
+		if (DistanceKm < 0.0f || DistanceKm > ExportSubductionInfluenceRadiusKm)
+		{
+			return 0.0f;
+		}
+
+		float DistanceInfluence = 0.0f;
+		if (DistanceKm <= ExportSubductionPeakDistanceKm)
+		{
+			DistanceInfluence = SmoothStep01(DistanceKm / FMath::Max(KINDA_SMALL_NUMBER, ExportSubductionPeakDistanceKm));
+		}
+		else
+		{
+			const float FalloffAlpha = (DistanceKm - ExportSubductionPeakDistanceKm) /
+				FMath::Max(KINDA_SMALL_NUMBER, ExportSubductionInfluenceRadiusKm - ExportSubductionPeakDistanceKm);
+			DistanceInfluence = 1.0f - SmoothStep01(FalloffAlpha);
+		}
+
+		const float SpeedInfluence = FMath::Clamp(SpeedMmPerYear / FMath::Max(KINDA_SMALL_NUMBER, ExportMaxSubductionSpeedMmPerYear), 0.0f, 1.0f);
+		return DistanceInfluence * SpeedInfluence;
+	}
+
+	float ComputeTrenchInfluenceForExport(const float DistanceKm, const float SpeedMmPerYear)
+	{
+		if (DistanceKm < 0.0f || DistanceKm > ExportSubductionTrenchRadiusKm)
+		{
+			return 0.0f;
+		}
+
+		const float DistanceInfluence = FMath::Square(
+			FMath::Clamp(1.0f - (DistanceKm / FMath::Max(KINDA_SMALL_NUMBER, ExportSubductionTrenchRadiusKm)), 0.0f, 1.0f));
+		const float SpeedInfluence = FMath::Clamp(SpeedMmPerYear / FMath::Max(KINDA_SMALL_NUMBER, ExportMaxSubductionSpeedMmPerYear), 0.0f, 1.0f);
+		return DistanceInfluence * SpeedInfluence;
+	}
+
+	float ComputeCollisionInfluenceForExport(const float DistanceKm, const float SpeedMmPerYear)
+	{
+		if (DistanceKm < 0.0f || DistanceKm > ExportCollisionInfluenceRadiusKm)
+		{
+			return 0.0f;
+		}
+
+		const float RadiusAlpha = FMath::Clamp(DistanceKm / FMath::Max(KINDA_SMALL_NUMBER, ExportCollisionInfluenceRadiusKm), 0.0f, 1.0f);
+		const float DistanceInfluence = FMath::Square(1.0f - (RadiusAlpha * RadiusAlpha));
+		const float SpeedInfluence = FMath::Clamp(SpeedMmPerYear / FMath::Max(KINDA_SMALL_NUMBER, ExportMaxSubductionSpeedMmPerYear), 0.0f, 1.0f);
+		return DistanceInfluence * SpeedInfluence;
 	}
 
 	FVector3d PixelToSphereDirection(const int32 X, const int32 Y, const int32 Width, const int32 Height)
@@ -102,6 +253,11 @@ namespace
 
 		const int32 ColorIndex = PlateId % UE_ARRAY_COUNT(PlateColors);
 		return PlateColors[ColorIndex];
+	}
+
+	FColor GetTerraneDebugColor(const int32 TerraneId)
+	{
+		return GetPlateDebugColor(TerraneId);
 	}
 
 	bool SaveColorPng(const FString& FilePath, const int32 Width, const int32 Height, const TArray<FColor>& Pixels)
@@ -183,6 +339,11 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 	DebugModeOptions.Add(MakeShared<FString>(TEXT("Boundary")));
 	DebugModeOptions.Add(MakeShared<FString>(TEXT("Boundary Type")));
 	DebugModeOptions.Add(MakeShared<FString>(TEXT("Elevation")));
+	DebugModeOptions.Add(MakeShared<FString>(TEXT("Crust Age")));
+	DebugModeOptions.Add(MakeShared<FString>(TEXT("Subduction Role")));
+	DebugModeOptions.Add(MakeShared<FString>(TEXT("Subduction Distance")));
+	DebugModeOptions.Add(MakeShared<FString>(TEXT("Orogeny Type")));
+	DebugModeOptions.Add(MakeShared<FString>(TEXT("Terrane ID")));
 
 	SetSelectedActor(FindActorInEditorSelection());
 
@@ -878,6 +1039,12 @@ FText SAurousTectonicControlPanel::GetMetricsText() const
 	const double BoundaryPct = (Snapshot.SampleCount > 0)
 		? (100.0 * static_cast<double>(Snapshot.BoundarySampleCount) / static_cast<double>(Snapshot.SampleCount))
 		: 0.0;
+	const double BoundaryDeepPct = (Snapshot.BoundarySampleCount > 0)
+		? (100.0 * static_cast<double>(Snapshot.BoundaryDeepSampleCount) / static_cast<double>(Snapshot.BoundarySampleCount))
+		: 0.0;
+	const double LargestContinentalPct = (Snapshot.ContinentalSampleCount > 0)
+		? (100.0 * static_cast<double>(Snapshot.LargestContinentalComponentSize) / static_cast<double>(Snapshot.ContinentalSampleCount))
+		: 0.0;
 
 	FString Metrics;
 	Metrics += FString::Printf(
@@ -899,12 +1066,50 @@ FText SAurousTectonicControlPanel::GetMetricsText() const
 		TEXT("  Samples: %d\n")
 		TEXT("  Triangles: %d\n")
 		TEXT("  Plates: %d\n")
-		TEXT("  Boundary Samples: %d (%.2f%%)\n"),
+		TEXT("  Boundary Samples: %d (%.2f%%)\n")
+		TEXT("  Boundary Mean Depth: %.2f hops\n")
+		TEXT("  Boundary Max Depth: %d hops\n")
+		TEXT("  Deep Boundary Samples (2+ hops): %d (%.2f%% of boundary)\n")
+		TEXT("  Continental Samples: %d\n")
+		TEXT("  Continental Components: %d\n")
+		TEXT("  Largest Continental Component: %d (%.2f%% of continental)\n")
+		TEXT("  Max Non-Gap Plate Components: %d\n")
+		TEXT("  Detached Non-Gap Fragment Samples: %d\n")
+		TEXT("  Largest Detached Non-Gap Fragment: %d\n")
+		TEXT("  Subduction Front Samples: %d\n")
+		TEXT("  Andean Samples: %d\n")
+		TEXT("  Tracked Terranes: %d\n")
+		TEXT("  Active Terranes: %d\n")
+		TEXT("  Merged Terranes: %d\n")
+		TEXT("  Collision Events: %d\n")
+		TEXT("  Himalayan Samples: %d\n")
+		TEXT("  Pending Collision Samples: %d\n")
+		TEXT("  Max Subduction Distance: %.1f km\n"),
 		Snapshot.SampleCount,
 		Snapshot.TriangleCount,
 		Snapshot.PlateCount,
 		Snapshot.BoundarySampleCount,
-		BoundaryPct);
+		BoundaryPct,
+		Snapshot.BoundaryMeanDepthHops,
+		Snapshot.BoundaryMaxDepthHops,
+		Snapshot.BoundaryDeepSampleCount,
+		BoundaryDeepPct,
+		Snapshot.ContinentalSampleCount,
+		Snapshot.ContinentalComponentCount,
+		Snapshot.LargestContinentalComponentSize,
+		LargestContinentalPct,
+		Snapshot.MaxPlateComponentCount,
+		Snapshot.DetachedPlateFragmentSampleCount,
+		Snapshot.LargestDetachedPlateFragmentSize,
+		Snapshot.SubductionFrontSampleCount,
+		Snapshot.AndeanSampleCount,
+		Snapshot.TrackedTerraneCount,
+		Snapshot.ActiveTerraneCount,
+		Snapshot.MergedTerraneCount,
+		Snapshot.CollisionEventCount,
+		Snapshot.HimalayanSampleCount,
+		Snapshot.PendingCollisionSampleCount,
+		Snapshot.MaxSubductionDistanceKm);
 
 	Metrics += TEXT("\nPer-Plate Sample Counts:\n");
 	if (Snapshot.PlateSampleCounts.Num() == 0)
@@ -939,6 +1144,12 @@ FText SAurousTectonicControlPanel::GetMetricsText() const
 	const double FastPathRate = (TotalPhase2Samples > 0)
 		? (100.0 * static_cast<double>(Timings.Phase2FastPathResolvedSamples) / static_cast<double>(TotalPhase2Samples))
 		: 0.0;
+	const double GapPct = (Snapshot.SampleCount > 0)
+		? (100.0 * static_cast<double>(Timings.GapSamples) / static_cast<double>(Snapshot.SampleCount))
+		: 0.0;
+	const double OverlapPct = (Snapshot.SampleCount > 0)
+		? (100.0 * static_cast<double>(Timings.OverlapSamples) / static_cast<double>(Snapshot.SampleCount))
+		: 0.0;
 
 	Metrics += TEXT("\nTiming Breakdown (ms):\n");
 	Metrics += FString::Printf(TEXT("  P1 Build Spatial: %.3f\n"), Timings.Phase1BuildSpatialMs);
@@ -952,10 +1163,13 @@ FText SAurousTectonicControlPanel::GetMetricsText() const
 	Metrics += FString::Printf(TEXT("  P6 Membership: %.3f\n"), Timings.Phase6MembershipMs);
 	Metrics += FString::Printf(TEXT("    Classify Triangles: %.3f\n"), Timings.Phase6ClassifyTrianglesMs);
 	Metrics += FString::Printf(TEXT("    Spatial Rebuild: %.3f\n"), Timings.Phase6SpatialRebuildMs);
-	Metrics += FString::Printf(TEXT("  P7 Terrane Stub: %.3f\n"), Timings.Phase7TerraneMs);
+	Metrics += FString::Printf(TEXT("  P7 Terranes: %.3f\n"), Timings.Phase7TerraneMs);
+	Metrics += FString::Printf(TEXT("  P8 Collision: %.3f\n"), Timings.Phase8CollisionMs);
+	Metrics += FString::Printf(TEXT("  P8b Refresh: %.3f\n"), Timings.Phase8PostCollisionRefreshMs);
+	Metrics += FString::Printf(TEXT("  P9 Subduction: %.3f\n"), Timings.Phase9SubductionMs);
 	Metrics += FString::Printf(TEXT("  Total: %.3f\n"), Timings.TotalMs);
 	Metrics += FString::Printf(TEXT("\nFast Path: %d / %d (%.2f%%)\n"), Timings.Phase2FastPathResolvedSamples, TotalPhase2Samples, FastPathRate);
-	Metrics += FString::Printf(TEXT("Gap Samples: %d | Overlap Samples: %d\n"), Timings.GapSamples, Timings.OverlapSamples);
+	Metrics += FString::Printf(TEXT("Gap Samples: %d (%.2f%%) | Artifact Resolved: %d | Divergent Gaps: %d | Overlap Samples: %d (%.2f%%)\n"), Timings.GapSamples, GapPct, Timings.ArtifactGapResolvedSamples, Timings.DivergentGapSamples, Timings.OverlapSamples, OverlapPct);
 	Metrics += FString::Printf(TEXT("Spatial Dirty/Rebuilt Plates: %d / %d"), Timings.Phase6SpatialDirtyPlateCount, Timings.Phase6SpatialRebuiltPlateCount);
 
 	return FText::FromString(Metrics);
@@ -1071,6 +1285,16 @@ int32 SAurousTectonicControlPanel::DebugModeToIndex(uint8 InDebugModeValue) cons
 		return 3;
 	case EPlanetDebugMode::Elevation:
 		return 4;
+	case EPlanetDebugMode::CrustAge:
+		return 5;
+	case EPlanetDebugMode::SubductionRole:
+		return 6;
+	case EPlanetDebugMode::SubductionDistance:
+		return 7;
+	case EPlanetDebugMode::OrogenyType:
+		return 8;
+	case EPlanetDebugMode::TerraneId:
+		return 9;
 	default:
 		return 0;
 	}
@@ -1090,6 +1314,16 @@ uint8 SAurousTectonicControlPanel::IndexToDebugModeValue(int32 InIndex) const
 		return static_cast<uint8>(EPlanetDebugMode::BoundaryType);
 	case 4:
 		return static_cast<uint8>(EPlanetDebugMode::Elevation);
+	case 5:
+		return static_cast<uint8>(EPlanetDebugMode::CrustAge);
+	case 6:
+		return static_cast<uint8>(EPlanetDebugMode::SubductionRole);
+	case 7:
+		return static_cast<uint8>(EPlanetDebugMode::SubductionDistance);
+	case 8:
+		return static_cast<uint8>(EPlanetDebugMode::OrogenyType);
+	case 9:
+		return static_cast<uint8>(EPlanetDebugMode::TerraneId);
 	default:
 		return static_cast<uint8>(EPlanetDebugMode::PlateId);
 	}
@@ -1297,19 +1531,41 @@ bool SAurousTectonicControlPanel::ExportMapsToDirectory(
 	const double ElevationRange = FMath::Max(MaxElevation - MinElevation, 1e-6);
 
 	const int32 NumPixels = Width * Height;
+	TArray<int32> ResolvedPlateIds;
 	TArray<FColor> PlateIdPixels;
 	TArray<FColor> CrustTypePixels;
+	TArray<FColor> SubductionRolePixels;
+	TArray<FColor> OrogenyTypePixels;
+	TArray<FColor> TerraneIdPixels;
 	TArray<uint16> ElevationPixels;
 	TArray<uint16> OwnershipMarginPixels;
+	TArray<uint16> DistanceToFrontPixels;
+	TArray<uint16> SubductionInfluencePixels;
+	TArray<uint16> TrenchInfluencePixels;
+	TArray<uint16> CollisionInfluencePixels;
 	TArray<uint8> BoundaryMaskPixels;
+	TArray<uint8> SubductionFrontMaskPixels;
+	TArray<uint8> CollisionFrontMaskPixels;
+	TArray<uint8> HimalayanMaskPixels;
 	TArray<uint8> GapMaskPixels;
 	TArray<uint8> OverlapMaskPixels;
 
+	ResolvedPlateIds.SetNumUninitialized(NumPixels);
 	PlateIdPixels.SetNumUninitialized(NumPixels);
 	CrustTypePixels.SetNumUninitialized(NumPixels);
+	SubductionRolePixels.SetNumUninitialized(NumPixels);
+	OrogenyTypePixels.SetNumUninitialized(NumPixels);
+	TerraneIdPixels.SetNumUninitialized(NumPixels);
 	ElevationPixels.SetNumUninitialized(NumPixels);
 	OwnershipMarginPixels.SetNumUninitialized(NumPixels);
-	BoundaryMaskPixels.SetNumUninitialized(NumPixels);
+	DistanceToFrontPixels.SetNumUninitialized(NumPixels);
+	SubductionInfluencePixels.SetNumUninitialized(NumPixels);
+	TrenchInfluencePixels.SetNumUninitialized(NumPixels);
+	CollisionInfluencePixels.SetNumUninitialized(NumPixels);
+	BoundaryMaskPixels.SetNumZeroed(NumPixels);
+	SubductionFrontMaskPixels.SetNumUninitialized(NumPixels);
+	CollisionFrontMaskPixels.SetNumUninitialized(NumPixels);
+	HimalayanMaskPixels.SetNumUninitialized(NumPixels);
 	GapMaskPixels.SetNumUninitialized(NumPixels);
 	OverlapMaskPixels.SetNumUninitialized(NumPixels);
 
@@ -1318,11 +1574,21 @@ bool SAurousTectonicControlPanel::ExportMapsToDirectory(
 		const FExportPixelSample& PixelSample = CachedExportPixelSamples[PixelIndex];
 		if (!PixelSample.bValid || !Triangles.IsValidIndex(PixelSample.TriangleIndex))
 		{
+			ResolvedPlateIds[PixelIndex] = INDEX_NONE;
 			PlateIdPixels[PixelIndex] = FColor::Black;
 			CrustTypePixels[PixelIndex] = FColor::Black;
 			ElevationPixels[PixelIndex] = 0;
 			OwnershipMarginPixels[PixelIndex] = 0;
-			BoundaryMaskPixels[PixelIndex] = 0;
+			SubductionRolePixels[PixelIndex] = FColor::Black;
+			OrogenyTypePixels[PixelIndex] = FColor::Black;
+			TerraneIdPixels[PixelIndex] = FColor::Black;
+			DistanceToFrontPixels[PixelIndex] = 0;
+			SubductionInfluencePixels[PixelIndex] = 0;
+			TrenchInfluencePixels[PixelIndex] = 0;
+			CollisionInfluencePixels[PixelIndex] = 0;
+			SubductionFrontMaskPixels[PixelIndex] = 0;
+			CollisionFrontMaskPixels[PixelIndex] = 0;
+			HimalayanMaskPixels[PixelIndex] = 0;
 			GapMaskPixels[PixelIndex] = 0;
 			OverlapMaskPixels[PixelIndex] = 0;
 			continue;
@@ -1331,11 +1597,21 @@ bool SAurousTectonicControlPanel::ExportMapsToDirectory(
 		const FDelaunayTriangle& Triangle = Triangles[PixelSample.TriangleIndex];
 		if (!Samples.IsValidIndex(Triangle.V[0]) || !Samples.IsValidIndex(Triangle.V[1]) || !Samples.IsValidIndex(Triangle.V[2]))
 		{
+			ResolvedPlateIds[PixelIndex] = INDEX_NONE;
 			PlateIdPixels[PixelIndex] = FColor::Black;
 			CrustTypePixels[PixelIndex] = FColor::Black;
 			ElevationPixels[PixelIndex] = 0;
 			OwnershipMarginPixels[PixelIndex] = 0;
-			BoundaryMaskPixels[PixelIndex] = 0;
+			SubductionRolePixels[PixelIndex] = FColor::Black;
+			OrogenyTypePixels[PixelIndex] = FColor::Black;
+			TerraneIdPixels[PixelIndex] = FColor::Black;
+			DistanceToFrontPixels[PixelIndex] = 0;
+			SubductionInfluencePixels[PixelIndex] = 0;
+			TrenchInfluencePixels[PixelIndex] = 0;
+			CollisionInfluencePixels[PixelIndex] = 0;
+			SubductionFrontMaskPixels[PixelIndex] = 0;
+			CollisionFrontMaskPixels[PixelIndex] = 0;
+			HimalayanMaskPixels[PixelIndex] = 0;
 			GapMaskPixels[PixelIndex] = 0;
 			OverlapMaskPixels[PixelIndex] = 0;
 			continue;
@@ -1348,6 +1624,7 @@ bool SAurousTectonicControlPanel::ExportMapsToDirectory(
 		};
 
 		const FVector Barycentric = PixelSample.Barycentric;
+		const FVector3d BarycentricD(Barycentric.X, Barycentric.Y, Barycentric.Z);
 		const double W0 = Barycentric.X;
 		const double W1 = Barycentric.Y;
 		const double W2 = Barycentric.Z;
@@ -1366,18 +1643,109 @@ bool SAurousTectonicControlPanel::ExportMapsToDirectory(
 		const double MarginNormalized = FMath::Clamp(Margin, 0.0, 1.0);
 		OwnershipMarginPixels[PixelIndex] = static_cast<uint16>(FMath::RoundToInt(MarginNormalized * 65535.0));
 
+		const int32 ResolvedPlateId = TectonicPlanetOwnership::ResolveWeightedPlateOwner(CornerSamples, BarycentricD);
+		ResolvedPlateIds[PixelIndex] = ResolvedPlateId;
+		PlateIdPixels[PixelIndex] = GetPlateDebugColor(ResolvedPlateId);
+
 		const int32 NearestCorner = FMath::Clamp(static_cast<int32>(PixelSample.NearestVertexCorner), 0, 2);
 		const FCanonicalSample& NearestSample = *CornerSamples[NearestCorner];
+		const int32 RoleValues[3] = {
+			static_cast<int32>(CornerSamples[0]->SubductionRole),
+			static_cast<int32>(CornerSamples[1]->SubductionRole),
+			static_cast<int32>(CornerSamples[2]->SubductionRole)
+		};
+		const int32 OrogenyValues[3] = {
+			static_cast<int32>(CornerSamples[0]->OrogenyType),
+			static_cast<int32>(CornerSamples[1]->OrogenyType),
+			static_cast<int32>(CornerSamples[2]->OrogenyType)
+		};
+		const int32 TerraneValues[3] = {
+			CornerSamples[0]->TerraneId,
+			CornerSamples[1]->TerraneId,
+			CornerSamples[2]->TerraneId
+		};
+		const int32 FrontValues[3] = {
+			CornerSamples[0]->bIsSubductionFront ? 1 : 0,
+			CornerSamples[1]->bIsSubductionFront ? 1 : 0,
+			CornerSamples[2]->bIsSubductionFront ? 1 : 0
+		};
+		const int32 CollisionFrontValues[3] = {
+			CornerSamples[0]->bIsCollisionFront ? 1 : 0,
+			CornerSamples[1]->bIsCollisionFront ? 1 : 0,
+			CornerSamples[2]->bIsCollisionFront ? 1 : 0
+		};
+		const ESubductionRole ResolvedRole = static_cast<ESubductionRole>(ResolveWeightedDominantValueFromInts(RoleValues, BarycentricD));
+		const EOrogenyType ResolvedOrogenyType = static_cast<EOrogenyType>(ResolveWeightedDominantValueFromInts(OrogenyValues, BarycentricD));
+		const int32 ResolvedTerraneId = ResolveWeightedDominantValueFromInts(TerraneValues, BarycentricD);
+		const bool bResolvedFront = ResolveWeightedDominantValueFromInts(FrontValues, BarycentricD) > 0;
+		const bool bResolvedCollisionFront = ResolveWeightedDominantValueFromInts(CollisionFrontValues, BarycentricD) > 0;
 
-		PlateIdPixels[PixelIndex] = GetPlateDebugColor(NearestSample.PlateId);
+		double RoleDistance = 0.0;
+		double RoleDistanceWeight = 0.0;
+		double RoleSpeed = 0.0;
+		double RoleSpeedWeight = 0.0;
+		for (int32 CornerIndex = 0; CornerIndex < 3; ++CornerIndex)
+		{
+			const FCanonicalSample& CornerSample = *CornerSamples[CornerIndex];
+			const double CornerWeight = (CornerIndex == 0) ? W0 : ((CornerIndex == 1) ? W1 : W2);
+			if (CornerSample.SubductionRole == ResolvedRole && CornerSample.SubductionDistanceKm >= 0.0f)
+			{
+				RoleDistance += CornerWeight * static_cast<double>(CornerSample.SubductionDistanceKm);
+				RoleDistanceWeight += CornerWeight;
+				RoleSpeed += CornerWeight * static_cast<double>(CornerSample.SubductionConvergenceSpeedMmPerYear);
+				RoleSpeedWeight += CornerWeight;
+			}
+		}
+
+		const double ResolvedDistanceKm = (RoleDistanceWeight > UE_DOUBLE_SMALL_NUMBER) ? (RoleDistance / RoleDistanceWeight) : -1.0;
+		const double ResolvedSpeedMmPerYear = (RoleSpeedWeight > UE_DOUBLE_SMALL_NUMBER) ? (RoleSpeed / RoleSpeedWeight) : 0.0;
+		const double DistanceNormalized = (ResolvedDistanceKm >= 0.0)
+			? FMath::Clamp(ResolvedDistanceKm / static_cast<double>(ExportSubductionInfluenceRadiusKm), 0.0, 1.0)
+			: 0.0;
+
+		double CollisionDistance = 0.0;
+		double CollisionDistanceWeight = 0.0;
+		double CollisionSpeed = 0.0;
+		double CollisionSpeedWeight = 0.0;
+		for (int32 CornerIndex = 0; CornerIndex < 3; ++CornerIndex)
+		{
+			const FCanonicalSample& CornerSample = *CornerSamples[CornerIndex];
+			if (CornerSample.CollisionDistanceKm < 0.0f)
+			{
+				continue;
+			}
+
+			const double CornerWeight = (CornerIndex == 0) ? W0 : ((CornerIndex == 1) ? W1 : W2);
+			CollisionDistance += CornerWeight * static_cast<double>(CornerSample.CollisionDistanceKm);
+			CollisionDistanceWeight += CornerWeight;
+			CollisionSpeed += CornerWeight * static_cast<double>(CornerSample.CollisionConvergenceSpeedMmPerYear);
+			CollisionSpeedWeight += CornerWeight;
+		}
+
+		const double ResolvedCollisionDistanceKm = (CollisionDistanceWeight > UE_DOUBLE_SMALL_NUMBER) ? (CollisionDistance / CollisionDistanceWeight) : -1.0;
+		const double ResolvedCollisionSpeedMmPerYear = (CollisionSpeedWeight > UE_DOUBLE_SMALL_NUMBER) ? (CollisionSpeed / CollisionSpeedWeight) : 0.0;
+
 		CrustTypePixels[PixelIndex] = (NearestSample.CrustType == ECrustType::Continental)
 			? FColor(139, 90, 43)
 			: FColor(0, 105, 148);
-		BoundaryMaskPixels[PixelIndex] = NearestSample.bIsBoundary ? 255 : 0;
-		GapMaskPixels[PixelIndex] = NearestSample.bGapDetected ? 255 : 0;
-		OverlapMaskPixels[PixelIndex] = NearestSample.bOverlapDetected ? 255 : 0;
+		SubductionRolePixels[PixelIndex] = GetSubductionRoleColor(ResolvedRole, bResolvedFront);
+		OrogenyTypePixels[PixelIndex] = GetOrogenyColor(ResolvedOrogenyType);
+		TerraneIdPixels[PixelIndex] = GetTerraneDebugColor(ResolvedTerraneId);
+		DistanceToFrontPixels[PixelIndex] = static_cast<uint16>(FMath::RoundToInt(DistanceNormalized * 65535.0));
+		SubductionInfluencePixels[PixelIndex] = static_cast<uint16>(FMath::RoundToInt(
+			((ResolvedRole == ESubductionRole::Overriding) ? ComputeSubductionInfluenceForExport(static_cast<float>(ResolvedDistanceKm), static_cast<float>(ResolvedSpeedMmPerYear)) : 0.0f) * 65535.0f));
+		TrenchInfluencePixels[PixelIndex] = static_cast<uint16>(FMath::RoundToInt(
+			((ResolvedRole == ESubductionRole::Subducting) ? ComputeTrenchInfluenceForExport(static_cast<float>(ResolvedDistanceKm), static_cast<float>(ResolvedSpeedMmPerYear)) : 0.0f) * 65535.0f));
+		CollisionInfluencePixels[PixelIndex] = static_cast<uint16>(FMath::RoundToInt(
+			ComputeCollisionInfluenceForExport(static_cast<float>(ResolvedCollisionDistanceKm), static_cast<float>(ResolvedCollisionSpeedMmPerYear)) * 65535.0f));
+		SubductionFrontMaskPixels[PixelIndex] = bResolvedFront ? 255 : 0;
+		CollisionFrontMaskPixels[PixelIndex] = bResolvedCollisionFront ? 255 : 0;
+		HimalayanMaskPixels[PixelIndex] = (ResolvedOrogenyType == EOrogenyType::Himalayan) ? 255 : 0;
+		GapMaskPixels[PixelIndex] = (CornerSamples[0]->bGapDetected || CornerSamples[1]->bGapDetected || CornerSamples[2]->bGapDetected) ? 255 : 0;
+		OverlapMaskPixels[PixelIndex] = (CornerSamples[0]->bOverlapDetected || CornerSamples[1]->bOverlapDetected || CornerSamples[2]->bOverlapDetected) ? 255 : 0;
 	}
 
+	TectonicPlanetOwnership::BuildBoundaryMaskFromResolvedPlateIds(ResolvedPlateIds, Width, Height, BoundaryMaskPixels);
 	bool bAllSucceeded = true;
 	const auto SaveChecked = [&bAllSucceeded](const bool bSucceeded, const TCHAR* MapName)
 	{
@@ -1393,6 +1761,16 @@ bool SAurousTectonicControlPanel::ExportMapsToDirectory(
 	SaveChecked(SaveGray8Png(FPaths::Combine(OutputDirectory, TEXT("BoundaryMask.png")), Width, Height, BoundaryMaskPixels), TEXT("BoundaryMask"));
 	SaveChecked(SaveColorPng(FPaths::Combine(OutputDirectory, TEXT("CrustType.png")), Width, Height, CrustTypePixels), TEXT("CrustType"));
 	SaveChecked(SaveGray16Png(FPaths::Combine(OutputDirectory, TEXT("OwnershipMargin.png")), Width, Height, OwnershipMarginPixels), TEXT("OwnershipMargin"));
+	SaveChecked(SaveColorPng(FPaths::Combine(OutputDirectory, TEXT("SubductionRole.png")), Width, Height, SubductionRolePixels), TEXT("SubductionRole"));
+	SaveChecked(SaveGray8Png(FPaths::Combine(OutputDirectory, TEXT("SubductionFrontMask.png")), Width, Height, SubductionFrontMaskPixels), TEXT("SubductionFrontMask"));
+	SaveChecked(SaveGray16Png(FPaths::Combine(OutputDirectory, TEXT("DistanceToFront.png")), Width, Height, DistanceToFrontPixels), TEXT("DistanceToFront"));
+	SaveChecked(SaveGray16Png(FPaths::Combine(OutputDirectory, TEXT("SubductionInfluence.png")), Width, Height, SubductionInfluencePixels), TEXT("SubductionInfluence"));
+	SaveChecked(SaveGray16Png(FPaths::Combine(OutputDirectory, TEXT("TrenchInfluence.png")), Width, Height, TrenchInfluencePixels), TEXT("TrenchInfluence"));
+	SaveChecked(SaveColorPng(FPaths::Combine(OutputDirectory, TEXT("OrogenyType.png")), Width, Height, OrogenyTypePixels), TEXT("OrogenyType"));
+	SaveChecked(SaveColorPng(FPaths::Combine(OutputDirectory, TEXT("TerraneId.png")), Width, Height, TerraneIdPixels), TEXT("TerraneId"));
+	SaveChecked(SaveGray8Png(FPaths::Combine(OutputDirectory, TEXT("CollisionFrontMask.png")), Width, Height, CollisionFrontMaskPixels), TEXT("CollisionFrontMask"));
+	SaveChecked(SaveGray8Png(FPaths::Combine(OutputDirectory, TEXT("HimalayanMask.png")), Width, Height, HimalayanMaskPixels), TEXT("HimalayanMask"));
+	SaveChecked(SaveGray16Png(FPaths::Combine(OutputDirectory, TEXT("CollisionInfluence.png")), Width, Height, CollisionInfluencePixels), TEXT("CollisionInfluence"));
 	SaveChecked(SaveGray8Png(FPaths::Combine(OutputDirectory, TEXT("GapMask.png")), Width, Height, GapMaskPixels), TEXT("GapMask"));
 	SaveChecked(SaveGray8Png(FPaths::Combine(OutputDirectory, TEXT("OverlapMask.png")), Width, Height, OverlapMaskPixels), TEXT("OverlapMask"));
 

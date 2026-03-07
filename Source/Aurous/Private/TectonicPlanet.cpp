@@ -7,6 +7,7 @@
 #include "Math/RandomStream.h"
 #include "PlateTriangleSoupAdapter.h"
 #include "ShewchukPredicates.h"
+#include "TectonicPlanetOwnershipUtils.h"
 
 namespace
 {
@@ -21,6 +22,18 @@ namespace
 			Hash *= 1099511628211ull; // FNV-1a prime
 		}
 		Hash ^= static_cast<uint64>(TriangleIndices.Num());
+		Hash *= 1099511628211ull;
+		return Hash;
+	}
+
+	uint64 HashPlateSoupTriangleLists(const FPlate& Plate)
+	{
+		uint64 Hash = HashTriangleIndexList(Plate.InteriorTriangles);
+		Hash ^= 0x9e3779b97f4a7c15ull;
+		Hash *= 1099511628211ull;
+		Hash ^= HashTriangleIndexList(Plate.BoundaryTriangles);
+		Hash *= 1099511628211ull;
+		Hash ^= static_cast<uint64>(Plate.InteriorTriangles.Num() + Plate.BoundaryTriangles.Num());
 		Hash *= 1099511628211ull;
 		return Hash;
 	}
@@ -143,6 +156,54 @@ namespace
 		return false;
 	}
 
+	FVector3d NormalizeContainmentBarycentric(const FVector3d& RawBarycentric)
+	{
+		FVector3d Barycentric(
+			FMath::Max(0.0, RawBarycentric.X),
+			FMath::Max(0.0, RawBarycentric.Y),
+			FMath::Max(0.0, RawBarycentric.Z));
+		const double BarySum = Barycentric.X + Barycentric.Y + Barycentric.Z;
+		if (BarySum > UE_DOUBLE_SMALL_NUMBER)
+		{
+			Barycentric /= BarySum;
+		}
+		return Barycentric;
+	}
+
+	double ComputeContainmentScore(const FVector3d& Barycentric)
+	{
+		return FMath::Min3(Barycentric.X, Barycentric.Y, Barycentric.Z);
+	}
+
+	bool IsBetterContainmentCandidate(const double CandidateScore, const int32 CandidatePlateId, const double BestScore, const int32 BestPlateId)
+	{
+		if (CandidateScore > BestScore + UE_DOUBLE_SMALL_NUMBER)
+		{
+			return true;
+		}
+
+		if (CandidateScore + UE_DOUBLE_SMALL_NUMBER < BestScore)
+		{
+			return false;
+		}
+
+		if (BestPlateId == INDEX_NONE)
+		{
+			return true;
+		}
+
+		return CandidatePlateId < BestPlateId;
+	}
+
+	bool IsPreferredPlateForTriangle(
+		const TArray<FCanonicalSample>& Samples,
+		const FDelaunayTriangle& Triangle,
+		const int32 CandidatePlateId,
+		const FVector3d& Barycentric)
+	{
+		return TectonicPlanetOwnership::IsPreferredWeightedPlateOwner(Samples, Triangle, CandidatePlateId, Barycentric);
+	}
+
 	FVector MakeRandomUnitVector(FRandomStream& Random)
 	{
 		const double Z = Random.FRandRange(-1.0f, 1.0f);
@@ -151,6 +212,289 @@ namespace
 		const double SinPhi = FMath::Sin(Phi);
 		const double CosPhi = FMath::Cos(Phi);
 		return FVector(RadiusXY * CosPhi, RadiusXY * SinPhi, Z);
+	}
+
+	struct FInfluencePathCandidate
+	{
+		bool bValid = false;
+		float DistanceKm = TNumericLimits<float>::Max();
+		float InfluenceWeight = 0.0f;
+		int32 SecondaryId = INDEX_NONE;
+		int32 FrontSampleIndex = INDEX_NONE;
+	};
+
+	struct FInfluenceSeed
+	{
+		int32 SampleIndex = INDEX_NONE;
+		int32 PlateId = INDEX_NONE;
+		int32 SecondaryId = INDEX_NONE;
+		float InfluenceWeight = 0.0f;
+	};
+
+	struct FInfluenceQueueEntry
+	{
+		int32 SampleIndex = INDEX_NONE;
+		int32 PlateId = INDEX_NONE;
+		int32 SecondaryId = INDEX_NONE;
+		int32 FrontSampleIndex = INDEX_NONE;
+		float DistanceKm = 0.0f;
+		float InfluenceWeight = 0.0f;
+
+		bool operator<(const FInfluenceQueueEntry& Other) const
+		{
+			return DistanceKm > Other.DistanceKm;
+		}
+	};
+
+	float SmoothStep01(const float X)
+	{
+		const float Clamped = FMath::Clamp(X, 0.0f, 1.0f);
+		return (3.0f * Clamped * Clamped) - (2.0f * Clamped * Clamped * Clamped);
+	}
+
+	float ComputeSubductionInfluence(const float DistanceKm, const float PeakDistanceKm, const float RadiusKm)
+	{
+		if (DistanceKm < 0.0f || DistanceKm > RadiusKm)
+		{
+			return 0.0f;
+		}
+
+		if (DistanceKm <= PeakDistanceKm)
+		{
+			return SmoothStep01(DistanceKm / FMath::Max(KINDA_SMALL_NUMBER, PeakDistanceKm));
+		}
+
+		const float FalloffAlpha = (DistanceKm - PeakDistanceKm) / FMath::Max(KINDA_SMALL_NUMBER, RadiusKm - PeakDistanceKm);
+		return 1.0f - SmoothStep01(FalloffAlpha);
+	}
+
+	float ComputeSpeedInfluence(const float SpeedMmPerYear, const float MaxSpeedMmPerYear)
+	{
+		return FMath::Clamp(SpeedMmPerYear / FMath::Max(KINDA_SMALL_NUMBER, MaxSpeedMmPerYear), 0.0f, 1.0f);
+	}
+
+	float ComputeElevationInfluence(const float ElevationKm, const float TrenchElevationKm, const float MaxElevationKm)
+	{
+		const float Normalized = FMath::Clamp(
+			(ElevationKm - TrenchElevationKm) / FMath::Max(KINDA_SMALL_NUMBER, MaxElevationKm - TrenchElevationKm),
+			0.0f,
+			1.0f);
+		return Normalized * Normalized;
+	}
+
+	float ComputeTrenchInfluence(const float DistanceKm, const float RadiusKm)
+	{
+		if (DistanceKm < 0.0f || DistanceKm > RadiusKm)
+		{
+			return 0.0f;
+		}
+
+		const float Normalized = FMath::Clamp(1.0f - (DistanceKm / FMath::Max(KINDA_SMALL_NUMBER, RadiusKm)), 0.0f, 1.0f);
+		return Normalized * Normalized;
+	}
+
+	bool IsBetterInfluenceCandidate(
+		const FInfluencePathCandidate& Candidate,
+		const FInfluencePathCandidate& Best,
+		const float RoleRadiusKm)
+	{
+		if (!Candidate.bValid)
+		{
+			return false;
+		}
+		if (!Best.bValid)
+		{
+			return true;
+		}
+
+		const float CandidateNormalizedDistance = Candidate.DistanceKm / FMath::Max(KINDA_SMALL_NUMBER, RoleRadiusKm);
+		const float BestNormalizedDistance = Best.DistanceKm / FMath::Max(KINDA_SMALL_NUMBER, RoleRadiusKm);
+		if (CandidateNormalizedDistance + KINDA_SMALL_NUMBER < BestNormalizedDistance)
+		{
+			return true;
+		}
+		if (BestNormalizedDistance + KINDA_SMALL_NUMBER < CandidateNormalizedDistance)
+		{
+			return false;
+		}
+		if (Candidate.InfluenceWeight > Best.InfluenceWeight + KINDA_SMALL_NUMBER)
+		{
+			return true;
+		}
+		if (Best.InfluenceWeight > Candidate.InfluenceWeight + KINDA_SMALL_NUMBER)
+		{
+			return false;
+		}
+		if (Best.SecondaryId == INDEX_NONE)
+		{
+			return true;
+		}
+		if (Candidate.SecondaryId != Best.SecondaryId)
+		{
+			return Candidate.SecondaryId < Best.SecondaryId;
+		}
+		return Candidate.FrontSampleIndex < Best.FrontSampleIndex;
+	}
+
+	bool IsInfluenceCandidateBetterAcrossRoles(
+		const FInfluencePathCandidate& Candidate,
+		const float CandidateRadiusKm,
+		const FInfluencePathCandidate& Best,
+		const float BestRadiusKm)
+	{
+		if (!Candidate.bValid)
+		{
+			return false;
+		}
+		if (!Best.bValid)
+		{
+			return true;
+		}
+
+		const float CandidateNormalizedDistance = Candidate.DistanceKm / FMath::Max(KINDA_SMALL_NUMBER, CandidateRadiusKm);
+		const float BestNormalizedDistance = Best.DistanceKm / FMath::Max(KINDA_SMALL_NUMBER, BestRadiusKm);
+		if (CandidateNormalizedDistance + KINDA_SMALL_NUMBER < BestNormalizedDistance)
+		{
+			return true;
+		}
+		if (BestNormalizedDistance + KINDA_SMALL_NUMBER < CandidateNormalizedDistance)
+		{
+			return false;
+		}
+		if (Candidate.InfluenceWeight > Best.InfluenceWeight + KINDA_SMALL_NUMBER)
+		{
+			return true;
+		}
+		if (Best.InfluenceWeight > Candidate.InfluenceWeight + KINDA_SMALL_NUMBER)
+		{
+			return false;
+		}
+		if (Best.SecondaryId == INDEX_NONE)
+		{
+			return true;
+		}
+		if (Candidate.SecondaryId != Best.SecondaryId)
+		{
+			return Candidate.SecondaryId < Best.SecondaryId;
+		}
+		return Candidate.FrontSampleIndex < Best.FrontSampleIndex;
+	}
+
+	template <typename TraversalPredicateType>
+	void PropagateInfluenceSeeds(
+		const TArray<FCanonicalSample>& Samples,
+		const TArray<TArray<int32>>& Adjacency,
+		const TArray<TArray<float>>& EdgeDistancesKm,
+		const TArray<FInfluenceSeed>& Seeds,
+		const float RadiusKm,
+		const TraversalPredicateType& TraversalPredicate,
+		TArray<FInfluencePathCandidate>& OutBestCandidates)
+	{
+		OutBestCandidates.SetNum(Samples.Num());
+		for (FInfluencePathCandidate& Candidate : OutBestCandidates)
+		{
+			Candidate = FInfluencePathCandidate{};
+		}
+
+		TArray<FInfluenceQueueEntry> Queue;
+		Queue.Reserve(Seeds.Num());
+		for (const FInfluenceSeed& Seed : Seeds)
+		{
+			if (!Samples.IsValidIndex(Seed.SampleIndex))
+			{
+				continue;
+			}
+
+			const FCanonicalSample& SeedSample = Samples[Seed.SampleIndex];
+			if (!TraversalPredicate(SeedSample, Seed))
+			{
+				continue;
+			}
+
+			FInfluencePathCandidate SeedCandidate;
+			SeedCandidate.bValid = true;
+			SeedCandidate.DistanceKm = 0.0f;
+			SeedCandidate.InfluenceWeight = Seed.InfluenceWeight;
+			SeedCandidate.SecondaryId = Seed.SecondaryId;
+			SeedCandidate.FrontSampleIndex = Seed.SampleIndex;
+			if (IsBetterInfluenceCandidate(SeedCandidate, OutBestCandidates[Seed.SampleIndex], RadiusKm))
+			{
+				OutBestCandidates[Seed.SampleIndex] = SeedCandidate;
+
+				FInfluenceQueueEntry QueueEntry;
+				QueueEntry.SampleIndex = Seed.SampleIndex;
+				QueueEntry.PlateId = Seed.PlateId;
+				QueueEntry.SecondaryId = Seed.SecondaryId;
+				QueueEntry.FrontSampleIndex = Seed.SampleIndex;
+				QueueEntry.DistanceKm = 0.0f;
+				QueueEntry.InfluenceWeight = Seed.InfluenceWeight;
+				Queue.HeapPush(QueueEntry);
+			}
+		}
+
+		while (Queue.Num() > 0)
+		{
+			FInfluenceQueueEntry Entry;
+			Queue.HeapPop(Entry);
+			if (!Samples.IsValidIndex(Entry.SampleIndex))
+			{
+				continue;
+			}
+
+			const FInfluencePathCandidate& CurrentBest = OutBestCandidates[Entry.SampleIndex];
+			if (!CurrentBest.bValid ||
+				CurrentBest.SecondaryId != Entry.SecondaryId ||
+				CurrentBest.FrontSampleIndex != Entry.FrontSampleIndex ||
+				!FMath::IsNearlyEqual(CurrentBest.DistanceKm, Entry.DistanceKm, 1e-3f))
+			{
+				continue;
+			}
+
+			checkSlow(Adjacency.IsValidIndex(Entry.SampleIndex));
+			checkSlow(EdgeDistancesKm.IsValidIndex(Entry.SampleIndex));
+			const TArray<int32>& NeighborIndices = Adjacency[Entry.SampleIndex];
+			const TArray<float>& NeighborEdgeDistancesKm = EdgeDistancesKm[Entry.SampleIndex];
+			checkSlow(NeighborIndices.Num() == NeighborEdgeDistancesKm.Num());
+
+			for (int32 NeighborSlot = 0; NeighborSlot < NeighborIndices.Num(); ++NeighborSlot)
+			{
+				const int32 NeighborIndex = NeighborIndices[NeighborSlot];
+				if (!Samples.IsValidIndex(NeighborIndex))
+				{
+					continue;
+				}
+
+				const FCanonicalSample& NeighborSample = Samples[NeighborIndex];
+				if (!TraversalPredicate(NeighborSample, Entry))
+				{
+					continue;
+				}
+
+				const float NewDistanceKm = Entry.DistanceKm + NeighborEdgeDistancesKm[NeighborSlot];
+				if (NewDistanceKm > RadiusKm)
+				{
+					continue;
+				}
+
+				FInfluencePathCandidate Candidate;
+				Candidate.bValid = true;
+				Candidate.DistanceKm = NewDistanceKm;
+				Candidate.InfluenceWeight = Entry.InfluenceWeight;
+				Candidate.SecondaryId = Entry.SecondaryId;
+				Candidate.FrontSampleIndex = Entry.FrontSampleIndex;
+				if (!IsBetterInfluenceCandidate(Candidate, OutBestCandidates[NeighborIndex], RadiusKm))
+				{
+					continue;
+				}
+
+				OutBestCandidates[NeighborIndex] = Candidate;
+
+				FInfluenceQueueEntry NextEntry = Entry;
+				NextEntry.SampleIndex = NeighborIndex;
+				NextEntry.DistanceKm = NewDistanceKm;
+				Queue.HeapPush(NextEntry);
+			}
+		}
 	}
 }
 
@@ -204,18 +548,56 @@ FTectonicPlanet::~FTectonicPlanet() = default;
 FTectonicPlanet::FTectonicPlanet(const FTectonicPlanet& Other)
 	: Triangles(Other.Triangles)
 	, Adjacency(Other.Adjacency)
+	, AdjacencyEdgeDistancesKm(Other.AdjacencyEdgeDistancesKm)
 	, Plates(Other.Plates)
+	, TerraneRecords(Other.TerraneRecords)
+	, CollisionEvents(Other.CollisionEvents)
+	, CollisionHistoryKeys(Other.CollisionHistoryKeys)
 	, SpatialQueryData(MakeUnique<FSpatialQueryData>())
 	, AverageSampleSpacing(Other.AverageSampleSpacing)
+	, AverageCellAreaKm2(Other.AverageCellAreaKm2)
+	, InitialMeanPlateAreaKm2(Other.InitialMeanPlateAreaKm2)
 	, ReconcileDisplacementThreshold(Other.ReconcileDisplacementThreshold)
 	, MaxAngularDisplacementSinceReconcile(Other.MaxAngularDisplacementSinceReconcile)
 	, TimestepCounter(Other.TimestepCounter)
 	, ReconcileCount(Other.ReconcileCount)
+	, NextTerraneId(Other.NextTerraneId)
 	, bReconcileTriggeredLastStep(Other.bReconcileTriggeredLastStep)
+	, BoundarySampleCount(Other.BoundarySampleCount)
+	, BoundaryMeanDepthHops(Other.BoundaryMeanDepthHops)
+	, BoundaryMaxDepthHops(Other.BoundaryMaxDepthHops)
+	, BoundaryDeepSampleCount(Other.BoundaryDeepSampleCount)
+	, ContinentalSampleCount(Other.ContinentalSampleCount)
+, ContinentalPlateCount(Other.ContinentalPlateCount)
+, InitialContinentalPlateCount(Other.InitialContinentalPlateCount)
+, ContinentalAreaFraction(Other.ContinentalAreaFraction)
+	, ContinentalComponentCount(Other.ContinentalComponentCount)
+	, LargestContinentalComponentSize(Other.LargestContinentalComponentSize)
+	, MaxPlateComponentCount(Other.MaxPlateComponentCount)
+	, DetachedPlateFragmentSampleCount(Other.DetachedPlateFragmentSampleCount)
+	, LargestDetachedPlateFragmentSize(Other.LargestDetachedPlateFragmentSize)
+	, SubductionFrontSampleCount(Other.SubductionFrontSampleCount)
+	, AndeanSampleCount(Other.AndeanSampleCount)
+	, TrackedTerraneCount(Other.TrackedTerraneCount)
+	, ActiveTerraneCount(Other.ActiveTerraneCount)
+	, MergedTerraneCount(Other.MergedTerraneCount)
+	, CollisionEventCount(Other.CollisionEventCount)
+	, HimalayanSampleCount(Other.HimalayanSampleCount)
+	, PendingCollisionSampleCount(Other.PendingCollisionSampleCount)
+	, MaxSubductionDistanceKm(Other.MaxSubductionDistanceKm)
+	, MinProtectedPlateSampleCount(Other.MinProtectedPlateSampleCount)
+	, EmptyProtectedPlateCount(Other.EmptyProtectedPlateCount)
+	, RescuedProtectedPlateCount(Other.RescuedProtectedPlateCount)
+	, RescuedProtectedSampleCount(Other.RescuedProtectedSampleCount)
+	, RepeatedlyRescuedProtectedSampleCount(Other.RepeatedlyRescuedProtectedSampleCount)
 	, LastGapSampleCount(Other.LastGapSampleCount)
 	, LastOverlapSampleCount(Other.LastOverlapSampleCount)
 	, HysteresisThreshold(Other.HysteresisThreshold)
 	, BoundaryConfidenceThreshold(Other.BoundaryConfidenceThreshold)
+	, TargetContinentalAreaFraction(Other.TargetContinentalAreaFraction)
+	, MinContinentalAreaFraction(Other.MinContinentalAreaFraction)
+	, MaxContinentalAreaFraction(Other.MaxContinentalAreaFraction)
+	, MinContinentalPlateFraction(Other.MinContinentalPlateFraction)
 	, LastReconcileTimings(Other.LastReconcileTimings)
 {
 	SampleBuffers[0] = Other.SampleBuffers[0];
@@ -235,17 +617,55 @@ FTectonicPlanet& FTectonicPlanet::operator=(const FTectonicPlanet& Other)
 		ReadableSampleBufferIndex.Store(Other.ReadableSampleBufferIndex.Load());
 		Triangles = Other.Triangles;
 		Adjacency = Other.Adjacency;
+		AdjacencyEdgeDistancesKm = Other.AdjacencyEdgeDistancesKm;
 		Plates = Other.Plates;
+		TerraneRecords = Other.TerraneRecords;
+		CollisionEvents = Other.CollisionEvents;
+		CollisionHistoryKeys = Other.CollisionHistoryKeys;
 		AverageSampleSpacing = Other.AverageSampleSpacing;
+		AverageCellAreaKm2 = Other.AverageCellAreaKm2;
+		InitialMeanPlateAreaKm2 = Other.InitialMeanPlateAreaKm2;
 		ReconcileDisplacementThreshold = Other.ReconcileDisplacementThreshold;
 		MaxAngularDisplacementSinceReconcile = Other.MaxAngularDisplacementSinceReconcile;
 		TimestepCounter = Other.TimestepCounter;
 		ReconcileCount = Other.ReconcileCount;
+		NextTerraneId = Other.NextTerraneId;
 		bReconcileTriggeredLastStep = Other.bReconcileTriggeredLastStep;
+		BoundarySampleCount = Other.BoundarySampleCount;
+		BoundaryMeanDepthHops = Other.BoundaryMeanDepthHops;
+		BoundaryMaxDepthHops = Other.BoundaryMaxDepthHops;
+		BoundaryDeepSampleCount = Other.BoundaryDeepSampleCount;
+		ContinentalSampleCount = Other.ContinentalSampleCount;
+	ContinentalPlateCount = Other.ContinentalPlateCount;
+	InitialContinentalPlateCount = Other.InitialContinentalPlateCount;
+	ContinentalAreaFraction = Other.ContinentalAreaFraction;
+		ContinentalComponentCount = Other.ContinentalComponentCount;
+		LargestContinentalComponentSize = Other.LargestContinentalComponentSize;
+		MaxPlateComponentCount = Other.MaxPlateComponentCount;
+		DetachedPlateFragmentSampleCount = Other.DetachedPlateFragmentSampleCount;
+		LargestDetachedPlateFragmentSize = Other.LargestDetachedPlateFragmentSize;
+		SubductionFrontSampleCount = Other.SubductionFrontSampleCount;
+		AndeanSampleCount = Other.AndeanSampleCount;
+		TrackedTerraneCount = Other.TrackedTerraneCount;
+		ActiveTerraneCount = Other.ActiveTerraneCount;
+		MergedTerraneCount = Other.MergedTerraneCount;
+		CollisionEventCount = Other.CollisionEventCount;
+		HimalayanSampleCount = Other.HimalayanSampleCount;
+		PendingCollisionSampleCount = Other.PendingCollisionSampleCount;
+		MaxSubductionDistanceKm = Other.MaxSubductionDistanceKm;
+		MinProtectedPlateSampleCount = Other.MinProtectedPlateSampleCount;
+		EmptyProtectedPlateCount = Other.EmptyProtectedPlateCount;
+		RescuedProtectedPlateCount = Other.RescuedProtectedPlateCount;
+		RescuedProtectedSampleCount = Other.RescuedProtectedSampleCount;
+		RepeatedlyRescuedProtectedSampleCount = Other.RepeatedlyRescuedProtectedSampleCount;
 		LastGapSampleCount = Other.LastGapSampleCount;
 		LastOverlapSampleCount = Other.LastOverlapSampleCount;
 		HysteresisThreshold = Other.HysteresisThreshold;
 		BoundaryConfidenceThreshold = Other.BoundaryConfidenceThreshold;
+		TargetContinentalAreaFraction = Other.TargetContinentalAreaFraction;
+		MinContinentalAreaFraction = Other.MinContinentalAreaFraction;
+		MaxContinentalAreaFraction = Other.MaxContinentalAreaFraction;
+		MinContinentalPlateFraction = Other.MinContinentalPlateFraction;
 		LastReconcileTimings = Other.LastReconcileTimings;
 
 		if (!SpatialQueryData)
@@ -264,18 +684,56 @@ FTectonicPlanet& FTectonicPlanet::operator=(const FTectonicPlanet& Other)
 FTectonicPlanet::FTectonicPlanet(FTectonicPlanet&& Other) noexcept
 	: Triangles(MoveTemp(Other.Triangles))
 	, Adjacency(MoveTemp(Other.Adjacency))
+	, AdjacencyEdgeDistancesKm(MoveTemp(Other.AdjacencyEdgeDistancesKm))
 	, Plates(MoveTemp(Other.Plates))
+	, TerraneRecords(MoveTemp(Other.TerraneRecords))
+	, CollisionEvents(MoveTemp(Other.CollisionEvents))
+	, CollisionHistoryKeys(MoveTemp(Other.CollisionHistoryKeys))
 	, SpatialQueryData(MoveTemp(Other.SpatialQueryData))
 	, AverageSampleSpacing(Other.AverageSampleSpacing)
+	, AverageCellAreaKm2(Other.AverageCellAreaKm2)
+	, InitialMeanPlateAreaKm2(Other.InitialMeanPlateAreaKm2)
 	, ReconcileDisplacementThreshold(Other.ReconcileDisplacementThreshold)
 	, MaxAngularDisplacementSinceReconcile(Other.MaxAngularDisplacementSinceReconcile)
 	, TimestepCounter(Other.TimestepCounter)
 	, ReconcileCount(Other.ReconcileCount)
+	, NextTerraneId(Other.NextTerraneId)
 	, bReconcileTriggeredLastStep(Other.bReconcileTriggeredLastStep)
+	, BoundarySampleCount(Other.BoundarySampleCount)
+	, BoundaryMeanDepthHops(Other.BoundaryMeanDepthHops)
+	, BoundaryMaxDepthHops(Other.BoundaryMaxDepthHops)
+	, BoundaryDeepSampleCount(Other.BoundaryDeepSampleCount)
+	, ContinentalSampleCount(Other.ContinentalSampleCount)
+, ContinentalPlateCount(Other.ContinentalPlateCount)
+, InitialContinentalPlateCount(Other.InitialContinentalPlateCount)
+, ContinentalAreaFraction(Other.ContinentalAreaFraction)
+	, ContinentalComponentCount(Other.ContinentalComponentCount)
+	, LargestContinentalComponentSize(Other.LargestContinentalComponentSize)
+	, MaxPlateComponentCount(Other.MaxPlateComponentCount)
+	, DetachedPlateFragmentSampleCount(Other.DetachedPlateFragmentSampleCount)
+	, LargestDetachedPlateFragmentSize(Other.LargestDetachedPlateFragmentSize)
+	, SubductionFrontSampleCount(Other.SubductionFrontSampleCount)
+	, AndeanSampleCount(Other.AndeanSampleCount)
+	, TrackedTerraneCount(Other.TrackedTerraneCount)
+	, ActiveTerraneCount(Other.ActiveTerraneCount)
+	, MergedTerraneCount(Other.MergedTerraneCount)
+	, CollisionEventCount(Other.CollisionEventCount)
+	, HimalayanSampleCount(Other.HimalayanSampleCount)
+	, PendingCollisionSampleCount(Other.PendingCollisionSampleCount)
+	, MaxSubductionDistanceKm(Other.MaxSubductionDistanceKm)
+	, MinProtectedPlateSampleCount(Other.MinProtectedPlateSampleCount)
+	, EmptyProtectedPlateCount(Other.EmptyProtectedPlateCount)
+	, RescuedProtectedPlateCount(Other.RescuedProtectedPlateCount)
+	, RescuedProtectedSampleCount(Other.RescuedProtectedSampleCount)
+	, RepeatedlyRescuedProtectedSampleCount(Other.RepeatedlyRescuedProtectedSampleCount)
 	, LastGapSampleCount(Other.LastGapSampleCount)
 	, LastOverlapSampleCount(Other.LastOverlapSampleCount)
 	, HysteresisThreshold(Other.HysteresisThreshold)
 	, BoundaryConfidenceThreshold(Other.BoundaryConfidenceThreshold)
+	, TargetContinentalAreaFraction(Other.TargetContinentalAreaFraction)
+	, MinContinentalAreaFraction(Other.MinContinentalAreaFraction)
+	, MaxContinentalAreaFraction(Other.MaxContinentalAreaFraction)
+	, MinContinentalPlateFraction(Other.MinContinentalPlateFraction)
 	, LastReconcileTimings(Other.LastReconcileTimings)
 {
 	SampleBuffers[0] = MoveTemp(Other.SampleBuffers[0]);
@@ -296,18 +754,56 @@ FTectonicPlanet& FTectonicPlanet::operator=(FTectonicPlanet&& Other) noexcept
 		ReadableSampleBufferIndex.Store(Other.ReadableSampleBufferIndex.Load());
 		Triangles = MoveTemp(Other.Triangles);
 		Adjacency = MoveTemp(Other.Adjacency);
+		AdjacencyEdgeDistancesKm = MoveTemp(Other.AdjacencyEdgeDistancesKm);
 		Plates = MoveTemp(Other.Plates);
+		TerraneRecords = MoveTemp(Other.TerraneRecords);
+		CollisionEvents = MoveTemp(Other.CollisionEvents);
+		CollisionHistoryKeys = MoveTemp(Other.CollisionHistoryKeys);
 		SpatialQueryData = MoveTemp(Other.SpatialQueryData);
 		AverageSampleSpacing = Other.AverageSampleSpacing;
+		AverageCellAreaKm2 = Other.AverageCellAreaKm2;
+		InitialMeanPlateAreaKm2 = Other.InitialMeanPlateAreaKm2;
 		ReconcileDisplacementThreshold = Other.ReconcileDisplacementThreshold;
 		MaxAngularDisplacementSinceReconcile = Other.MaxAngularDisplacementSinceReconcile;
 		TimestepCounter = Other.TimestepCounter;
 		ReconcileCount = Other.ReconcileCount;
+		NextTerraneId = Other.NextTerraneId;
 		bReconcileTriggeredLastStep = Other.bReconcileTriggeredLastStep;
+		BoundarySampleCount = Other.BoundarySampleCount;
+		BoundaryMeanDepthHops = Other.BoundaryMeanDepthHops;
+		BoundaryMaxDepthHops = Other.BoundaryMaxDepthHops;
+		BoundaryDeepSampleCount = Other.BoundaryDeepSampleCount;
+		ContinentalSampleCount = Other.ContinentalSampleCount;
+	ContinentalPlateCount = Other.ContinentalPlateCount;
+	InitialContinentalPlateCount = Other.InitialContinentalPlateCount;
+	ContinentalAreaFraction = Other.ContinentalAreaFraction;
+		ContinentalComponentCount = Other.ContinentalComponentCount;
+		LargestContinentalComponentSize = Other.LargestContinentalComponentSize;
+		MaxPlateComponentCount = Other.MaxPlateComponentCount;
+		DetachedPlateFragmentSampleCount = Other.DetachedPlateFragmentSampleCount;
+		LargestDetachedPlateFragmentSize = Other.LargestDetachedPlateFragmentSize;
+		SubductionFrontSampleCount = Other.SubductionFrontSampleCount;
+		AndeanSampleCount = Other.AndeanSampleCount;
+		TrackedTerraneCount = Other.TrackedTerraneCount;
+		ActiveTerraneCount = Other.ActiveTerraneCount;
+		MergedTerraneCount = Other.MergedTerraneCount;
+		CollisionEventCount = Other.CollisionEventCount;
+		HimalayanSampleCount = Other.HimalayanSampleCount;
+		PendingCollisionSampleCount = Other.PendingCollisionSampleCount;
+		MaxSubductionDistanceKm = Other.MaxSubductionDistanceKm;
+		MinProtectedPlateSampleCount = Other.MinProtectedPlateSampleCount;
+		EmptyProtectedPlateCount = Other.EmptyProtectedPlateCount;
+		RescuedProtectedPlateCount = Other.RescuedProtectedPlateCount;
+		RescuedProtectedSampleCount = Other.RescuedProtectedSampleCount;
+		RepeatedlyRescuedProtectedSampleCount = Other.RepeatedlyRescuedProtectedSampleCount;
 		LastGapSampleCount = Other.LastGapSampleCount;
 		LastOverlapSampleCount = Other.LastOverlapSampleCount;
 		HysteresisThreshold = Other.HysteresisThreshold;
 		BoundaryConfidenceThreshold = Other.BoundaryConfidenceThreshold;
+		TargetContinentalAreaFraction = Other.TargetContinentalAreaFraction;
+		MinContinentalAreaFraction = Other.MinContinentalAreaFraction;
+		MaxContinentalAreaFraction = Other.MaxContinentalAreaFraction;
+		MinContinentalPlateFraction = Other.MinContinentalPlateFraction;
 		LastReconcileTimings = Other.LastReconcileTimings;
 
 		if (!SpatialQueryData)
@@ -329,6 +825,69 @@ int32 FTectonicPlanet::GetNumSamples() const
 	return GetReadableSamplesInternal().Num();
 }
 
+bool FTectonicPlanet::IsPlateActive(const int32 PlateId) const
+{
+	return Plates.IsValidIndex(PlateId) && Plates[PlateId].SampleIndices.Num() > 0;
+}
+
+bool FTectonicPlanet::IsPlateProtected(const int32 PlateId) const
+{
+	return Plates.IsValidIndex(PlateId) && Plates[PlateId].PersistencePolicy == EPlatePersistencePolicy::Protected;
+}
+
+int32 FTectonicPlanet::GetInitialPlateFloorSamples(const int32 TotalSampleCount, const int32 PlateCount) const
+{
+	if (TotalSampleCount <= 0 || PlateCount <= 0)
+	{
+		return 0;
+	}
+
+	return FMath::Max(64, FMath::FloorToInt(0.30 * static_cast<double>(TotalSampleCount) / static_cast<double>(PlateCount)));
+}
+
+int32 FTectonicPlanet::GetPersistentPlateFloorSamples(const int32 PlateId) const
+{
+	if (!Plates.IsValidIndex(PlateId) || Plates[PlateId].PersistencePolicy != EPlatePersistencePolicy::Protected)
+	{
+		return 0;
+	}
+
+	return FMath::Max(32, FMath::CeilToInt(0.05 * static_cast<double>(FMath::Max(0, Plates[PlateId].InitialSampleCount))));
+}
+
+uint64 FTectonicPlanet::MakeCollisionHistoryKey(const int32 TerraneIdA, const int32 TerraneIdB)
+{
+	const uint32 Low = static_cast<uint32>(FMath::Min(TerraneIdA, TerraneIdB));
+	const uint32 High = static_cast<uint32>(FMath::Max(TerraneIdA, TerraneIdB));
+	return (static_cast<uint64>(Low) << 32) | static_cast<uint64>(High);
+}
+
+FTectonicPlanet::FTerraneRecord* FTectonicPlanet::FindTerraneRecordById(const int32 TerraneId)
+{
+	for (FTerraneRecord& Record : TerraneRecords)
+	{
+		if (Record.TerraneId == TerraneId)
+		{
+			return &Record;
+		}
+	}
+
+	return nullptr;
+}
+
+const FTectonicPlanet::FTerraneRecord* FTectonicPlanet::FindTerraneRecordById(const int32 TerraneId) const
+{
+	for (const FTerraneRecord& Record : TerraneRecords)
+	{
+		if (Record.TerraneId == TerraneId)
+		{
+			return &Record;
+		}
+	}
+
+	return nullptr;
+}
+
 void FTectonicPlanet::Initialize(int32 NumSamples)
 {
 	checkf(NumSamples >= 4, TEXT("FTectonicPlanet::Initialize requires at least 4 samples."));
@@ -338,16 +897,44 @@ void FTectonicPlanet::Initialize(int32 NumSamples)
 	SampleBuffers[1].Reset();
 	Triangles.Reset();
 	Adjacency.Reset();
+	AdjacencyEdgeDistancesKm.Reset();
 	Plates.Reset();
+	TerraneRecords.Reset();
+	CollisionEvents.Reset();
+	CollisionHistoryKeys.Reset();
 	AverageSampleSpacing = 0.0;
+	AverageCellAreaKm2 = 0.0;
+	InitialMeanPlateAreaKm2 = 0.0;
 	ReconcileDisplacementThreshold = 0.0;
 	MaxAngularDisplacementSinceReconcile = 0.0;
 	TimestepCounter = 0;
 	ReconcileCount = 0;
+	NextTerraneId = 0;
 	bReconcileTriggeredLastStep = false;
 	BoundarySampleCount = 0;
+	BoundaryMeanDepthHops = 0.0;
+	BoundaryMaxDepthHops = 0;
+	BoundaryDeepSampleCount = 0;
+	ContinentalSampleCount = 0;
+	ContinentalPlateCount = 0;
+	InitialContinentalPlateCount = 0;
+	ContinentalAreaFraction = 0.0;
+	ContinentalComponentCount = 0;
+	LargestContinentalComponentSize = 0;
+	MaxPlateComponentCount = 0;
+	DetachedPlateFragmentSampleCount = 0;
+	LargestDetachedPlateFragmentSize = 0;
 	LastGapSampleCount = 0;
 	LastOverlapSampleCount = 0;
+	TrackedTerraneCount = 0;
+	ActiveTerraneCount = 0;
+	MergedTerraneCount = 0;
+	CollisionEventCount = 0;
+	HimalayanSampleCount = 0;
+	PendingCollisionSampleCount = 0;
+	SubductionFrontSampleCount = 0;
+	AndeanSampleCount = 0;
+	MaxSubductionDistanceKm = 0.0f;
 	LastReconcileTimings = FReconcilePhaseTimings{};
 	InvalidateSpatialQueryData();
 
@@ -361,6 +948,7 @@ void FTectonicPlanet::Initialize(int32 NumSamples)
 	BuildDelaunayTriangulation();
 	BuildAdjacencyGraph();
 	AverageSampleSpacing = FMath::Sqrt((4.0 * static_cast<double>(PI)) / static_cast<double>(GetReadableSamplesInternal().Num()));
+	AverageCellAreaKm2 = (4.0 * static_cast<double>(PI) * PlanetRadius * PlanetRadius) / static_cast<double>(GetReadableSamplesInternal().Num());
 	ReconcileDisplacementThreshold = 0.5 * AverageSampleSpacing;
 	UpdateBoundaryFlags();
 
@@ -376,59 +964,318 @@ void FTectonicPlanet::InitializePlates(int32 NumPlates, int32 RandomSeed)
 	checkf(NumPlates > 0, TEXT("InitializePlates requires NumPlates > 0."));
 
 	const int32 ClampedNumPlates = FMath::Min(NumPlates, Samples.Num());
-	FRandomStream Rng(RandomSeed);
+	FRandomStream LayoutRng(RandomSeed);
+	FRandomStream PlateMotionRng(RandomSeed ^ 0x5f3759df);
 	const double LocalAverageSampleSpacing = (Samples.Num() > 0)
 		? FMath::Sqrt((4.0 * static_cast<double>(PI)) / static_cast<double>(Samples.Num()))
 		: 1.0;
+	const int32 InitialPlateFloorSamples = GetInitialPlateFloorSamples(Samples.Num(), ClampedNumPlates);
+	const double ClampedMinContinentalAreaFraction = FMath::Clamp(MinContinentalAreaFraction, 0.0, 1.0);
+	const double ClampedMaxContinentalAreaFraction = FMath::Clamp(MaxContinentalAreaFraction, ClampedMinContinentalAreaFraction, 1.0);
+	const double ClampedTargetContinentalAreaFraction = FMath::Clamp(TargetContinentalAreaFraction, ClampedMinContinentalAreaFraction, ClampedMaxContinentalAreaFraction);
+	const double ClampedMinContinentalPlateFraction = FMath::Clamp(MinContinentalPlateFraction, 0.0, 1.0);
 
-	TArray<FVector> Centroids;
-	Centroids.Reserve(ClampedNumPlates);
-	for (int32 PlateIndex = 0; PlateIndex < ClampedNumPlates; ++PlateIndex)
+	TArray<FVector> SelectedCentroids;
+	TArray<int32> SelectedPlateAssignments;
+	TArray<double> SelectedBestDots;
+	TArray<double> SelectedSecondBestDots;
+	TArray<int32> SelectedPlateCounts;
+	SelectedPlateAssignments.SetNumUninitialized(Samples.Num());
+	SelectedBestDots.SetNumUninitialized(Samples.Num());
+	SelectedSecondBestDots.SetNumUninitialized(Samples.Num());
+	SelectedPlateCounts.Init(0, ClampedNumPlates);
+
+	bool bFoundValidLayout = false;
+	int32 BestRejectedMinPlateCount = 0;
+	constexpr int32 MaxInitializationAttempts = 4;
+
+	for (int32 AttemptIndex = 0; AttemptIndex < MaxInitializationAttempts; ++AttemptIndex)
 	{
-		Centroids.Add(MakeRandomUnitVector(Rng).GetSafeNormal());
+		const int32 FirstCentroidSampleIndex = LayoutRng.RandRange(0, Samples.Num() - 1);
+		TArray<FVector> AttemptCentroids;
+		AttemptCentroids.Reserve(ClampedNumPlates);
+		AttemptCentroids.Add(Samples[FirstCentroidSampleIndex].Position.GetSafeNormal());
+
+		while (AttemptCentroids.Num() < ClampedNumPlates)
+		{
+			double BestNearestCentroidDot = TNumericLimits<double>::Max();
+			int32 BestCentroidSampleIndex = INDEX_NONE;
+			for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+			{
+				const FVector CandidateDirection = Samples[SampleIndex].Position.GetSafeNormal();
+				double NearestCentroidDot = -TNumericLimits<double>::Max();
+				for (const FVector& ExistingCentroid : AttemptCentroids)
+				{
+					NearestCentroidDot = FMath::Max(NearestCentroidDot, FVector::DotProduct(CandidateDirection, ExistingCentroid));
+				}
+
+				if (BestCentroidSampleIndex == INDEX_NONE ||
+					NearestCentroidDot < BestNearestCentroidDot - UE_DOUBLE_SMALL_NUMBER ||
+					(FMath::IsNearlyEqual(NearestCentroidDot, BestNearestCentroidDot, UE_DOUBLE_SMALL_NUMBER) && SampleIndex < BestCentroidSampleIndex))
+				{
+					BestNearestCentroidDot = NearestCentroidDot;
+					BestCentroidSampleIndex = SampleIndex;
+				}
+			}
+
+			check(BestCentroidSampleIndex != INDEX_NONE);
+			AttemptCentroids.Add(Samples[BestCentroidSampleIndex].Position.GetSafeNormal());
+		}
+
+		TArray<int32> AttemptPlateAssignments;
+		TArray<double> AttemptBestDots;
+		TArray<double> AttemptSecondBestDots;
+		TArray<int32> AttemptPlateCounts;
+		AttemptPlateAssignments.SetNumUninitialized(Samples.Num());
+		AttemptBestDots.SetNumUninitialized(Samples.Num());
+		AttemptSecondBestDots.SetNumUninitialized(Samples.Num());
+		AttemptPlateCounts.Init(0, ClampedNumPlates);
+
+		for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+		{
+			double BestDot = -TNumericLimits<double>::Max();
+			double SecondBestDot = -TNumericLimits<double>::Max();
+			int32 BestPlateIndex = 0;
+
+			const FVector& Position = Samples[SampleIndex].Position;
+			for (int32 PlateIndex = 0; PlateIndex < AttemptCentroids.Num(); ++PlateIndex)
+			{
+				const double Dot = FVector::DotProduct(Position, AttemptCentroids[PlateIndex]);
+				if (Dot > BestDot)
+				{
+					SecondBestDot = BestDot;
+					BestDot = Dot;
+					BestPlateIndex = PlateIndex;
+				}
+				else if (Dot > SecondBestDot)
+				{
+					SecondBestDot = Dot;
+				}
+			}
+
+			AttemptPlateAssignments[SampleIndex] = BestPlateIndex;
+			AttemptBestDots[SampleIndex] = BestDot;
+			AttemptSecondBestDots[SampleIndex] = SecondBestDot;
+			++AttemptPlateCounts[BestPlateIndex];
+		}
+
+		int32 MinPlateCount = TNumericLimits<int32>::Max();
+		for (const int32 PlateCount : AttemptPlateCounts)
+		{
+			MinPlateCount = FMath::Min(MinPlateCount, PlateCount);
+		}
+		BestRejectedMinPlateCount = FMath::Max(BestRejectedMinPlateCount, MinPlateCount);
+
+		if (MinPlateCount < InitialPlateFloorSamples)
+		{
+			continue;
+		}
+
+		SelectedCentroids = MoveTemp(AttemptCentroids);
+		SelectedPlateAssignments = MoveTemp(AttemptPlateAssignments);
+		SelectedBestDots = MoveTemp(AttemptBestDots);
+		SelectedSecondBestDots = MoveTemp(AttemptSecondBestDots);
+		SelectedPlateCounts = MoveTemp(AttemptPlateCounts);
+		bFoundValidLayout = true;
+		break;
 	}
+
+	checkf(bFoundValidLayout,
+		TEXT("InitializePlates failed to find a valid farthest-point plate layout after %d attempts (seed=%d, requested plates=%d, floor=%d, best rejected min=%d)."),
+		MaxInitializationAttempts,
+		RandomSeed,
+		ClampedNumPlates,
+		InitialPlateFloorSamples,
+		BestRejectedMinPlateCount);
 
 	Plates.Reset();
 	Plates.SetNum(ClampedNumPlates);
+	int32 InitialSampleCountSum = 0;
 	for (int32 PlateIndex = 0; PlateIndex < Plates.Num(); ++PlateIndex)
 	{
 		FPlate& Plate = Plates[PlateIndex];
 		Plate = FPlate{};
 		Plate.Id = PlateIndex;
-		Plate.RotationAxis = MakeRandomUnitVector(Rng).GetSafeNormal();
-		Plate.AngularSpeed = Rng.FRandRange(0.5f, 1.5f) * 3.14e-2f;
+		Plate.PersistencePolicy = EPlatePersistencePolicy::Protected;
+		Plate.IdentityAnchorDirection = SelectedCentroids[PlateIndex];
+		Plate.CanonicalCenterDirection = SelectedCentroids[PlateIndex];
+		Plate.InitialSampleCount = SelectedPlateCounts[PlateIndex];
+		InitialSampleCountSum += Plate.InitialSampleCount;
+		Plate.RotationAxis = MakeRandomUnitVector(PlateMotionRng).GetSafeNormal();
+		Plate.AngularSpeed = PlateMotionRng.FRandRange(0.5f, 1.5f) * 3.14e-2f;
+	}
+	InitialMeanPlateAreaKm2 = (Plates.Num() > 0)
+		? (static_cast<double>(InitialSampleCountSum) * AverageCellAreaKm2 / static_cast<double>(Plates.Num()))
+		: 0.0;
+
+	const int32 LowPlateFallbackMin = (ClampedNumPlates < 7)
+		? 1
+		: FMath::Max(2, FMath::RoundToInt(ClampedMinContinentalPlateFraction * static_cast<double>(ClampedNumPlates)));
+	const int32 TargetContinentalPlateCount = FMath::Clamp(
+		FMath::RoundToInt(ClampedTargetContinentalAreaFraction * static_cast<double>(ClampedNumPlates)),
+		LowPlateFallbackMin,
+		ClampedNumPlates);
+
+	struct FContinentalCandidateLayout
+	{
+		TArray<int32> PlateIds;
+		int32 ContinentalSampleCount = 0;
+		double ContinentalSampleFraction = 0.0;
+		double MinPairwiseAngularSeparation = 0.0;
+	};
+
+	auto ComputeMinPairwiseAngularSeparation = [this](const TArray<int32>& PlateIds) -> double
+	{
+		double MinAngle = PI;
+		if (PlateIds.Num() <= 1)
+		{
+			return MinAngle;
+		}
+
+		for (int32 PlateIdIndexA = 0; PlateIdIndexA < PlateIds.Num(); ++PlateIdIndexA)
+		{
+			const int32 PlateIdA = PlateIds[PlateIdIndexA];
+			if (!Plates.IsValidIndex(PlateIdA))
+			{
+				continue;
+			}
+
+			for (int32 PlateIdIndexB = PlateIdIndexA + 1; PlateIdIndexB < PlateIds.Num(); ++PlateIdIndexB)
+			{
+				const int32 PlateIdB = PlateIds[PlateIdIndexB];
+				if (!Plates.IsValidIndex(PlateIdB))
+				{
+					continue;
+				}
+
+				const double Dot = FMath::Clamp(
+					static_cast<double>(FVector::DotProduct(Plates[PlateIdA].CanonicalCenterDirection, Plates[PlateIdB].CanonicalCenterDirection)),
+					-1.0,
+					1.0);
+				MinAngle = FMath::Min(MinAngle, FMath::Acos(Dot));
+			}
+		}
+
+		return MinAngle;
+	};
+
+	auto IsLexicographicallyLowerPlateList = [](const TArray<int32>& CandidatePlateIds, const TArray<int32>& BestPlateIds) -> bool
+	{
+		if (BestPlateIds.Num() <= 0)
+		{
+			return true;
+		}
+
+		const int32 CompareCount = FMath::Min(CandidatePlateIds.Num(), BestPlateIds.Num());
+		for (int32 CompareIndex = 0; CompareIndex < CompareCount; ++CompareIndex)
+		{
+			if (CandidatePlateIds[CompareIndex] != BestPlateIds[CompareIndex])
+			{
+				return CandidatePlateIds[CompareIndex] < BestPlateIds[CompareIndex];
+			}
+		}
+
+		return CandidatePlateIds.Num() < BestPlateIds.Num();
+	};
+
+	FContinentalCandidateLayout BestContinentalLayout;
+	bool bFoundContinentalLayout = false;
+	for (int32 StartPlateId = 0; StartPlateId < ClampedNumPlates; ++StartPlateId)
+	{
+		FContinentalCandidateLayout CandidateLayout;
+		CandidateLayout.PlateIds.Reserve(TargetContinentalPlateCount);
+		CandidateLayout.PlateIds.Add(StartPlateId);
+		while (CandidateLayout.PlateIds.Num() < TargetContinentalPlateCount)
+		{
+			double BestNearestSelectedDot = TNumericLimits<double>::Max();
+			int32 BestCandidatePlateId = INDEX_NONE;
+			for (int32 CandidatePlateId = 0; CandidatePlateId < ClampedNumPlates; ++CandidatePlateId)
+			{
+				if (CandidateLayout.PlateIds.Contains(CandidatePlateId))
+				{
+					continue;
+				}
+
+				double NearestSelectedDot = -TNumericLimits<double>::Max();
+				for (const int32 SelectedPlateId : CandidateLayout.PlateIds)
+				{
+					NearestSelectedDot = FMath::Max(
+						NearestSelectedDot,
+						static_cast<double>(FVector::DotProduct(Plates[CandidatePlateId].CanonicalCenterDirection, Plates[SelectedPlateId].CanonicalCenterDirection)));
+				}
+
+				if (BestCandidatePlateId == INDEX_NONE ||
+					NearestSelectedDot < BestNearestSelectedDot - UE_DOUBLE_SMALL_NUMBER ||
+					(FMath::IsNearlyEqual(NearestSelectedDot, BestNearestSelectedDot, UE_DOUBLE_SMALL_NUMBER) && CandidatePlateId < BestCandidatePlateId))
+				{
+					BestNearestSelectedDot = NearestSelectedDot;
+					BestCandidatePlateId = CandidatePlateId;
+				}
+			}
+
+			check(BestCandidatePlateId != INDEX_NONE);
+			CandidateLayout.PlateIds.Add(BestCandidatePlateId);
+		}
+
+		CandidateLayout.PlateIds.Sort();
+		for (const int32 PlateId : CandidateLayout.PlateIds)
+		{
+			CandidateLayout.ContinentalSampleCount += Plates[PlateId].InitialSampleCount;
+		}
+
+		CandidateLayout.ContinentalSampleFraction =
+			(Samples.Num() > 0)
+				? (static_cast<double>(CandidateLayout.ContinentalSampleCount) / static_cast<double>(Samples.Num()))
+				: 0.0;
+		if (CandidateLayout.ContinentalSampleFraction + UE_DOUBLE_SMALL_NUMBER < ClampedMinContinentalAreaFraction ||
+			CandidateLayout.ContinentalSampleFraction - UE_DOUBLE_SMALL_NUMBER > ClampedMaxContinentalAreaFraction)
+		{
+			continue;
+		}
+
+		CandidateLayout.MinPairwiseAngularSeparation = ComputeMinPairwiseAngularSeparation(CandidateLayout.PlateIds);
+		const double CandidateFractionError = FMath::Abs(CandidateLayout.ContinentalSampleFraction - ClampedTargetContinentalAreaFraction);
+		const double BestFractionError = FMath::Abs(BestContinentalLayout.ContinentalSampleFraction - ClampedTargetContinentalAreaFraction);
+		const bool bBetterCandidate =
+			!bFoundContinentalLayout ||
+			(CandidateFractionError < BestFractionError - UE_DOUBLE_SMALL_NUMBER) ||
+			(FMath::IsNearlyEqual(CandidateFractionError, BestFractionError, UE_DOUBLE_SMALL_NUMBER) &&
+				CandidateLayout.MinPairwiseAngularSeparation > BestContinentalLayout.MinPairwiseAngularSeparation + UE_DOUBLE_SMALL_NUMBER) ||
+			(FMath::IsNearlyEqual(CandidateFractionError, BestFractionError, UE_DOUBLE_SMALL_NUMBER) &&
+				FMath::IsNearlyEqual(CandidateLayout.MinPairwiseAngularSeparation, BestContinentalLayout.MinPairwiseAngularSeparation, UE_DOUBLE_SMALL_NUMBER) &&
+				IsLexicographicallyLowerPlateList(CandidateLayout.PlateIds, BestContinentalLayout.PlateIds));
+		if (bBetterCandidate)
+		{
+			BestContinentalLayout = MoveTemp(CandidateLayout);
+			bFoundContinentalLayout = true;
+		}
 	}
 
+	checkf(
+		bFoundContinentalLayout,
+		TEXT("InitializePlates failed to find a continental plate layout within the configured area band (seed=%d, plates=%d, target plates=%d, target area=%.3f, band=[%.3f, %.3f])."),
+		RandomSeed,
+		ClampedNumPlates,
+		TargetContinentalPlateCount,
+		ClampedTargetContinentalAreaFraction,
+		ClampedMinContinentalAreaFraction,
+		ClampedMaxContinentalAreaFraction);
+
 	TSet<int32> ContinentalPlates;
-	const int32 NumContinentalPlates = FMath::Clamp(Rng.RandRange(1, 3), 1, ClampedNumPlates);
-	while (ContinentalPlates.Num() < NumContinentalPlates)
+	for (const int32 ContinentalPlateId : BestContinentalLayout.PlateIds)
 	{
-		ContinentalPlates.Add(Rng.RandRange(0, ClampedNumPlates - 1));
+		ContinentalPlates.Add(ContinentalPlateId);
 	}
+	const int32 NumContinentalPlates = ContinentalPlates.Num();
+	InitialContinentalPlateCount = NumContinentalPlates;
 
 	int32 NumAssignedContinental = 0;
 	int32 NumAssignedOceanic = 0;
 	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
 	{
-		double BestDot = -TNumericLimits<double>::Max();
-		double SecondBestDot = -TNumericLimits<double>::Max();
-		int32 BestPlateIndex = 0;
-
-		const FVector& Position = Samples[SampleIndex].Position;
-		for (int32 PlateIndex = 0; PlateIndex < Plates.Num(); ++PlateIndex)
-		{
-			const double Dot = FVector::DotProduct(Position, Centroids[PlateIndex]);
-			if (Dot > BestDot)
-			{
-				SecondBestDot = BestDot;
-				BestDot = Dot;
-				BestPlateIndex = PlateIndex;
-			}
-			else if (Dot > SecondBestDot)
-			{
-				SecondBestDot = Dot;
-			}
-		}
+		const double BestDot = SelectedBestDots[SampleIndex];
+		const double SecondBestDot = SelectedSecondBestDots[SampleIndex];
+		const int32 BestPlateIndex = SelectedPlateAssignments[SampleIndex];
 
 		FCanonicalSample& Sample = Samples[SampleIndex];
 		Sample.PlateId = BestPlateIndex;
@@ -464,8 +1311,8 @@ void FTectonicPlanet::InitializePlates(int32 NumPlates, int32 RandomSeed)
 		else
 		{
 			Sample.CrustType = ECrustType::Oceanic;
-			Sample.Elevation = -4.0f;
-			Sample.Thickness = 7.0f;
+			Sample.Elevation = InitialOceanicPlateElevationKm;
+			Sample.Thickness = OceanicCrustThicknessKm;
 			Sample.TerraneId = -1;
 			++NumAssignedOceanic;
 		}
@@ -473,14 +1320,25 @@ void FTectonicPlanet::InitializePlates(int32 NumPlates, int32 RandomSeed)
 
 	ResetDisplacementTracking();
 	RebuildPlateMembershipFromSamples(Samples);
-	RebuildCarriedSampleWorkspacesForSamples(Samples);
+	UpdatePlateCanonicalCentersFromSamples(Samples);
 	ClassifyTrianglesForSamples(Samples);
+	DetectTerranesForSamples(Samples);
+	UpdateSubductionFieldsForSamples(Samples);
+	RebuildCarriedSampleWorkspacesForSamples(Samples);
 	InvalidateSpatialQueryData();
 	RebuildSpatialQueryData();
 	SampleBuffers[1 - ReadableSampleBufferIndex.Load()] = Samples;
 
-	UE_LOG(LogTemp, Log, TEXT("Initialized %d plates (seed=%d): continental plates=%d continental samples=%d oceanic samples=%d"),
-		Plates.Num(), RandomSeed, ContinentalPlates.Num(), NumAssignedContinental, NumAssignedOceanic);
+	TArray<int32> InitialPlateSizes = SelectedPlateCounts;
+	InitialPlateSizes.Sort();
+	const int32 MinInitialPlateSize = InitialPlateSizes.Num() > 0 ? InitialPlateSizes[0] : 0;
+	const int32 MedianInitialPlateSize = InitialPlateSizes.Num() > 0 ? InitialPlateSizes[InitialPlateSizes.Num() / 2] : 0;
+	const int32 MaxInitialPlateSize = InitialPlateSizes.Num() > 0 ? InitialPlateSizes.Last() : 0;
+	const double InitialContinentalAreaFractionPct = (Samples.Num() > 0)
+		? (100.0 * static_cast<double>(NumAssignedContinental) / static_cast<double>(Samples.Num()))
+		: 0.0;
+	UE_LOG(LogTemp, Log, TEXT("Initialized %d plates (seed=%d): continental plates=%d continental samples=%d (%.3f%%) oceanic samples=%d min/median/max plate samples=%d/%d/%d"),
+		Plates.Num(), RandomSeed, ContinentalPlates.Num(), NumAssignedContinental, InitialContinentalAreaFractionPct, NumAssignedOceanic, MinInitialPlateSize, MedianInitialPlateSize, MaxInitialPlateSize);
 }
 
 void FTectonicPlanet::ClassifyTriangles()
@@ -502,6 +1360,11 @@ void FTectonicPlanet::AdvancePlateMotionStep()
 		return;
 	}
 
+	constexpr double MmToKm = 1.0e-6;
+	const double DampeningStepKm = static_cast<double>(OceanicDampeningRateMmPerYear) * MmToKm * TimestepDurationYears;
+	const double BaseSubductionUpliftStepKm = static_cast<double>(BaseSubductionUpliftMmPerYear) * MmToKm * TimestepDurationYears;
+	const TArray<FCanonicalSample>& ReadSamples = GetReadableSamplesInternal();
+
 	for (FPlate& Plate : Plates)
 	{
 		const FVector Axis = Plate.RotationAxis.GetSafeNormal();
@@ -511,8 +1374,181 @@ void FTectonicPlanet::AdvancePlateMotionStep()
 		Plate.AngularDisplacementSinceReconcile += FMath::Abs(static_cast<double>(Plate.AngularSpeed));
 		MaxAngularDisplacementSinceReconcile = FMath::Max(MaxAngularDisplacementSinceReconcile, Plate.AngularDisplacementSinceReconcile);
 
-		// M6 crust evolution hooks (erosion, dampening, etc.) run here.
+		for (FCarriedSampleData& CarriedSample : Plate.CarriedSamples)
+		{
+			const FCanonicalSample* CanonicalSample = ReadSamples.IsValidIndex(CarriedSample.CanonicalSampleIndex)
+				? &ReadSamples[CarriedSample.CanonicalSampleIndex]
+				: nullptr;
+			const FVector MovedPosition = CanonicalSample
+				? Plate.CumulativeRotation.RotateVector(CanonicalSample->Position).GetSafeNormal()
+				: FVector::ZeroVector;
+
+			if (CarriedSample.CrustType == ECrustType::Oceanic)
+			{
+				CarriedSample.Age += static_cast<float>(TimestepDurationMy);
+				const double ElevationKm = static_cast<double>(CarriedSample.Elevation);
+				const double DampeningMultiplier = 1.0 - (ElevationKm / static_cast<double>(OceanicTrenchElevationKm));
+				const double UpdatedElevationKm = ElevationKm - DampeningMultiplier * DampeningStepKm;
+				CarriedSample.Elevation = static_cast<float>(UpdatedElevationKm);
+			}
+			else
+			{
+				// TODO[M6]: Continental erosion hook:
+				// z -= (z / z_c) * epsilon_c * delta_t
+				// TODO[M6]: Sediment accretion hook:
+				// z += epsilon_f * delta_t
+			}
+
+			bool bAppliedAndeanUplift = false;
+			if (CarriedSample.SubductionRole == ESubductionRole::Overriding &&
+				CarriedSample.CrustType == ECrustType::Continental &&
+				CarriedSample.SubductionDistanceKm >= 0.0f &&
+				Plates.IsValidIndex(CarriedSample.SubductionOpposingPlateId) &&
+				!MovedPosition.IsNearlyZero())
+			{
+				const float DistanceInfluence = ComputeSubductionInfluence(
+					CarriedSample.SubductionDistanceKm,
+					SubductionPeakDistanceKm,
+					SubductionInfluenceRadiusKm);
+				const float SpeedInfluence = ComputeSpeedInfluence(
+					CarriedSample.SubductionConvergenceSpeedMmPerYear,
+					MaxSubductionSpeedMmPerYear);
+				const float ElevationInfluence = ComputeElevationInfluence(
+					CarriedSample.Elevation,
+					OceanicTrenchElevationKm,
+					MaxContinentalElevationKm);
+				const float UpliftStepKm = static_cast<float>(BaseSubductionUpliftStepKm) * DistanceInfluence * SpeedInfluence * ElevationInfluence;
+				CarriedSample.Elevation += UpliftStepKm;
+
+				const FVector OverridingVelocity = ComputeSurfaceVelocity(Plate.Id, MovedPosition);
+				const FVector SubductingVelocity = ComputeSurfaceVelocity(CarriedSample.SubductionOpposingPlateId, MovedPosition);
+				FVector FoldTarget = SubductingVelocity - OverridingVelocity;
+				FoldTarget = FoldTarget - FVector::DotProduct(FoldTarget, MovedPosition) * MovedPosition;
+				FoldTarget = FoldTarget.GetSafeNormal();
+				if (!FoldTarget.IsNearlyZero())
+				{
+					FVector ExistingFold = CarriedSample.FoldDirection;
+					ExistingFold = ExistingFold - FVector::DotProduct(ExistingFold, MovedPosition) * MovedPosition;
+					ExistingFold = ExistingFold.GetSafeNormal();
+					if (ExistingFold.IsNearlyZero())
+					{
+						ExistingFold = FoldTarget;
+					}
+
+					const float BlendAlpha = FoldBlendAtMaxSpeed * SpeedInfluence;
+					FVector BlendedFold = FMath::Lerp(ExistingFold, FoldTarget, BlendAlpha);
+					BlendedFold = BlendedFold - FVector::DotProduct(BlendedFold, MovedPosition) * MovedPosition;
+					CarriedSample.FoldDirection = BlendedFold.GetSafeNormal();
+				}
+
+				if (CarriedSample.OrogenyType == EOrogenyType::None)
+				{
+					CarriedSample.OrogenyType = EOrogenyType::Andean;
+					CarriedSample.OrogenyAge = 0.0f;
+				}
+				else
+				{
+					CarriedSample.OrogenyAge += static_cast<float>(TimestepDurationMy);
+				}
+
+				bAppliedAndeanUplift = true;
+			}
+
+			if (CarriedSample.SubductionRole == ESubductionRole::Subducting &&
+				CarriedSample.CrustType == ECrustType::Oceanic &&
+				CarriedSample.SubductionDistanceKm >= 0.0f)
+			{
+				const float SpeedInfluence = ComputeSpeedInfluence(
+					CarriedSample.SubductionConvergenceSpeedMmPerYear,
+					MaxSubductionSpeedMmPerYear);
+				const float TrenchStepKm =
+					0.5f *
+					static_cast<float>(BaseSubductionUpliftStepKm) *
+					ComputeTrenchInfluence(CarriedSample.SubductionDistanceKm, SubductionTrenchRadiusKm) *
+					SpeedInfluence;
+				CarriedSample.Elevation = FMath::Max(CarriedSample.Elevation - TrenchStepKm, OceanicTrenchElevationKm);
+			}
+
+			if (!bAppliedAndeanUplift && CarriedSample.OrogenyType != EOrogenyType::None)
+			{
+				CarriedSample.OrogenyAge += static_cast<float>(TimestepDurationMy);
+			}
+		}
+
+		if (Plate.CarriedSamples.Num() > 0 && !Plate.CanonicalCenterDirection.IsNearlyZero())
+		{
+			const FVector MovedCenter = Plate.CumulativeRotation.RotateVector(Plate.CanonicalCenterDirection).GetSafeNormal();
+			FVector MeanSlabPullVote = FVector::ZeroVector;
+			float SlabPullWeightSum = 0.0f;
+			int32 NumSubductingFrontVotes = 0;
+			for (const FCarriedSampleData& CarriedSample : Plate.CarriedSamples)
+			{
+				if (CarriedSample.SubductionRole != ESubductionRole::Subducting || !CarriedSample.bIsSubductionFront)
+				{
+					continue;
+				}
+				if (!ReadSamples.IsValidIndex(CarriedSample.CanonicalSampleIndex))
+				{
+					continue;
+				}
+
+				const FVector FrontPosition = Plate.CumulativeRotation.RotateVector(ReadSamples[CarriedSample.CanonicalSampleIndex].Position).GetSafeNormal();
+				FVector VoteDirection = FVector::CrossProduct(MovedCenter, FrontPosition);
+				VoteDirection = VoteDirection.GetSafeNormal();
+				const float VoteWeight = ComputeSpeedInfluence(
+					CarriedSample.SubductionConvergenceSpeedMmPerYear,
+					MaxSubductionSpeedMmPerYear);
+				if (!VoteDirection.IsNearlyZero() && VoteWeight > UE_SMALL_NUMBER)
+				{
+					MeanSlabPullVote += VoteDirection * VoteWeight;
+					SlabPullWeightSum += VoteWeight;
+					++NumSubductingFrontVotes;
+				}
+			}
+
+			MeanSlabPullVote = MeanSlabPullVote.GetSafeNormal();
+			if (!MeanSlabPullVote.IsNearlyZero() && SlabPullWeightSum > UE_SMALL_NUMBER)
+			{
+				const float FrontCoverage = static_cast<float>(NumSubductingFrontVotes) / static_cast<float>(Plate.CarriedSamples.Num());
+				const float MeanSpeedInfluence = SlabPullWeightSum / static_cast<float>(NumSubductingFrontVotes);
+				const float PullStrength = FMath::Clamp(
+					MeanSpeedInfluence * FMath::Sqrt(FMath::Max(FrontCoverage, 0.0f)),
+					0.0f,
+					1.0f);
+				if (PullStrength <= UE_SMALL_NUMBER)
+				{
+					continue;
+				}
+
+				FVector CurrentAxis = Plate.RotationAxis.GetSafeNormal();
+				float Dot = FVector::DotProduct(CurrentAxis, MeanSlabPullVote);
+				Dot = FMath::Clamp(Dot, -1.0f, 1.0f);
+				const float Angle = FMath::Acos(Dot);
+				if (Angle > KINDA_SMALL_NUMBER)
+				{
+					const float MaxStepRadians = FMath::DegreesToRadians(SlabPullAxisMaxDegreesPerStep * PullStrength);
+					const float RotationAngle = FMath::Min(Angle, MaxStepRadians);
+					FVector RotationAxis = FVector::CrossProduct(CurrentAxis, MeanSlabPullVote).GetSafeNormal();
+					if (RotationAxis.IsNearlyZero())
+					{
+						RotationAxis = FVector::CrossProduct(CurrentAxis, FVector::UpVector).GetSafeNormal();
+						if (RotationAxis.IsNearlyZero())
+						{
+							RotationAxis = FVector::CrossProduct(CurrentAxis, FVector::RightVector).GetSafeNormal();
+						}
+					}
+
+					if (!RotationAxis.IsNearlyZero())
+					{
+						const FQuat AxisAdjustment(RotationAxis, RotationAngle);
+						Plate.RotationAxis = AxisAdjustment.RotateVector(CurrentAxis).GetSafeNormal();
+					}
+				}
+			}
+		}
 	}
+
+	RefreshSubductionMetricsFromCarriedSamples();
 
 	if (SpatialQueryData)
 	{
@@ -586,6 +1622,8 @@ void FTectonicPlanet::Reconcile()
 
 	TArray<FVector> PlateCapCenters;
 	PlateCapCenters.SetNum(Plates.Num());
+	TArray<uint8> ActivePlateFlags;
+	ActivePlateFlags.Init(0, Plates.Num());
 	TArray<const FSpatialQueryData::FPlateSpatialState*> SpatialStateByPlateId;
 	SpatialStateByPlateId.Init(nullptr, Plates.Num());
 	if (SpatialQueryData)
@@ -598,6 +1636,7 @@ void FTectonicPlanet::Reconcile()
 				if (PlateState.bHasValidCap)
 				{
 					PlateCapCenters[PlateState.PlateId] = PlateState.CapCenterDirection.GetSafeNormal();
+					ActivePlateFlags[PlateState.PlateId] = 1;
 				}
 			}
 		}
@@ -605,18 +1644,29 @@ void FTectonicPlanet::Reconcile()
 
 	for (const FPlate& Plate : Plates)
 	{
-		if (PlateCapCenters[Plate.Id].IsNearlyZero())
+		if (PlateCapCenters[Plate.Id].IsNearlyZero() && Plate.SampleIndices.Num() > 0)
 		{
-			PlateCapCenters[Plate.Id] = Plate.CumulativeRotation.RotateVector(Plate.RotationAxis).GetSafeNormal();
+			const FVector FallbackCenter = Plate.CumulativeRotation.RotateVector(Plate.CanonicalCenterDirection).GetSafeNormal();
+			if (!FallbackCenter.IsNearlyZero())
+			{
+				PlateCapCenters[Plate.Id] = FallbackCenter;
+				ActivePlateFlags[Plate.Id] = 1;
+			}
 		}
 	}
 
-	const auto ComputeMarginFromCapCenters = [this, &PlateCapCenters](const FVector& Direction) -> float
+	const auto ComputeMarginFromCapCenters = [this, &PlateCapCenters, &ActivePlateFlags](const FVector& Direction) -> float
 	{
 		double BestDot = -TNumericLimits<double>::Max();
 		double SecondBestDot = -TNumericLimits<double>::Max();
-		for (const FVector& Center : PlateCapCenters)
+		for (int32 PlateId = 0; PlateId < PlateCapCenters.Num(); ++PlateId)
 		{
+			if (!ActivePlateFlags.IsValidIndex(PlateId) || ActivePlateFlags[PlateId] == 0)
+			{
+				continue;
+			}
+
+			const FVector& Center = PlateCapCenters[PlateId];
 			const double Dot = FVector::DotProduct(Direction, Center);
 			if (Dot > BestDot)
 			{
@@ -644,12 +1694,17 @@ void FTectonicPlanet::Reconcile()
 			: 0.0f;
 	};
 
-	const auto FindNearestPlateFromCapCenters = [&PlateCapCenters](const FVector& Direction) -> int32
+	const auto FindNearestPlateFromCapCenters = [&PlateCapCenters, &ActivePlateFlags](const FVector& Direction) -> int32
 	{
 		double BestDot = -TNumericLimits<double>::Max();
-		int32 BestPlateId = 0;
+		int32 BestPlateId = INDEX_NONE;
 		for (int32 PlateId = 0; PlateId < PlateCapCenters.Num(); ++PlateId)
 		{
+			if (!ActivePlateFlags.IsValidIndex(PlateId) || ActivePlateFlags[PlateId] == 0)
+			{
+				continue;
+			}
+
 			const double Dot = FVector::DotProduct(Direction, PlateCapCenters[PlateId]);
 			if (Dot > BestDot)
 			{
@@ -657,16 +1712,16 @@ void FTectonicPlanet::Reconcile()
 				BestPlateId = PlateId;
 			}
 		}
-		return BestPlateId;
+		return BestPlateId == INDEX_NONE ? 0 : BestPlateId;
 	};
 
 	const FSpatialQueryData* LocalSpatialQueryData = SpatialQueryData.Get();
 
 	auto QuerySinglePlateContainmentFromSpatialData =
-		[this, &SpatialStateByPlateId](const FVector& Position, const int32 PlateId, FContainmentQueryResult& OutResult) -> bool
+		[this, &SpatialStateByPlateId, &ReadSamples](const FVector& Position, const int32 PlateId, FContainmentQueryResult& OutResult) -> bool
 	{
 		OutResult = FContainmentQueryResult{};
-		if (!Plates.IsValidIndex(PlateId) || !SpatialStateByPlateId.IsValidIndex(PlateId))
+		if (!IsPlateActive(PlateId) || !SpatialStateByPlateId.IsValidIndex(PlateId))
 		{
 			return false;
 		}
@@ -696,20 +1751,18 @@ void FTectonicPlanet::Reconcile()
 		OutResult.NumContainingPlates = 1;
 		OutResult.ContainingPlateIds[0] = PlateId;
 
-		FVector3d Barycentric = ComputePlanarBarycentric(A, B, C, QueryPointLocal);
-		Barycentric.X = FMath::Max(0.0, Barycentric.X);
-		Barycentric.Y = FMath::Max(0.0, Barycentric.Y);
-		Barycentric.Z = FMath::Max(0.0, Barycentric.Z);
-		const double BarySum = Barycentric.X + Barycentric.Y + Barycentric.Z;
-		if (BarySum > UE_DOUBLE_SMALL_NUMBER)
+		const FVector3d Barycentric = NormalizeContainmentBarycentric(ComputePlanarBarycentric(A, B, C, QueryPointLocal));
+		const int32 GlobalTriangleIndex = PlateState->SoupData.GlobalTriangleIndices[LocalTriangleId];
+		if (!Triangles.IsValidIndex(GlobalTriangleIndex) || !IsPreferredPlateForTriangle(ReadSamples, Triangles[GlobalTriangleIndex], PlateId, Barycentric))
 		{
-			Barycentric /= BarySum;
+			return false;
 		}
+
 		OutResult.Barycentric = FVector(Barycentric.X, Barycentric.Y, Barycentric.Z);
 		return true;
 	};
 
-	auto QueryContainmentFromSpatialData = [this, LocalSpatialQueryData](const FVector& Position) -> FContainmentQueryResult
+	auto QueryContainmentFromSpatialData = [this, LocalSpatialQueryData, &ReadSamples](const FVector& Position) -> FContainmentQueryResult
 	{
 		FContainmentQueryResult Result;
 		if (!LocalSpatialQueryData || LocalSpatialQueryData->PlateStates.Num() == 0)
@@ -721,7 +1774,7 @@ void FTectonicPlanet::Reconcile()
 		double BestContainmentScore = -TNumericLimits<double>::Max();
 		for (const FSpatialQueryData::FPlateSpatialState& PlateState : LocalSpatialQueryData->PlateStates)
 		{
-			if (!PlateState.bHasValidCap)
+			if (!PlateState.bHasValidCap || !IsPlateActive(PlateState.PlateId))
 			{
 				continue;
 			}
@@ -749,26 +1802,25 @@ void FTectonicPlanet::Reconcile()
 				continue;
 			}
 
+			const FVector3d Barycentric = NormalizeContainmentBarycentric(ComputePlanarBarycentric(A, B, C, QueryPointLocal));
+			const int32 GlobalTriangleIndex = PlateState.SoupData.GlobalTriangleIndices[LocalTriangleId];
+			if (!Triangles.IsValidIndex(GlobalTriangleIndex) || !IsPreferredPlateForTriangle(ReadSamples, Triangles[GlobalTriangleIndex], PlateState.PlateId, Barycentric))
+			{
+				continue;
+			}
+
 			++Result.NumContainingPlates;
 			if (Result.NumContainingPlates <= UE_ARRAY_COUNT(Result.ContainingPlateIds))
 			{
 				Result.ContainingPlateIds[Result.NumContainingPlates - 1] = PlateState.PlateId;
 			}
 
-			if (DotToCap > BestContainmentScore)
+			const double ContainmentScore = ComputeContainmentScore(Barycentric);
+			if (IsBetterContainmentCandidate(ContainmentScore, PlateState.PlateId, BestContainmentScore, Result.PlateId))
 			{
-				BestContainmentScore = DotToCap;
+				BestContainmentScore = ContainmentScore;
 				Result.PlateId = PlateState.PlateId;
-				Result.TriangleIndex = PlateState.SoupData.GlobalTriangleIndices[LocalTriangleId];
-				FVector3d Barycentric = ComputePlanarBarycentric(A, B, C, QueryPointLocal);
-				Barycentric.X = FMath::Max(0.0, Barycentric.X);
-				Barycentric.Y = FMath::Max(0.0, Barycentric.Y);
-				Barycentric.Z = FMath::Max(0.0, Barycentric.Z);
-				const double BarySum = Barycentric.X + Barycentric.Y + Barycentric.Z;
-				if (BarySum > UE_DOUBLE_SMALL_NUMBER)
-				{
-					Barycentric /= BarySum;
-				}
+				Result.TriangleIndex = GlobalTriangleIndex;
 				Result.Barycentric = FVector(Barycentric.X, Barycentric.Y, Barycentric.Z);
 			}
 		}
@@ -794,7 +1846,7 @@ void FTectonicPlanet::Reconcile()
 		State.OwnershipMargin = Margin;
 		const bool bBoundaryLike = SourceSample.bIsBoundary || (SourceSample.OwnershipMargin < BoundaryConfidenceThreshold);
 
-		if (Plates.IsValidIndex(SourceSample.PrevPlateId))
+		if (!bBoundaryLike && Plates.IsValidIndex(SourceSample.PrevPlateId))
 		{
 			FContainmentQueryResult FastPathResult;
 			if (QuerySinglePlateContainmentFromSpatialData(SourceSample.Position, SourceSample.PrevPlateId, FastPathResult))
@@ -889,6 +1941,75 @@ void FTectonicPlanet::Reconcile()
 		FCanonicalSample& DestSample = WriteSamples[SampleIndex];
 		const FPhase2SampleState& State = Phase2States[SampleIndex];
 
+		auto CopyFromCarriedSample = [&ReadSamples, &DestSample](const FCarriedSampleData& SourceCarried)
+		{
+			DestSample.Elevation = SourceCarried.Elevation;
+			DestSample.Thickness = SourceCarried.Thickness;
+			DestSample.Age = SourceCarried.Age;
+			DestSample.OrogenyAge = SourceCarried.OrogenyAge;
+			DestSample.CrustType = SourceCarried.CrustType;
+			DestSample.OrogenyType = SourceCarried.OrogenyType;
+			DestSample.RidgeDirection = SourceCarried.RidgeDirection;
+			DestSample.FoldDirection = SourceCarried.FoldDirection;
+			DestSample.SubductionRole = SourceCarried.SubductionRole;
+			DestSample.SubductionOpposingPlateId = SourceCarried.SubductionOpposingPlateId;
+			DestSample.SubductionDistanceKm = SourceCarried.SubductionDistanceKm;
+			DestSample.SubductionConvergenceSpeedMmPerYear = SourceCarried.SubductionConvergenceSpeedMmPerYear;
+			DestSample.bIsSubductionFront = SourceCarried.bIsSubductionFront;
+			DestSample.CollisionDistanceKm = SourceCarried.CollisionDistanceKm;
+			DestSample.CollisionConvergenceSpeedMmPerYear = SourceCarried.CollisionConvergenceSpeedMmPerYear;
+			DestSample.bIsCollisionFront = SourceCarried.bIsCollisionFront;
+
+			if (ReadSamples.IsValidIndex(SourceCarried.CanonicalSampleIndex))
+			{
+				DestSample.TerraneId = ReadSamples[SourceCarried.CanonicalSampleIndex].TerraneId;
+			}
+			else
+			{
+				DestSample.TerraneId = INDEX_NONE;
+			}
+		};
+
+		auto TryCopyNearestAssignedPlateSample = [this, &ReadSamples, &SourceSample, &CopyFromCarriedSample](const int32 PlateId) -> bool
+		{
+			if (!Plates.IsValidIndex(PlateId))
+			{
+				return false;
+			}
+
+			const FPlate& Plate = Plates[PlateId];
+			const FVector SampleDirection = SourceSample.Position.GetSafeNormal();
+			const FCarriedSampleData* BestCarried = nullptr;
+			double BestDot = -TNumericLimits<double>::Max();
+			for (const FCarriedSampleData& CandidateCarried : Plate.CarriedSamples)
+			{
+				if (!ReadSamples.IsValidIndex(CandidateCarried.CanonicalSampleIndex))
+				{
+					continue;
+				}
+
+				const double CandidateDot = FVector::DotProduct(
+					SampleDirection,
+					ReadSamples[CandidateCarried.CanonicalSampleIndex].Position.GetSafeNormal());
+				if (!BestCarried ||
+					CandidateDot > BestDot + UE_DOUBLE_SMALL_NUMBER ||
+					(FMath::IsNearlyEqual(CandidateDot, BestDot, UE_DOUBLE_SMALL_NUMBER) &&
+						CandidateCarried.CanonicalSampleIndex < BestCarried->CanonicalSampleIndex))
+				{
+					BestCarried = &CandidateCarried;
+					BestDot = CandidateDot;
+				}
+			}
+
+			if (!BestCarried)
+			{
+				return false;
+			}
+
+			CopyFromCarriedSample(*BestCarried);
+			return true;
+		};
+
 		DestSample.PlateId = State.AssignedPlateId;
 		DestSample.PrevPlateId = SourceSample.PrevPlateId;
 		DestSample.OwnershipMargin = State.OwnershipMargin;
@@ -898,6 +2019,14 @@ void FTectonicPlanet::Reconcile()
 		DestSample.FlankingPlateIdA = INDEX_NONE;
 		DestSample.FlankingPlateIdB = INDEX_NONE;
 		DestSample.bOverlapDetected = false;
+		DestSample.SubductionRole = ESubductionRole::None;
+		DestSample.SubductionOpposingPlateId = INDEX_NONE;
+		DestSample.SubductionDistanceKm = -1.0f;
+		DestSample.SubductionConvergenceSpeedMmPerYear = 0.0f;
+		DestSample.bIsSubductionFront = false;
+		DestSample.CollisionDistanceKm = -1.0f;
+		DestSample.CollisionConvergenceSpeedMmPerYear = 0.0f;
+		DestSample.bIsCollisionFront = false;
 		DestSample.NumOverlapPlateIds = 0;
 		for (int32 OverlapIndex = 0; OverlapIndex < UE_ARRAY_COUNT(DestSample.OverlapPlateIds); ++OverlapIndex)
 		{
@@ -916,6 +2045,7 @@ void FTectonicPlanet::Reconcile()
 		const FCarriedSampleData* V2 = Lookup.FindRef(Triangle.V[2]);
 		if (!V0 || !V1 || !V2)
 		{
+			TryCopyNearestAssignedPlateSample(State.AssignedPlateId);
 			return;
 		}
 
@@ -929,8 +2059,21 @@ void FTectonicPlanet::Reconcile()
 		DestSample.Age = W0 * V0->Age + W1 * V1->Age + W2 * V2->Age;
 		DestSample.OrogenyAge = W0 * V0->OrogenyAge + W1 * V1->OrogenyAge + W2 * V2->OrogenyAge;
 
-		DestSample.CrustType = MajorityCrustType(V0->CrustType, V1->CrustType, V2->CrustType);
-		DestSample.OrogenyType = MajorityOrogenyType(V0->OrogenyType, V1->OrogenyType, V2->OrogenyType);
+		if (W0 >= W1 && W0 >= W2)
+		{
+			DestSample.CrustType = V0->CrustType;
+			DestSample.OrogenyType = V0->OrogenyType;
+		}
+		else if (W1 >= W0 && W1 >= W2)
+		{
+			DestSample.CrustType = V1->CrustType;
+			DestSample.OrogenyType = V1->OrogenyType;
+		}
+		else
+		{
+			DestSample.CrustType = V2->CrustType;
+			DestSample.OrogenyType = V2->OrogenyType;
+		}
 		DestSample.RidgeDirection = ResolveDirectionField(DestSample.Position, V0->RidgeDirection, V1->RidgeDirection, V2->RidgeDirection, Bary);
 		DestSample.FoldDirection = ResolveDirectionField(DestSample.Position, V0->FoldDirection, V1->FoldDirection, V2->FoldDirection, Bary);
 
@@ -940,40 +2083,62 @@ void FTectonicPlanet::Reconcile()
 		if (W0 >= W1 && W0 >= W2)
 		{
 			DestSample.TerraneId = TerraneId0;
+			DestSample.CollisionDistanceKm = V0->CollisionDistanceKm;
+			DestSample.CollisionConvergenceSpeedMmPerYear = V0->CollisionConvergenceSpeedMmPerYear;
+			DestSample.bIsCollisionFront = V0->bIsCollisionFront;
 		}
 		else if (W1 >= W0 && W1 >= W2)
 		{
 			DestSample.TerraneId = TerraneId1;
+			DestSample.CollisionDistanceKm = V1->CollisionDistanceKm;
+			DestSample.CollisionConvergenceSpeedMmPerYear = V1->CollisionConvergenceSpeedMmPerYear;
+			DestSample.bIsCollisionFront = V1->bIsCollisionFront;
 		}
 		else
 		{
 			DestSample.TerraneId = TerraneId2;
+			DestSample.CollisionDistanceKm = V2->CollisionDistanceKm;
+			DestSample.CollisionConvergenceSpeedMmPerYear = V2->CollisionConvergenceSpeedMmPerYear;
+			DestSample.bIsCollisionFront = V2->bIsCollisionFront;
 		}
 	});
 	Timings.Phase3InterpolationMs = (FPlatformTime::Seconds() - Phase3Start) * 1000.0;
 
-	const double Phase4Start = FPlatformTime::Seconds();
+		const double Phase4Start = FPlatformTime::Seconds();
+	TArray<uint8> GapFlags;
+	GapFlags.Init(0, Phase2States.Num());
+	for (int32 SampleIndex = 0; SampleIndex < Phase2States.Num(); ++SampleIndex)
+	{
+		GapFlags[SampleIndex] = Phase2States[SampleIndex].bGap ? 1 : 0;
+	}
+
 	int32 GapSamples = 0;
+	int32 ArtifactGapResolvedSamples = 0;
+	int32 DivergentGapSamples = 0;
 	for (int32 SampleIndex = 0; SampleIndex < WriteSamples.Num(); ++SampleIndex)
 	{
-		const FPhase2SampleState& State = Phase2States[SampleIndex];
-		FCanonicalSample& Sample = WriteSamples[SampleIndex];
-		if (!State.bGap)
+		if (!Phase2States[SampleIndex].bGap)
 		{
 			continue;
 		}
 
-		const int32 NearestPlate = FindNearestPlateFromCapCenters(Sample.Position);
-		Sample.PlateId = NearestPlate;
-		Sample.CrustType = ECrustType::Oceanic;
-		Sample.Elevation = -6.0f;
-		Sample.Thickness = 7.0f;
-		Sample.Age = 0.0f;
-		Sample.bGapDetected = true;
-		++GapSamples;
+		bool bDivergentGapCreated = false;
+		ResolveGapSamplePhase4(SampleIndex, GapFlags, WriteSamples, bDivergentGapCreated);
+		if (bDivergentGapCreated)
+		{
+			++GapSamples;
+			++DivergentGapSamples;
+		}
+		else
+		{
+			++ArtifactGapResolvedSamples;
+		}
 	}
 	Timings.GapSamples = GapSamples;
+	Timings.ArtifactGapResolvedSamples = ArtifactGapResolvedSamples;
+	Timings.DivergentGapSamples = DivergentGapSamples;
 	Timings.Phase4GapMs = (FPlatformTime::Seconds() - Phase4Start) * 1000.0;
+	StabilizeContinentalCrustForSamples(ReadSamples, WriteSamples);
 
 	const double Phase5Start = FPlatformTime::Seconds();
 	int32 OverlapSamples = 0;
@@ -997,25 +2162,38 @@ void FTectonicPlanet::Reconcile()
 	Timings.OverlapSamples = OverlapSamples;
 	Timings.Phase5OverlapMs = (FPlatformTime::Seconds() - Phase5Start) * 1000.0;
 
-	const double Phase6Start = FPlatformTime::Seconds();
 	const double Phase6SanitizeStart = FPlatformTime::Seconds();
+	RescuedProtectedPlateCount = 0;
+	RescuedProtectedSampleCount = 0;
+	RepeatedlyRescuedProtectedSampleCount = 0;
 	for (FCanonicalSample& Sample : WriteSamples)
 	{
 		if (!Plates.IsValidIndex(Sample.PlateId))
 		{
-			Sample.PlateId = FindNearestPlateFromCapCenters(Sample.Position);
+			Sample.PlateId = FindNearestPlateByCap(Sample.Position);
 		}
-		Sample.PrevPlateId = Sample.PlateId;
+	}
+
+	RunBoundaryLikeLocalOwnershipSanitizePass(Phase2States, WriteSamples, 2);
+	const double Phase6PersistenceStart = FPlatformTime::Seconds();
+	EnforceConnectedPlateOwnershipForSamples(WriteSamples);
+	const bool bRescuedProtectedOwnership = RescueProtectedPlateOwnershipForSamples(WriteSamples);
+	if (bRescuedProtectedOwnership)
+	{
+		EnforceConnectedPlateOwnershipForSamples(WriteSamples);
+	}
+	Timings.Phase6PersistenceMs = (FPlatformTime::Seconds() - Phase6PersistenceStart) * 1000.0;
+	RunBoundaryLikeLocalOwnershipSanitizePass(Phase2States, WriteSamples, 1);
+	if (bRescuedProtectedOwnership)
+	{
+		EnforceConnectedPlateOwnershipForSamples(WriteSamples);
 	}
 	Timings.Phase6SanitizeOwnershipMs = (FPlatformTime::Seconds() - Phase6SanitizeStart) * 1000.0;
 
 	const double Phase6MembershipRebuildStart = FPlatformTime::Seconds();
 	RebuildPlateMembershipFromSamples(WriteSamples);
+	UpdatePlateCanonicalCentersFromSamples(WriteSamples);
 	Timings.Phase6RebuildMembershipMs = (FPlatformTime::Seconds() - Phase6MembershipRebuildStart) * 1000.0;
-
-	const double Phase6CarriedStart = FPlatformTime::Seconds();
-	RebuildCarriedSampleWorkspacesForSamples(WriteSamples);
-	Timings.Phase6RebuildCarriedMs = (FPlatformTime::Seconds() - Phase6CarriedStart) * 1000.0;
 
 	const double Phase6ClassifyStart = FPlatformTime::Seconds();
 	ClassifyTrianglesForSamples(WriteSamples);
@@ -1032,11 +2210,43 @@ void FTectonicPlanet::Reconcile()
 		Timings.Phase6SpatialRebuiltPlateCount = SpatialQueryData->LastRebuiltPlateCount;
 	}
 
-	Timings.Phase6MembershipMs = (FPlatformTime::Seconds() - Phase6Start) * 1000.0;
+	const double Phase7TerraneStart = FPlatformTime::Seconds();
+	DetectTerranesForSamples(WriteSamples);
+	Timings.Phase7TerraneMs = (FPlatformTime::Seconds() - Phase7TerraneStart) * 1000.0;
 
-	const double Phase7Start = FPlatformTime::Seconds();
-	RunTerraneDetectionStub();
-	Timings.Phase7TerraneMs = (FPlatformTime::Seconds() - Phase7Start) * 1000.0;
+	const double Phase8CollisionStart = FPlatformTime::Seconds();
+	const bool bAppliedCollision = ApplyContinentalCollisionEventsForSamples(WriteSamples);
+	Timings.Phase8CollisionMs = (FPlatformTime::Seconds() - Phase8CollisionStart) * 1000.0;
+
+	if (bAppliedCollision)
+	{
+		const double Phase8RefreshStart = FPlatformTime::Seconds();
+		RefreshCanonicalStateAfterCollision(Phase2States, WriteSamples);
+		Timings.Phase8PostCollisionRefreshMs = (FPlatformTime::Seconds() - Phase8RefreshStart) * 1000.0;
+	}
+
+	for (FCanonicalSample& Sample : WriteSamples)
+	{
+		Sample.PrevPlateId = Sample.PlateId;
+	}
+
+	const double Phase9Start = FPlatformTime::Seconds();
+	UpdateSubductionFieldsForSamples(WriteSamples);
+	Timings.Phase9SubductionMs = (FPlatformTime::Seconds() - Phase9Start) * 1000.0;
+	Timings.Phase7SubductionMs = Timings.Phase9SubductionMs;
+
+	const double Phase6CarriedStart = FPlatformTime::Seconds();
+	RebuildCarriedSampleWorkspacesForSamples(WriteSamples);
+	Timings.Phase6RebuildCarriedMs = (FPlatformTime::Seconds() - Phase6CarriedStart) * 1000.0;
+
+	ReadableSampleBufferIndex.Store(WriteBufferIndex);
+
+	Timings.Phase6MembershipMs =
+		Timings.Phase6SanitizeOwnershipMs +
+		Timings.Phase6RebuildMembershipMs +
+		Timings.Phase6ClassifyTrianglesMs +
+		Timings.Phase6RebuildCarriedMs +
+		Timings.Phase6SpatialRebuildMs;
 
 	LastGapSampleCount = GapSamples;
 	LastOverlapSampleCount = OverlapSamples;
@@ -1047,7 +2257,7 @@ void FTectonicPlanet::Reconcile()
 	ResetDisplacementTracking();
 
 	UE_LOG(LogTemp, Log,
-		TEXT("Reconcile timings (ms): P1=%.3f P2=%.3f P3=%.3f P4=%.3f P5=%.3f P6=%.3f P7=%.3f Total=%.3f Gap=%d Overlap=%d"),
+		TEXT("Reconcile timings (ms): P1=%.3f P2=%.3f P3=%.3f P4=%.3f P5=%.3f P6=%.3f P7=%.3f P8=%.3f P8b=%.3f P9=%.3f Total=%.3f Gap=%d ArtifactResolved=%d DivergentGap=%d Overlap=%d"),
 		LastReconcileTimings.Phase1BuildSpatialMs,
 		LastReconcileTimings.Phase2OwnershipMs,
 		LastReconcileTimings.Phase3InterpolationMs,
@@ -1055,11 +2265,16 @@ void FTectonicPlanet::Reconcile()
 		LastReconcileTimings.Phase5OverlapMs,
 		LastReconcileTimings.Phase6MembershipMs,
 		LastReconcileTimings.Phase7TerraneMs,
+		LastReconcileTimings.Phase8CollisionMs,
+		LastReconcileTimings.Phase8PostCollisionRefreshMs,
+		LastReconcileTimings.Phase9SubductionMs,
 		LastReconcileTimings.TotalMs,
 		LastReconcileTimings.GapSamples,
+		LastReconcileTimings.ArtifactGapResolvedSamples,
+		LastReconcileTimings.DivergentGapSamples,
 		LastReconcileTimings.OverlapSamples);
 	UE_LOG(LogTemp, Log,
-		TEXT("Reconcile subphase (ms): P1 Soup sum/max=%.3f/%.3f Cap sum/max=%.3f/%.3f BVH sum/max=%.3f/%.3f | P6 Sanitize=%.3f Membership=%.3f Carried=%.3f Classify=%.3f SpatialRebuild=%.3f"),
+		TEXT("Reconcile subphase (ms): P1 Soup sum/max=%.3f/%.3f Cap sum/max=%.3f/%.3f BVH sum/max=%.3f/%.3f | P6 Sanitize=%.3f Membership=%.3f Carried=%.3f Classify=%.3f SpatialRebuild=%.3f | P7 Terrane=%.3f P8 Collision=%.3f P8b Refresh=%.3f P9 Subduction=%.3f"),
 		LastReconcileTimings.Phase1SoupExtractTotalMs,
 		LastReconcileTimings.Phase1SoupExtractMaxMs,
 		LastReconcileTimings.Phase1CapBuildTotalMs,
@@ -1070,7 +2285,11 @@ void FTectonicPlanet::Reconcile()
 		LastReconcileTimings.Phase6RebuildMembershipMs,
 		LastReconcileTimings.Phase6RebuildCarriedMs,
 		LastReconcileTimings.Phase6ClassifyTrianglesMs,
-		LastReconcileTimings.Phase6SpatialRebuildMs);
+		LastReconcileTimings.Phase6SpatialRebuildMs,
+		LastReconcileTimings.Phase7TerraneMs,
+		LastReconcileTimings.Phase8CollisionMs,
+		LastReconcileTimings.Phase8PostCollisionRefreshMs,
+		LastReconcileTimings.Phase9SubductionMs);
 	UE_LOG(LogTemp, Log,
 		TEXT("Reconcile spatial rebuild stats: dirty_plates=%d rebuilt_plates=%d"),
 		LastReconcileTimings.Phase6SpatialDirtyPlateCount,
@@ -1079,6 +2298,1555 @@ void FTectonicPlanet::Reconcile()
 		TEXT("Reconcile phase2 fast-path: resolved=%d full_query=%d"),
 		LastReconcileTimings.Phase2FastPathResolvedSamples,
 		LastReconcileTimings.Phase2FullQuerySamples);
+
+	const double SampleCountForDiagnostics = static_cast<double>(FMath::Max(1, WriteSamples.Num()));
+	const double GapPct = 100.0 * static_cast<double>(LastReconcileTimings.GapSamples) / SampleCountForDiagnostics;
+	const double OverlapPct = 100.0 * static_cast<double>(LastReconcileTimings.OverlapSamples) / SampleCountForDiagnostics;
+	const double BoundaryDeepPct = (BoundarySampleCount > 0)
+		? (100.0 * static_cast<double>(BoundaryDeepSampleCount) / static_cast<double>(BoundarySampleCount))
+		: 0.0;
+	const double LargestContinentalPct = (ContinentalSampleCount > 0)
+		? (100.0 * static_cast<double>(LargestContinentalComponentSize) / static_cast<double>(ContinentalSampleCount))
+		: 0.0;
+	const double ContinentalAreaPct = 100.0 * ContinentalAreaFraction;
+	UE_LOG(LogTemp, Log,
+		TEXT("Reconcile diagnostics: Gap=%.3f%% Overlap=%.3f%% BoundaryMeanDepth=%.3f BoundaryMaxDepth=%d BoundaryDeep=%d (%.3f%%) ContinentalPlates=%d ContinentalArea=%.3f%% ContinentalComponents=%d LargestContinent=%d/%d (%.3f%%) MaxPlateComponents=%d DetachedPlateFragments=%d LargestDetachedFragment=%d SubductionFronts=%d Andean=%d PendingCollision=%d MaxSubductionDistance=%.1fkm"),
+		GapPct,
+		OverlapPct,
+		BoundaryMeanDepthHops,
+		BoundaryMaxDepthHops,
+		BoundaryDeepSampleCount,
+		BoundaryDeepPct,
+		ContinentalPlateCount,
+		ContinentalAreaPct,
+		ContinentalComponentCount,
+		LargestContinentalComponentSize,
+		ContinentalSampleCount,
+		LargestContinentalPct,
+		MaxPlateComponentCount,
+		DetachedPlateFragmentSampleCount,
+		LargestDetachedPlateFragmentSize,
+		SubductionFrontSampleCount,
+		AndeanSampleCount,
+		PendingCollisionSampleCount,
+		MaxSubductionDistanceKm);
+}
+
+bool FTectonicPlanet::ResolveGapSamplePhase4(
+	int32 SampleIndex,
+	const TArray<uint8>& GapFlags,
+	TArray<FCanonicalSample>& InOutSamples,
+	bool& bOutDivergentGapCreated) const
+{
+	bOutDivergentGapCreated = false;
+	if (!InOutSamples.IsValidIndex(SampleIndex) || !Adjacency.IsValidIndex(SampleIndex))
+	{
+		return false;
+	}
+
+	constexpr float RidgeTemplateElevationKm = RidgeElevationKm;
+	constexpr float OceanicFallbackElevationKm = AbyssalPlainElevationKm;
+	constexpr float OceanicThicknessKm = OceanicCrustThicknessKm;
+	constexpr int32 MaxNeighborPlateBins = 16;
+	constexpr double DivergentGapThresholdRatio = 0.3;
+
+	FCanonicalSample& Sample = InOutSamples[SampleIndex];
+	const FVector Position = Sample.Position.GetSafeNormal();
+	const int32 PreviousOwner = Sample.PrevPlateId;
+
+	auto ClearGapClassification = [&Sample]()
+	{
+		Sample.bGapDetected = false;
+		Sample.FlankingPlateIdA = INDEX_NONE;
+		Sample.FlankingPlateIdB = INDEX_NONE;
+		Sample.RidgeDirection = FVector::ZeroVector;
+	};
+
+	auto CopyResolvedGapFromNeighbor = [&InOutSamples, &Sample, &ClearGapClassification](const int32 AssignedPlateId, const int32 SourceNeighborIndex)
+	{
+		if (AssignedPlateId != INDEX_NONE)
+		{
+			Sample.PlateId = AssignedPlateId;
+		}
+		ClearGapClassification();
+		if (!InOutSamples.IsValidIndex(SourceNeighborIndex))
+		{
+			return;
+		}
+
+		const FCanonicalSample& SourceNeighbor = InOutSamples[SourceNeighborIndex];
+		Sample.CrustType = SourceNeighbor.CrustType;
+		Sample.Elevation = SourceNeighbor.Elevation;
+		Sample.Thickness = SourceNeighbor.Thickness;
+		Sample.Age = SourceNeighbor.Age;
+		Sample.RidgeDirection = SourceNeighbor.RidgeDirection;
+		Sample.FoldDirection = SourceNeighbor.FoldDirection;
+		Sample.OrogenyType = SourceNeighbor.OrogenyType;
+		Sample.OrogenyAge = SourceNeighbor.OrogenyAge;
+		Sample.TerraneId = SourceNeighbor.TerraneId;
+		Sample.CollisionDistanceKm = SourceNeighbor.CollisionDistanceKm;
+		Sample.CollisionConvergenceSpeedMmPerYear = SourceNeighbor.CollisionConvergenceSpeedMmPerYear;
+		Sample.bIsCollisionFront = SourceNeighbor.bIsCollisionFront;
+	};
+
+	if (Position.IsNearlyZero())
+	{
+		CopyResolvedGapFromNeighbor(Plates.IsValidIndex(PreviousOwner) ? PreviousOwner : FindNearestPlateByCap(Sample.Position), INDEX_NONE);
+		return true;
+	}
+
+	TArray<int32, TInlineAllocator<32>> FirstRing;
+	for (const int32 NeighborIndex : Adjacency[SampleIndex])
+	{
+		if (InOutSamples.IsValidIndex(NeighborIndex))
+		{
+			FirstRing.AddUnique(NeighborIndex);
+		}
+	}
+
+	TArray<int32, TInlineAllocator<96>> Neighborhood;
+	Neighborhood.Append(FirstRing);
+	for (const int32 NeighborIndex : FirstRing)
+	{
+		if (!Adjacency.IsValidIndex(NeighborIndex))
+		{
+			continue;
+		}
+
+		for (const int32 SecondRingIndex : Adjacency[NeighborIndex])
+		{
+			if (SecondRingIndex != SampleIndex && InOutSamples.IsValidIndex(SecondRingIndex))
+			{
+				Neighborhood.AddUnique(SecondRingIndex);
+			}
+		}
+	}
+
+	int32 NeighborPlateIds[MaxNeighborPlateBins];
+	int32 NeighborPlateCounts[MaxNeighborPlateBins];
+	int32 NumNeighborPlates = 0;
+	for (int32 SlotIndex = 0; SlotIndex < MaxNeighborPlateBins; ++SlotIndex)
+	{
+		NeighborPlateIds[SlotIndex] = INDEX_NONE;
+		NeighborPlateCounts[SlotIndex] = 0;
+	}
+
+	auto AccumulateNeighborPlate = [&NeighborPlateIds, &NeighborPlateCounts, &NumNeighborPlates](const int32 PlateId)
+	{
+		int32 ExistingSlot = INDEX_NONE;
+		for (int32 SlotIndex = 0; SlotIndex < NumNeighborPlates; ++SlotIndex)
+		{
+			if (NeighborPlateIds[SlotIndex] == PlateId)
+			{
+				ExistingSlot = SlotIndex;
+				break;
+			}
+		}
+
+		if (ExistingSlot != INDEX_NONE)
+		{
+			++NeighborPlateCounts[ExistingSlot];
+		}
+		else if (NumNeighborPlates < MaxNeighborPlateBins)
+		{
+			NeighborPlateIds[NumNeighborPlates] = PlateId;
+			NeighborPlateCounts[NumNeighborPlates] = 1;
+			++NumNeighborPlates;
+		}
+	};
+
+	for (const int32 NeighborIndex : FirstRing)
+	{
+		if (!InOutSamples.IsValidIndex(NeighborIndex))
+		{
+			continue;
+		}
+		if (GapFlags.IsValidIndex(NeighborIndex) && GapFlags[NeighborIndex] != 0)
+		{
+			continue;
+		}
+
+		const int32 NeighborPlateId = InOutSamples[NeighborIndex].PlateId;
+		if (Plates.IsValidIndex(NeighborPlateId))
+		{
+			AccumulateNeighborPlate(NeighborPlateId);
+		}
+	}
+
+	auto FindNearestSamePlateSample = [this, &InOutSamples, &GapFlags, &Neighborhood, &Sample](const int32 PlateId, const bool bRequireBoundary, int32& OutSampleIndex, double& OutDistSq)
+	{
+		OutSampleIndex = INDEX_NONE;
+		OutDistSq = TNumericLimits<double>::Max();
+		if (!Plates.IsValidIndex(PlateId))
+		{
+			return;
+		}
+
+		for (const int32 CandidateIndex : Neighborhood)
+		{
+			if (!InOutSamples.IsValidIndex(CandidateIndex))
+			{
+				continue;
+			}
+			if (GapFlags.IsValidIndex(CandidateIndex) && GapFlags[CandidateIndex] != 0)
+			{
+				continue;
+			}
+
+			const FCanonicalSample& Candidate = InOutSamples[CandidateIndex];
+			if (Candidate.PlateId != PlateId)
+			{
+				continue;
+			}
+			if (bRequireBoundary && !Candidate.bIsBoundary)
+			{
+				continue;
+			}
+
+			const double DistSq = FVector::DistSquared(Sample.Position, Candidate.Position);
+			if (DistSq < OutDistSq)
+			{
+				OutDistSq = DistSq;
+				OutSampleIndex = CandidateIndex;
+			}
+		}
+	};
+
+	auto FindDominantPlateId = [&NeighborPlateIds, &NeighborPlateCounts, NumNeighborPlates]() -> int32
+	{
+		int32 DominantPlateId = INDEX_NONE;
+		int32 DominantPlateCount = 0;
+		for (int32 SlotIndex = 0; SlotIndex < NumNeighborPlates; ++SlotIndex)
+		{
+			const int32 PlateId = NeighborPlateIds[SlotIndex];
+			const int32 PlateCount = NeighborPlateCounts[SlotIndex];
+			if (DominantPlateId == INDEX_NONE ||
+				PlateCount > DominantPlateCount ||
+				(PlateCount == DominantPlateCount && PlateId < DominantPlateId))
+			{
+				DominantPlateId = PlateId;
+				DominantPlateCount = PlateCount;
+			}
+		}
+		return DominantPlateId;
+	};
+
+	if (NumNeighborPlates <= 0)
+	{
+		CopyResolvedGapFromNeighbor(Plates.IsValidIndex(PreviousOwner) ? PreviousOwner : FindNearestPlateByCap(Position), INDEX_NONE);
+		return true;
+	}
+
+	if (NumNeighborPlates == 1)
+	{
+		int32 NearestSampleIndex = INDEX_NONE;
+		double NearestSampleDistSq = TNumericLimits<double>::Max();
+		FindNearestSamePlateSample(NeighborPlateIds[0], false, NearestSampleIndex, NearestSampleDistSq);
+		CopyResolvedGapFromNeighbor(NeighborPlateIds[0], NearestSampleIndex);
+		return true;
+	}
+
+	if (NumNeighborPlates >= 3)
+	{
+		const int32 DominantPlateId = FindDominantPlateId();
+		int32 NearestSampleIndex = INDEX_NONE;
+		double NearestSampleDistSq = TNumericLimits<double>::Max();
+		FindNearestSamePlateSample(DominantPlateId, false, NearestSampleIndex, NearestSampleDistSq);
+		CopyResolvedGapFromNeighbor(DominantPlateId, NearestSampleIndex);
+		return true;
+	}
+
+	int32 BestIndexA = INDEX_NONE;
+	int32 BestIndexB = INDEX_NONE;
+	for (int32 SlotIndex = 0; SlotIndex < NumNeighborPlates; ++SlotIndex)
+	{
+		if (BestIndexA == INDEX_NONE ||
+			NeighborPlateCounts[SlotIndex] > NeighborPlateCounts[BestIndexA] ||
+			(NeighborPlateCounts[SlotIndex] == NeighborPlateCounts[BestIndexA] && NeighborPlateIds[SlotIndex] < NeighborPlateIds[BestIndexA]))
+		{
+			BestIndexB = BestIndexA;
+			BestIndexA = SlotIndex;
+			continue;
+		}
+
+		if (BestIndexB == INDEX_NONE ||
+			NeighborPlateCounts[SlotIndex] > NeighborPlateCounts[BestIndexB] ||
+			(NeighborPlateCounts[SlotIndex] == NeighborPlateCounts[BestIndexB] && NeighborPlateIds[SlotIndex] < NeighborPlateIds[BestIndexB]))
+		{
+			BestIndexB = SlotIndex;
+		}
+	}
+
+	int32 FlankPlateA = (BestIndexA != INDEX_NONE) ? NeighborPlateIds[BestIndexA] : INDEX_NONE;
+	int32 FlankPlateB = (BestIndexB != INDEX_NONE) ? NeighborPlateIds[BestIndexB] : INDEX_NONE;
+	if (!Plates.IsValidIndex(FlankPlateA))
+	{
+		FlankPlateA = Plates.IsValidIndex(PreviousOwner) ? PreviousOwner : FindNearestPlateByCap(Position);
+	}
+	if (!Plates.IsValidIndex(FlankPlateB) || FlankPlateB == FlankPlateA)
+	{
+		FlankPlateB = INDEX_NONE;
+	}
+
+	int32 BorderSampleA = INDEX_NONE;
+	int32 BorderSampleB = INDEX_NONE;
+	double DistSqA = TNumericLimits<double>::Max();
+	double DistSqB = TNumericLimits<double>::Max();
+	FindNearestSamePlateSample(FlankPlateA, true, BorderSampleA, DistSqA);
+	FindNearestSamePlateSample(FlankPlateB, true, BorderSampleB, DistSqB);
+	if (!InOutSamples.IsValidIndex(BorderSampleA))
+	{
+		FindNearestSamePlateSample(FlankPlateA, false, BorderSampleA, DistSqA);
+	}
+	if (!InOutSamples.IsValidIndex(BorderSampleB))
+	{
+		FindNearestSamePlateSample(FlankPlateB, false, BorderSampleB, DistSqB);
+	}
+
+	int32 AssignedPlateId = INDEX_NONE;
+	if (InOutSamples.IsValidIndex(BorderSampleA) && InOutSamples.IsValidIndex(BorderSampleB))
+	{
+		AssignedPlateId = (DistSqA <= DistSqB) ? FlankPlateA : FlankPlateB;
+	}
+	else if (InOutSamples.IsValidIndex(BorderSampleA))
+	{
+		AssignedPlateId = FlankPlateA;
+	}
+	else if (InOutSamples.IsValidIndex(BorderSampleB))
+	{
+		AssignedPlateId = FlankPlateB;
+	}
+	else if (Plates.IsValidIndex(PreviousOwner))
+	{
+		AssignedPlateId = PreviousOwner;
+	}
+	else
+	{
+		AssignedPlateId = FindNearestPlateByCap(Position);
+	}
+
+	const int32 NearestResolvedFlankSample =
+		(InOutSamples.IsValidIndex(BorderSampleA) && InOutSamples.IsValidIndex(BorderSampleB))
+			? ((DistSqA <= DistSqB) ? BorderSampleA : BorderSampleB)
+			: (InOutSamples.IsValidIndex(BorderSampleA) ? BorderSampleA : BorderSampleB);
+	const bool bHasValidFlankPair =
+		Plates.IsValidIndex(FlankPlateA) &&
+		Plates.IsValidIndex(FlankPlateB) &&
+		FlankPlateA != FlankPlateB &&
+		InOutSamples.IsValidIndex(BorderSampleA) &&
+		InOutSamples.IsValidIndex(BorderSampleB);
+
+	FVector RidgeDirection = FVector::ZeroVector;
+	bool bDivergentGap = false;
+	if (bHasValidFlankPair)
+	{
+		const FVector RelativeVelocity = ComputeSurfaceVelocity(FlankPlateA, Position) - ComputeSurfaceVelocity(FlankPlateB, Position);
+		const double RelativeSpeed = RelativeVelocity.Size();
+		FVector AcrossGap = InOutSamples[BorderSampleB].Position - InOutSamples[BorderSampleA].Position;
+		AcrossGap = AcrossGap - FVector::DotProduct(AcrossGap, Position) * Position;
+		AcrossGap = AcrossGap.GetSafeNormal();
+		if (!AcrossGap.IsNearlyZero() && RelativeSpeed > 1e-8)
+		{
+			const double NormalComponent = FVector::DotProduct(RelativeVelocity, AcrossGap);
+			bDivergentGap = NormalComponent < -(DivergentGapThresholdRatio * RelativeSpeed);
+			RidgeDirection = FVector::CrossProduct(RelativeVelocity, Position);
+		}
+	}
+
+	if (!bHasValidFlankPair || !bDivergentGap)
+	{
+		CopyResolvedGapFromNeighbor(AssignedPlateId, NearestResolvedFlankSample);
+		return true;
+	}
+
+	float BorderElevation = OceanicFallbackElevationKm;
+	if (InOutSamples.IsValidIndex(BorderSampleA) && InOutSamples.IsValidIndex(BorderSampleB))
+	{
+		const float ElevationA = InOutSamples[BorderSampleA].Elevation;
+		const float ElevationB = InOutSamples[BorderSampleB].Elevation;
+		const double DistA = FMath::Sqrt(FMath::Max(0.0, DistSqA));
+		const double DistB = FMath::Sqrt(FMath::Max(0.0, DistSqB));
+		const double WeightA = 1.0 / FMath::Max(1e-6, DistA);
+		const double WeightB = 1.0 / FMath::Max(1e-6, DistB);
+		const double WeightSum = WeightA + WeightB;
+		BorderElevation = (WeightSum > UE_DOUBLE_SMALL_NUMBER)
+			? static_cast<float>((WeightA * ElevationA + WeightB * ElevationB) / WeightSum)
+			: 0.5f * (ElevationA + ElevationB);
+	}
+	else if (InOutSamples.IsValidIndex(BorderSampleA))
+	{
+		BorderElevation = InOutSamples[BorderSampleA].Elevation;
+	}
+	else if (InOutSamples.IsValidIndex(BorderSampleB))
+	{
+		BorderElevation = InOutSamples[BorderSampleB].Elevation;
+	}
+
+	float RidgeBlendedElevation = BorderElevation;
+	if (InOutSamples.IsValidIndex(BorderSampleA) && InOutSamples.IsValidIndex(BorderSampleB))
+	{
+		const double DistA = FMath::Sqrt(FMath::Max(0.0, DistSqA));
+		const double DistB = FMath::Sqrt(FMath::Max(0.0, DistSqB));
+		const double DistanceToRidge = 0.5 * FMath::Abs(DistA - DistB);
+		const double DistanceToBorder = FMath::Min(DistA, DistB);
+		const double AlphaDenominator = DistanceToRidge + DistanceToBorder;
+		const double Alpha = (AlphaDenominator > UE_DOUBLE_SMALL_NUMBER)
+			? FMath::Clamp(DistanceToRidge / AlphaDenominator, 0.0, 1.0)
+			: 0.0;
+		RidgeBlendedElevation = static_cast<float>(Alpha * BorderElevation + (1.0 - Alpha) * static_cast<double>(RidgeTemplateElevationKm));
+	}
+
+	if (RidgeDirection.IsNearlyZero() && InOutSamples.IsValidIndex(BorderSampleA) && InOutSamples.IsValidIndex(BorderSampleB))
+	{
+		FVector AcrossGap = InOutSamples[BorderSampleB].Position - InOutSamples[BorderSampleA].Position;
+		AcrossGap = AcrossGap - FVector::DotProduct(AcrossGap, Position) * Position;
+		AcrossGap = AcrossGap.GetSafeNormal();
+		RidgeDirection = FVector::CrossProduct(AcrossGap, Position);
+	}
+	RidgeDirection = RidgeDirection - FVector::DotProduct(RidgeDirection, Position) * Position;
+	RidgeDirection = RidgeDirection.GetSafeNormal();
+
+	Sample.PlateId = AssignedPlateId;
+	Sample.CrustType = ECrustType::Oceanic;
+	Sample.Elevation = RidgeBlendedElevation;
+	Sample.Thickness = OceanicThicknessKm;
+	Sample.Age = 0.0f;
+	Sample.RidgeDirection = RidgeDirection;
+	Sample.FoldDirection = FVector::ZeroVector;
+	Sample.OrogenyType = EOrogenyType::None;
+	Sample.OrogenyAge = 0.0f;
+	Sample.TerraneId = INDEX_NONE;
+	Sample.CollisionDistanceKm = -1.0f;
+	Sample.CollisionConvergenceSpeedMmPerYear = 0.0f;
+	Sample.bIsCollisionFront = false;
+	Sample.bGapDetected = true;
+	Sample.FlankingPlateIdA = FlankPlateA;
+	Sample.FlankingPlateIdB = FlankPlateB;
+	bOutDivergentGapCreated = true;
+	return true;
+}
+
+void FTectonicPlanet::StabilizeContinentalCrustForSamples(
+	const TArray<FCanonicalSample>& PreviousSamples,
+	TArray<FCanonicalSample>& InOutSamples) const
+{
+	const int32 NumSamples = InOutSamples.Num();
+	if (NumSamples <= 0 || PreviousSamples.Num() != NumSamples || Adjacency.Num() != NumSamples)
+	{
+		return;
+	}
+
+	int32 PreviousContinentalCount = 0;
+	int32 CurrentContinentalCount = 0;
+	for (int32 SampleIndex = 0; SampleIndex < NumSamples; ++SampleIndex)
+	{
+		PreviousContinentalCount += (PreviousSamples[SampleIndex].CrustType == ECrustType::Continental) ? 1 : 0;
+		CurrentContinentalCount += (InOutSamples[SampleIndex].CrustType == ECrustType::Continental) ? 1 : 0;
+	}
+
+	const double ClampedMinimumContinentalFraction = FMath::Clamp(MinContinentalAreaFraction, 0.0, 1.0);
+	const int32 MinimumContinentalSamples = FMath::Clamp(
+		FMath::CeilToInt(ClampedMinimumContinentalFraction * static_cast<double>(NumSamples)),
+		0,
+		NumSamples);
+	const int32 MaximumContinentalComponents =
+		(InitialContinentalPlateCount > 0)
+			? (3 * InitialContinentalPlateCount)
+			: TNumericLimits<int32>::Max();
+
+	if (CurrentContinentalCount >= MinimumContinentalSamples &&
+		CurrentContinentalCount <= PreviousContinentalCount &&
+		MaximumContinentalComponents == TNumericLimits<int32>::Max())
+	{
+		return;
+	}
+
+	auto CopyOceanicTemplateToSample = [&InOutSamples](const FCanonicalSample& TemplateSample, const int32 SampleIndex)
+	{
+		FCanonicalSample& Sample = InOutSamples[SampleIndex];
+		Sample.CrustType = ECrustType::Oceanic;
+		Sample.Elevation = TemplateSample.Elevation;
+		Sample.Thickness = TemplateSample.Thickness;
+		Sample.Age = TemplateSample.Age;
+		Sample.RidgeDirection = TemplateSample.RidgeDirection;
+		Sample.FoldDirection = TemplateSample.FoldDirection;
+		Sample.OrogenyType = EOrogenyType::None;
+		Sample.OrogenyAge = 0.0f;
+		Sample.TerraneId = INDEX_NONE;
+		Sample.CollisionDistanceKm = -1.0f;
+		Sample.CollisionConvergenceSpeedMmPerYear = 0.0f;
+		Sample.bIsCollisionFront = false;
+	};
+
+	auto ResetSampleToOceanicDefaults = [this, &InOutSamples](const int32 SampleIndex)
+	{
+		FCanonicalSample& Sample = InOutSamples[SampleIndex];
+		Sample.CrustType = ECrustType::Oceanic;
+		Sample.Elevation = AbyssalPlainElevationKm;
+		Sample.Thickness = OceanicCrustThicknessKm;
+		Sample.Age = 0.0f;
+		Sample.RidgeDirection = FVector::ZeroVector;
+		Sample.FoldDirection = FVector::ZeroVector;
+		Sample.OrogenyType = EOrogenyType::None;
+		Sample.OrogenyAge = 0.0f;
+		Sample.TerraneId = INDEX_NONE;
+		Sample.CollisionDistanceKm = -1.0f;
+		Sample.CollisionConvergenceSpeedMmPerYear = 0.0f;
+		Sample.bIsCollisionFront = false;
+	};
+
+	auto DemoteSampleToOceanic = [this, &PreviousSamples, &InOutSamples, &CopyOceanicTemplateToSample, &ResetSampleToOceanicDefaults](const int32 SampleIndex)
+	{
+		if (!InOutSamples.IsValidIndex(SampleIndex))
+		{
+			return;
+		}
+
+		if (PreviousSamples[SampleIndex].CrustType == ECrustType::Oceanic)
+		{
+			CopyOceanicTemplateToSample(PreviousSamples[SampleIndex], SampleIndex);
+			return;
+		}
+
+		int32 BestNeighborIndex = INDEX_NONE;
+		double BestDistSq = TNumericLimits<double>::Max();
+		auto ConsiderOceanicCandidate = [this, &InOutSamples, SampleIndex, &BestNeighborIndex, &BestDistSq](const int32 CandidateIndex)
+		{
+			if (!InOutSamples.IsValidIndex(CandidateIndex))
+			{
+				return;
+			}
+
+			const FCanonicalSample& Candidate = InOutSamples[CandidateIndex];
+			if (Candidate.CrustType != ECrustType::Oceanic || Candidate.bGapDetected)
+			{
+				return;
+			}
+
+			const double CandidateDistSq = FVector::DistSquared(InOutSamples[SampleIndex].Position, Candidate.Position);
+			if (BestNeighborIndex == INDEX_NONE ||
+				CandidateDistSq < BestDistSq - UE_DOUBLE_SMALL_NUMBER ||
+				(FMath::IsNearlyEqual(CandidateDistSq, BestDistSq, UE_DOUBLE_SMALL_NUMBER) && CandidateIndex < BestNeighborIndex))
+			{
+				BestNeighborIndex = CandidateIndex;
+				BestDistSq = CandidateDistSq;
+			}
+		};
+
+		for (const int32 NeighborIndex : Adjacency[SampleIndex])
+		{
+			ConsiderOceanicCandidate(NeighborIndex);
+		}
+		if (BestNeighborIndex == INDEX_NONE)
+		{
+			for (const int32 NeighborIndex : Adjacency[SampleIndex])
+			{
+				if (!Adjacency.IsValidIndex(NeighborIndex))
+				{
+					continue;
+				}
+
+				for (const int32 SecondRingIndex : Adjacency[NeighborIndex])
+				{
+					if (SecondRingIndex != SampleIndex)
+					{
+						ConsiderOceanicCandidate(SecondRingIndex);
+					}
+				}
+			}
+		}
+
+		if (BestNeighborIndex != INDEX_NONE)
+		{
+			CopyOceanicTemplateToSample(InOutSamples[BestNeighborIndex], SampleIndex);
+			return;
+		}
+
+		ResetSampleToOceanicDefaults(SampleIndex);
+	};
+
+	auto PromoteSampleFromPrevious = [&PreviousSamples, &InOutSamples](const int32 SampleIndex)
+	{
+		if (!PreviousSamples.IsValidIndex(SampleIndex) || !InOutSamples.IsValidIndex(SampleIndex))
+		{
+			return;
+		}
+
+		const FCanonicalSample& PreviousSample = PreviousSamples[SampleIndex];
+		if (PreviousSample.CrustType != ECrustType::Continental)
+		{
+			return;
+		}
+
+		FCanonicalSample& Sample = InOutSamples[SampleIndex];
+		Sample.CrustType = ECrustType::Continental;
+		Sample.Elevation = PreviousSample.Elevation;
+		Sample.Thickness = PreviousSample.Thickness;
+		Sample.Age = PreviousSample.Age;
+		Sample.RidgeDirection = PreviousSample.RidgeDirection;
+		Sample.FoldDirection = PreviousSample.FoldDirection;
+		Sample.OrogenyType = PreviousSample.OrogenyType;
+		Sample.OrogenyAge = PreviousSample.OrogenyAge;
+		Sample.TerraneId = PreviousSample.TerraneId;
+		Sample.CollisionDistanceKm = -1.0f;
+		Sample.CollisionConvergenceSpeedMmPerYear = 0.0f;
+		Sample.bIsCollisionFront = false;
+	};
+
+	struct FContinentalPromotionCandidate
+	{
+		int32 SampleIndex = INDEX_NONE;
+		int32 CurrentContinentalNeighborCount = 0;
+		int32 PreviousContinentalNeighborCount = 0;
+	};
+
+	if (CurrentContinentalCount < MinimumContinentalSamples)
+	{
+		auto CountCurrentContinentalNeighbors = [&InOutSamples, this](const int32 SampleIndex)
+		{
+			int32 NeighborCount = 0;
+			for (const int32 NeighborIndex : Adjacency[SampleIndex])
+			{
+				if (InOutSamples.IsValidIndex(NeighborIndex) &&
+					!InOutSamples[NeighborIndex].bGapDetected &&
+					InOutSamples[NeighborIndex].CrustType == ECrustType::Continental)
+				{
+					++NeighborCount;
+				}
+			}
+			return NeighborCount;
+		};
+
+		auto CountPreviousContinentalNeighbors = [&PreviousSamples, this](const int32 SampleIndex)
+		{
+			int32 NeighborCount = 0;
+			for (const int32 NeighborIndex : Adjacency[SampleIndex])
+			{
+				if (PreviousSamples.IsValidIndex(NeighborIndex) &&
+					PreviousSamples[NeighborIndex].CrustType == ECrustType::Continental)
+				{
+					++NeighborCount;
+				}
+			}
+			return NeighborCount;
+		};
+
+		auto FindBestPromotionCandidate =
+			[this, &InOutSamples, &PreviousSamples, &CountCurrentContinentalNeighbors, &CountPreviousContinentalNeighbors](const bool bRequireCurrentAdjacency)
+		{
+			FContinentalPromotionCandidate BestCandidate;
+			for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
+			{
+				if (InOutSamples[SampleIndex].CrustType == ECrustType::Continental ||
+					InOutSamples[SampleIndex].bGapDetected ||
+					PreviousSamples[SampleIndex].CrustType != ECrustType::Continental)
+				{
+					continue;
+				}
+
+				FContinentalPromotionCandidate Candidate;
+				Candidate.SampleIndex = SampleIndex;
+				Candidate.CurrentContinentalNeighborCount = CountCurrentContinentalNeighbors(SampleIndex);
+				Candidate.PreviousContinentalNeighborCount = CountPreviousContinentalNeighbors(SampleIndex);
+				if (bRequireCurrentAdjacency && Candidate.CurrentContinentalNeighborCount <= 0)
+				{
+					continue;
+				}
+
+				const bool bBetterCandidate =
+					BestCandidate.SampleIndex == INDEX_NONE ||
+					Candidate.CurrentContinentalNeighborCount > BestCandidate.CurrentContinentalNeighborCount ||
+					(Candidate.CurrentContinentalNeighborCount == BestCandidate.CurrentContinentalNeighborCount &&
+						Candidate.PreviousContinentalNeighborCount > BestCandidate.PreviousContinentalNeighborCount) ||
+					(Candidate.CurrentContinentalNeighborCount == BestCandidate.CurrentContinentalNeighborCount &&
+						Candidate.PreviousContinentalNeighborCount == BestCandidate.PreviousContinentalNeighborCount &&
+						Candidate.SampleIndex < BestCandidate.SampleIndex);
+				if (bBetterCandidate)
+				{
+					BestCandidate = Candidate;
+				}
+			}
+
+			return BestCandidate;
+		};
+
+		while (CurrentContinentalCount < MinimumContinentalSamples)
+		{
+			const bool bHaveCurrentContinents = CurrentContinentalCount > 0;
+			FContinentalPromotionCandidate Candidate = FindBestPromotionCandidate(bHaveCurrentContinents);
+			if (Candidate.SampleIndex == INDEX_NONE && bHaveCurrentContinents)
+			{
+				break;
+			}
+			if (Candidate.SampleIndex == INDEX_NONE)
+			{
+				Candidate = FindBestPromotionCandidate(false);
+				if (Candidate.SampleIndex == INDEX_NONE)
+				{
+					break;
+				}
+			}
+
+			PromoteSampleFromPrevious(Candidate.SampleIndex);
+			if (InOutSamples[Candidate.SampleIndex].CrustType == ECrustType::Continental)
+			{
+				++CurrentContinentalCount;
+			}
+			else
+			{
+				break;
+			}
+		}
+	}
+
+	struct FContinentalComponent
+	{
+		TArray<int32> Members;
+		int32 PreviousContinentalCount = 0;
+		int32 MinSampleIndex = TNumericLimits<int32>::Max();
+	};
+
+	auto BuildContinentalComponents = [this, &InOutSamples, &PreviousSamples, NumSamples](TArray<FContinentalComponent>& OutComponents)
+	{
+		OutComponents.Reset();
+
+		TArray<uint8> Visited;
+		Visited.Init(0, NumSamples);
+		TArray<int32> Stack;
+		Stack.Reserve(256);
+
+		for (int32 SeedIndex = 0; SeedIndex < NumSamples; ++SeedIndex)
+		{
+			if (Visited[SeedIndex] != 0 ||
+				InOutSamples[SeedIndex].CrustType != ECrustType::Continental ||
+				InOutSamples[SeedIndex].bGapDetected)
+			{
+				continue;
+			}
+
+			FContinentalComponent& Component = OutComponents.Emplace_GetRef();
+			Visited[SeedIndex] = 1;
+			Stack.Reset();
+			Stack.Add(SeedIndex);
+			while (Stack.Num() > 0)
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				Component.Members.Add(SampleIndex);
+				Component.MinSampleIndex = FMath::Min(Component.MinSampleIndex, SampleIndex);
+				Component.PreviousContinentalCount += (PreviousSamples[SampleIndex].CrustType == ECrustType::Continental) ? 1 : 0;
+
+				for (const int32 NeighborIndex : Adjacency[SampleIndex])
+				{
+					if (!InOutSamples.IsValidIndex(NeighborIndex) ||
+						Visited[NeighborIndex] != 0 ||
+						InOutSamples[NeighborIndex].CrustType != ECrustType::Continental ||
+						InOutSamples[NeighborIndex].bGapDetected)
+					{
+						continue;
+					}
+
+					Visited[NeighborIndex] = 1;
+					Stack.Add(NeighborIndex);
+				}
+			}
+		}
+	};
+
+	TArray<FContinentalComponent> Components;
+	BuildContinentalComponents(Components);
+	if (Components.Num() <= 0)
+	{
+		return;
+	}
+
+	Components.Sort([](const FContinentalComponent& A, const FContinentalComponent& B)
+	{
+		if (A.PreviousContinentalCount != B.PreviousContinentalCount)
+		{
+			return A.PreviousContinentalCount < B.PreviousContinentalCount;
+		}
+		if (A.Members.Num() != B.Members.Num())
+		{
+			return A.Members.Num() < B.Members.Num();
+		}
+		return A.MinSampleIndex < B.MinSampleIndex;
+	});
+
+	int32 RemainingComponentCount = Components.Num();
+	for (const FContinentalComponent& Component : Components)
+	{
+		const bool bExceedsComponentCap =
+			MaximumContinentalComponents != TNumericLimits<int32>::Max() &&
+			RemainingComponentCount > MaximumContinentalComponents;
+		const bool bExceedsPreviousCount = CurrentContinentalCount > PreviousContinentalCount;
+		if (!bExceedsComponentCap && !bExceedsPreviousCount)
+		{
+			break;
+		}
+
+		if (CurrentContinentalCount - Component.Members.Num() < MinimumContinentalSamples)
+		{
+			continue;
+		}
+
+		for (const int32 SampleIndex : Component.Members)
+		{
+			DemoteSampleToOceanic(SampleIndex);
+		}
+		CurrentContinentalCount -= Component.Members.Num();
+		--RemainingComponentCount;
+	}
+}
+
+void FTectonicPlanet::RunBoundaryLikeLocalOwnershipSanitizePass(
+	const TArray<FPhase2SampleState>& Phase2States,
+	TArray<FCanonicalSample>& InOutSamples,
+	int32 NumIterations) const
+{
+	if (Adjacency.Num() != InOutSamples.Num() || NumIterations <= 0)
+	{
+		return;
+	}
+
+	constexpr int32 MaxCleanupPlateBins = 16;
+	TArray<int32> CleanupAssignments;
+	CleanupAssignments.Init(INDEX_NONE, InOutSamples.Num());
+	for (int32 CleanupIteration = 0; CleanupIteration < NumIterations; ++CleanupIteration)
+	{
+		TArray<int32> ProjectedNonGapCountsByPlate;
+		ProjectedNonGapCountsByPlate.Init(0, Plates.Num());
+		for (const FCanonicalSample& Sample : InOutSamples)
+		{
+			if (!Sample.bGapDetected && Plates.IsValidIndex(Sample.PlateId))
+			{
+				++ProjectedNonGapCountsByPlate[Sample.PlateId];
+			}
+		}
+
+		bool bAnyCleanupAssignments = false;
+		for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
+		{
+			CleanupAssignments[SampleIndex] = INDEX_NONE;
+			if (!Adjacency.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			const FCanonicalSample& Sample = InOutSamples[SampleIndex];
+			if (!Plates.IsValidIndex(Sample.PlateId) || Sample.bGapDetected)
+			{
+				continue;
+			}
+
+			const FPhase2SampleState* State = Phase2States.IsValidIndex(SampleIndex) ? &Phase2States[SampleIndex] : nullptr;
+			const bool bBoundaryLike = Sample.bOverlapDetected ||
+				(State && (State->bOverlap || State->bGap || (State->OwnershipMargin < (BoundaryConfidenceThreshold * 2.0f))));
+			if (!bBoundaryLike)
+			{
+				continue;
+			}
+
+			int32 NeighborPlateIds[MaxCleanupPlateBins];
+			int32 NeighborPlateCounts[MaxCleanupPlateBins];
+			int32 NumNeighborPlates = 0;
+			int32 OwnPlateNeighborCount = 0;
+			int32 TotalValidNeighbors = 0;
+			for (int32 SlotIndex = 0; SlotIndex < MaxCleanupPlateBins; ++SlotIndex)
+			{
+				NeighborPlateIds[SlotIndex] = INDEX_NONE;
+				NeighborPlateCounts[SlotIndex] = 0;
+			}
+
+			for (const int32 NeighborIndex : Adjacency[SampleIndex])
+			{
+				if (!InOutSamples.IsValidIndex(NeighborIndex))
+				{
+					continue;
+				}
+
+				const int32 NeighborPlateId = InOutSamples[NeighborIndex].PlateId;
+				if (!Plates.IsValidIndex(NeighborPlateId))
+				{
+					continue;
+				}
+
+				++TotalValidNeighbors;
+				if (NeighborPlateId == Sample.PlateId)
+				{
+					++OwnPlateNeighborCount;
+					continue;
+				}
+
+				int32 ExistingSlot = INDEX_NONE;
+				for (int32 SlotIndex = 0; SlotIndex < NumNeighborPlates; ++SlotIndex)
+				{
+					if (NeighborPlateIds[SlotIndex] == NeighborPlateId)
+					{
+						ExistingSlot = SlotIndex;
+						break;
+					}
+				}
+
+				if (ExistingSlot == INDEX_NONE && NumNeighborPlates < MaxCleanupPlateBins)
+				{
+					ExistingSlot = NumNeighborPlates++;
+					NeighborPlateIds[ExistingSlot] = NeighborPlateId;
+				}
+				if (ExistingSlot != INDEX_NONE)
+				{
+					++NeighborPlateCounts[ExistingSlot];
+				}
+			}
+
+			if (TotalValidNeighbors <= 0)
+			{
+				continue;
+			}
+
+			int32 BestNeighborPlateId = INDEX_NONE;
+			int32 BestNeighborCount = 0;
+			for (int32 SlotIndex = 0; SlotIndex < NumNeighborPlates; ++SlotIndex)
+			{
+				if (NeighborPlateCounts[SlotIndex] > BestNeighborCount)
+				{
+					BestNeighborCount = NeighborPlateCounts[SlotIndex];
+					BestNeighborPlateId = NeighborPlateIds[SlotIndex];
+				}
+			}
+
+			const bool bWeakLocalSupport = OwnPlateNeighborCount <= 2;
+			const bool bStrongNeighborMajority = BestNeighborCount >= FMath::Max(4, OwnPlateNeighborCount + 3);
+			const bool bNeighborSupermajority = (BestNeighborCount * 2) >= (TotalValidNeighbors + 2);
+			if (!Plates.IsValidIndex(BestNeighborPlateId) || !bWeakLocalSupport || !bStrongNeighborMajority || !bNeighborSupermajority)
+			{
+				continue;
+			}
+
+			if (IsPlateProtected(Sample.PlateId))
+			{
+				const int32 PersistentFloorSamples = GetPersistentPlateFloorSamples(Sample.PlateId);
+				if (ProjectedNonGapCountsByPlate[Sample.PlateId] <= PersistentFloorSamples)
+				{
+					continue;
+				}
+			}
+
+			CleanupAssignments[SampleIndex] = BestNeighborPlateId;
+			if (ProjectedNonGapCountsByPlate.IsValidIndex(Sample.PlateId))
+			{
+				--ProjectedNonGapCountsByPlate[Sample.PlateId];
+			}
+			if (ProjectedNonGapCountsByPlate.IsValidIndex(BestNeighborPlateId))
+			{
+				++ProjectedNonGapCountsByPlate[BestNeighborPlateId];
+			}
+			bAnyCleanupAssignments = true;
+		}
+
+		if (!bAnyCleanupAssignments)
+		{
+			break;
+		}
+
+		for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
+		{
+			if (Plates.IsValidIndex(CleanupAssignments[SampleIndex]))
+			{
+				InOutSamples[SampleIndex].PlateId = CleanupAssignments[SampleIndex];
+			}
+		}
+	}
+}
+
+void FTectonicPlanet::EnforceConnectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples) const
+{
+	if (Plates.Num() == 0 || Adjacency.Num() != InOutSamples.Num())
+	{
+		return;
+	}
+
+	// Pre-rifting invariant: before Milestone 5 adds rifting, each plate's non-gap ownership must stay connected.
+	constexpr int32 MaxConnectivityIterations = 8;
+
+	struct FPlateComponentInfo
+	{
+		TArray<int32> Members;
+		int32 PrevMatchCount = 0;
+		int32 MinSampleIndex = TNumericLimits<int32>::Max();
+	};
+
+	auto FindPrimaryComponentIndex = [this](const TArray<FPlateComponentInfo>& Components, const int32 PlateId) -> int32
+	{
+		const int32 PersistentFloorSamples = IsPlateProtected(PlateId) ? GetPersistentPlateFloorSamples(PlateId) : 0;
+		int32 BestIndex = INDEX_NONE;
+		for (int32 ComponentIndex = 0; ComponentIndex < Components.Num(); ++ComponentIndex)
+		{
+			const FPlateComponentInfo& Candidate = Components[ComponentIndex];
+			const bool bCandidateSatisfiesFloor = PersistentFloorSamples <= 0 || Candidate.Members.Num() >= PersistentFloorSamples;
+			if (BestIndex == INDEX_NONE)
+			{
+				BestIndex = ComponentIndex;
+				continue;
+			}
+
+			const FPlateComponentInfo& Best = Components[BestIndex];
+			const bool bBestSatisfiesFloor = PersistentFloorSamples <= 0 || Best.Members.Num() >= PersistentFloorSamples;
+			if ((bCandidateSatisfiesFloor && !bBestSatisfiesFloor) ||
+				(bCandidateSatisfiesFloor == bBestSatisfiesFloor && Candidate.PrevMatchCount > Best.PrevMatchCount) ||
+				(bCandidateSatisfiesFloor == bBestSatisfiesFloor && Candidate.PrevMatchCount == Best.PrevMatchCount && Candidate.Members.Num() > Best.Members.Num()) ||
+				(bCandidateSatisfiesFloor == bBestSatisfiesFloor && Candidate.PrevMatchCount == Best.PrevMatchCount && Candidate.Members.Num() == Best.Members.Num() && Candidate.MinSampleIndex < Best.MinSampleIndex))
+			{
+				BestIndex = ComponentIndex;
+			}
+		}
+		return BestIndex;
+	};
+
+	auto SelectBestNeighborPlate = [this](const TMap<int32, int32>& EdgeCounts) -> int32
+	{
+		int32 BestNeighborPlateId = INDEX_NONE;
+		int32 BestEdgeCount = -1;
+		for (const TPair<int32, int32>& Entry : EdgeCounts)
+		{
+			if (!Plates.IsValidIndex(Entry.Key))
+			{
+				continue;
+			}
+
+			if (Entry.Value > BestEdgeCount ||
+				(Entry.Value == BestEdgeCount && (BestNeighborPlateId == INDEX_NONE || Entry.Key < BestNeighborPlateId)))
+			{
+				BestNeighborPlateId = Entry.Key;
+				BestEdgeCount = Entry.Value;
+			}
+		}
+		return BestNeighborPlateId;
+	};
+
+	TArray<uint8> Visited;
+	TArray<int32> Stack;
+	TArray<int32> Reassignments;
+	TArray<int32> SampleComponentIndices;
+	TArray<uint8> PrimaryComponentSampleFlags;
+	TArray<int32> PrimaryComponentIndicesByPlate;
+
+	for (int32 ConnectivityIteration = 0; ConnectivityIteration < MaxConnectivityIterations; ++ConnectivityIteration)
+	{
+		Visited.Init(0, InOutSamples.Num());
+		TArray<TArray<FPlateComponentInfo>> ComponentsByPlate;
+		ComponentsByPlate.SetNum(Plates.Num());
+		SampleComponentIndices.Init(INDEX_NONE, InOutSamples.Num());
+		PrimaryComponentSampleFlags.Init(0, InOutSamples.Num());
+		PrimaryComponentIndicesByPlate.Init(INDEX_NONE, Plates.Num());
+		TArray<int32> CurrentNonGapCountsByPlate;
+		CurrentNonGapCountsByPlate.Init(0, Plates.Num());
+
+		for (int32 SeedIndex = 0; SeedIndex < InOutSamples.Num(); ++SeedIndex)
+		{
+			if (Visited[SeedIndex] != 0 || InOutSamples[SeedIndex].bGapDetected || !Plates.IsValidIndex(InOutSamples[SeedIndex].PlateId))
+			{
+				continue;
+			}
+
+			const int32 PlateId = InOutSamples[SeedIndex].PlateId;
+			const int32 ComponentIndex = ComponentsByPlate[PlateId].Num();
+			FPlateComponentInfo Component;
+			Visited[SeedIndex] = 1;
+			++CurrentNonGapCountsByPlate[PlateId];
+			Stack.Reset();
+			Stack.Add(SeedIndex);
+			while (Stack.Num() > 0)
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				SampleComponentIndices[SampleIndex] = ComponentIndex;
+				Component.Members.Add(SampleIndex);
+				Component.MinSampleIndex = FMath::Min(Component.MinSampleIndex, SampleIndex);
+				Component.PrevMatchCount += (InOutSamples[SampleIndex].PrevPlateId == PlateId) ? 1 : 0;
+				for (const int32 NeighborIndex : Adjacency[SampleIndex])
+				{
+					if (!InOutSamples.IsValidIndex(NeighborIndex) || Visited[NeighborIndex] != 0)
+					{
+						continue;
+					}
+					if (InOutSamples[NeighborIndex].bGapDetected || InOutSamples[NeighborIndex].PlateId != PlateId)
+					{
+						continue;
+					}
+
+					Visited[NeighborIndex] = 1;
+					++CurrentNonGapCountsByPlate[PlateId];
+					Stack.Add(NeighborIndex);
+				}
+			}
+
+			ComponentsByPlate[PlateId].Add(MoveTemp(Component));
+		}
+
+		bool bAnyFragmentedPlate = false;
+		for (int32 PlateId = 0; PlateId < ComponentsByPlate.Num(); ++PlateId)
+		{
+			const TArray<FPlateComponentInfo>& Components = ComponentsByPlate[PlateId];
+			if (Components.Num() <= 0)
+			{
+				continue;
+			}
+
+			const int32 PrimaryComponentIndex = FindPrimaryComponentIndex(Components, PlateId);
+			PrimaryComponentIndicesByPlate[PlateId] = PrimaryComponentIndex;
+			if (PrimaryComponentIndex != INDEX_NONE)
+			{
+				for (const int32 SampleIndex : Components[PrimaryComponentIndex].Members)
+				{
+					PrimaryComponentSampleFlags[SampleIndex] = 1;
+				}
+			}
+
+			bAnyFragmentedPlate |= Components.Num() > 1;
+		}
+
+		if (!bAnyFragmentedPlate)
+		{
+			break;
+		}
+
+		Reassignments.Init(INDEX_NONE, InOutSamples.Num());
+		TArray<int32> ProjectedNonGapCountsByPlate = CurrentNonGapCountsByPlate;
+		bool bAnyReassignments = false;
+		for (int32 PlateId = 0; PlateId < ComponentsByPlate.Num(); ++PlateId)
+		{
+			const TArray<FPlateComponentInfo>& Components = ComponentsByPlate[PlateId];
+			if (Components.Num() <= 1)
+			{
+				continue;
+			}
+
+			const int32 PrimaryComponentIndex = PrimaryComponentIndicesByPlate[PlateId];
+			for (int32 ComponentIndex = 0; ComponentIndex < Components.Num(); ++ComponentIndex)
+			{
+				if (ComponentIndex == PrimaryComponentIndex)
+				{
+					continue;
+				}
+
+				const FPlateComponentInfo& Component = Components[ComponentIndex];
+				TMap<int32, int32> PrimaryEdgeCounts;
+				TMap<int32, int32> ExternalEdgeCounts;
+				for (const int32 SampleIndex : Component.Members)
+				{
+					for (const int32 NeighborIndex : Adjacency[SampleIndex])
+					{
+						if (!InOutSamples.IsValidIndex(NeighborIndex) || InOutSamples[NeighborIndex].bGapDetected)
+						{
+							continue;
+						}
+
+						const int32 NeighborPlateId = InOutSamples[NeighborIndex].PlateId;
+						if (!Plates.IsValidIndex(NeighborPlateId) || NeighborPlateId == PlateId)
+						{
+							continue;
+						}
+
+						ExternalEdgeCounts.FindOrAdd(NeighborPlateId) += 1;
+						if (PrimaryComponentSampleFlags[NeighborIndex] != 0 &&
+							SampleComponentIndices[NeighborIndex] == PrimaryComponentIndicesByPlate[NeighborPlateId])
+						{
+							PrimaryEdgeCounts.FindOrAdd(NeighborPlateId) += 1;
+						}
+					}
+				}
+
+				int32 BestNeighborPlateId = SelectBestNeighborPlate(PrimaryEdgeCounts);
+				if (!Plates.IsValidIndex(BestNeighborPlateId))
+				{
+					BestNeighborPlateId = SelectBestNeighborPlate(ExternalEdgeCounts);
+				}
+				if (!Plates.IsValidIndex(BestNeighborPlateId))
+				{
+					continue;
+				}
+
+				if (IsPlateProtected(PlateId))
+				{
+					const int32 PersistentFloorSamples = GetPersistentPlateFloorSamples(PlateId);
+					if (ProjectedNonGapCountsByPlate[PlateId] - Component.Members.Num() < PersistentFloorSamples)
+					{
+						continue;
+					}
+				}
+
+				for (const int32 SampleIndex : Component.Members)
+				{
+					Reassignments[SampleIndex] = BestNeighborPlateId;
+				}
+				ProjectedNonGapCountsByPlate[PlateId] -= Component.Members.Num();
+				bAnyReassignments = true;
+			}
+		}
+
+		if (!bAnyReassignments)
+		{
+			break;
+		}
+
+		for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
+		{
+			if (Plates.IsValidIndex(Reassignments[SampleIndex]))
+			{
+				InOutSamples[SampleIndex].PlateId = Reassignments[SampleIndex];
+			}
+		}
+	}
+}
+
+bool FTectonicPlanet::RescueProtectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples)
+{
+	if (Plates.Num() == 0 || Adjacency.Num() != InOutSamples.Num())
+	{
+		return false;
+	}
+
+	struct FPlateComponentInfo
+	{
+		TArray<int32> Members;
+		int32 PrevMatchCount = 0;
+		int32 MinSampleIndex = TNumericLimits<int32>::Max();
+	};
+
+	auto FindPrimaryComponentIndex = [this](const TArray<FPlateComponentInfo>& Components, const int32 PlateId) -> int32
+	{
+		const int32 PersistentFloorSamples = IsPlateProtected(PlateId) ? GetPersistentPlateFloorSamples(PlateId) : 0;
+		int32 BestIndex = INDEX_NONE;
+		for (int32 ComponentIndex = 0; ComponentIndex < Components.Num(); ++ComponentIndex)
+		{
+			const FPlateComponentInfo& Candidate = Components[ComponentIndex];
+			const bool bCandidateSatisfiesFloor = PersistentFloorSamples <= 0 || Candidate.Members.Num() >= PersistentFloorSamples;
+			if (BestIndex == INDEX_NONE)
+			{
+				BestIndex = ComponentIndex;
+				continue;
+			}
+
+			const FPlateComponentInfo& Best = Components[BestIndex];
+			const bool bBestSatisfiesFloor = PersistentFloorSamples <= 0 || Best.Members.Num() >= PersistentFloorSamples;
+			if ((bCandidateSatisfiesFloor && !bBestSatisfiesFloor) ||
+				(bCandidateSatisfiesFloor == bBestSatisfiesFloor && Candidate.PrevMatchCount > Best.PrevMatchCount) ||
+				(bCandidateSatisfiesFloor == bBestSatisfiesFloor && Candidate.PrevMatchCount == Best.PrevMatchCount && Candidate.Members.Num() > Best.Members.Num()) ||
+				(bCandidateSatisfiesFloor == bBestSatisfiesFloor && Candidate.PrevMatchCount == Best.PrevMatchCount && Candidate.Members.Num() == Best.Members.Num() && Candidate.MinSampleIndex < Best.MinSampleIndex))
+			{
+				BestIndex = ComponentIndex;
+			}
+		}
+		return BestIndex;
+	};
+
+	auto BuildPlateComponents = [this, &InOutSamples](const int32 PlateId, TArray<FPlateComponentInfo>& OutComponents, int32& OutNonGapCount)
+	{
+		OutComponents.Reset();
+		OutNonGapCount = 0;
+
+		TArray<uint8> Visited;
+		Visited.Init(0, InOutSamples.Num());
+		TArray<int32> Stack;
+		Stack.Reserve(256);
+
+		for (int32 SeedIndex = 0; SeedIndex < InOutSamples.Num(); ++SeedIndex)
+		{
+			if (Visited[SeedIndex] != 0)
+			{
+				continue;
+			}
+
+			const FCanonicalSample& SeedSample = InOutSamples[SeedIndex];
+			if (SeedSample.bGapDetected || SeedSample.PlateId != PlateId)
+			{
+				continue;
+			}
+
+			FPlateComponentInfo& Component = OutComponents.Emplace_GetRef();
+			Visited[SeedIndex] = 1;
+			Stack.Reset();
+			Stack.Add(SeedIndex);
+			while (Stack.Num() > 0)
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				const FCanonicalSample& Sample = InOutSamples[SampleIndex];
+				Component.Members.Add(SampleIndex);
+				Component.MinSampleIndex = FMath::Min(Component.MinSampleIndex, SampleIndex);
+				Component.PrevMatchCount += (Sample.PrevPlateId == PlateId) ? 1 : 0;
+				++OutNonGapCount;
+
+				for (const int32 NeighborIndex : Adjacency[SampleIndex])
+				{
+					if (!InOutSamples.IsValidIndex(NeighborIndex) || Visited[NeighborIndex] != 0)
+					{
+						continue;
+					}
+
+					const FCanonicalSample& NeighborSample = InOutSamples[NeighborIndex];
+					if (NeighborSample.bGapDetected || NeighborSample.PlateId != PlateId)
+					{
+						continue;
+					}
+
+					Visited[NeighborIndex] = 1;
+					Stack.Add(NeighborIndex);
+				}
+			}
+		}
+	};
+
+	TArray<int32> CurrentNonGapCountsByPlate;
+	CurrentNonGapCountsByPlate.Init(0, Plates.Num());
+	for (const FCanonicalSample& Sample : InOutSamples)
+	{
+		if (!Sample.bGapDetected && Plates.IsValidIndex(Sample.PlateId))
+		{
+			++CurrentNonGapCountsByPlate[Sample.PlateId];
+		}
+	}
+
+	TArray<int32> PlatesNeedingRescue;
+	for (const FPlate& Plate : Plates)
+	{
+		if (Plate.PersistencePolicy != EPlatePersistencePolicy::Protected)
+		{
+			continue;
+		}
+
+		const int32 PersistentFloorSamples = GetPersistentPlateFloorSamples(Plate.Id);
+		if (PersistentFloorSamples <= 0)
+		{
+			continue;
+		}
+
+		TArray<FPlateComponentInfo> Components;
+		int32 NonGapCount = 0;
+		BuildPlateComponents(Plate.Id, Components, NonGapCount);
+		const int32 PrimaryComponentIndex = FindPrimaryComponentIndex(Components, Plate.Id);
+		const int32 PrimaryComponentSize =
+			(PrimaryComponentIndex != INDEX_NONE && Components.IsValidIndex(PrimaryComponentIndex))
+				? Components[PrimaryComponentIndex].Members.Num()
+				: 0;
+		if (PrimaryComponentSize < PersistentFloorSamples)
+		{
+			PlatesNeedingRescue.Add(Plate.Id);
+		}
+	}
+
+	if (PlatesNeedingRescue.Num() <= 0)
+	{
+		return false;
+	}
+
+	PlatesNeedingRescue.Sort([&CurrentNonGapCountsByPlate](const int32 A, const int32 B)
+	{
+		const int32 CountA = CurrentNonGapCountsByPlate.IsValidIndex(A) ? CurrentNonGapCountsByPlate[A] : 0;
+		const int32 CountB = CurrentNonGapCountsByPlate.IsValidIndex(B) ? CurrentNonGapCountsByPlate[B] : 0;
+		return (CountA == CountB) ? (A < B) : (CountA < CountB);
+	});
+
+	auto CanBorrowFromDonorPlate = [this, &CurrentNonGapCountsByPlate](const int32 DonorPlateId) -> bool
+	{
+		if (!Plates.IsValidIndex(DonorPlateId) || !CurrentNonGapCountsByPlate.IsValidIndex(DonorPlateId) || CurrentNonGapCountsByPlate[DonorPlateId] <= 0)
+		{
+			return false;
+		}
+
+		if (!IsPlateProtected(DonorPlateId))
+		{
+			return true;
+		}
+
+		return (CurrentNonGapCountsByPlate[DonorPlateId] - 1) >= GetPersistentPlateFloorSamples(DonorPlateId);
+	};
+
+	TArray<uint8> RegionFlags;
+	RegionFlags.Init(0, InOutSamples.Num());
+	TArray<int32> RegionSamples;
+	RegionSamples.Reserve(256);
+
+	bool bAnyRescueApplied = false;
+	for (const int32 PlateId : PlatesNeedingRescue)
+	{
+		if (!IsPlateProtected(PlateId))
+		{
+			continue;
+		}
+
+		for (const int32 SampleIndex : RegionSamples)
+		{
+			if (RegionFlags.IsValidIndex(SampleIndex))
+			{
+				RegionFlags[SampleIndex] = 0;
+			}
+		}
+		RegionSamples.Reset();
+
+		TArray<FPlateComponentInfo> Components;
+		int32 CurrentNonGapCount = 0;
+		BuildPlateComponents(PlateId, Components, CurrentNonGapCount);
+		if (CurrentNonGapCountsByPlate.IsValidIndex(PlateId))
+		{
+			CurrentNonGapCountsByPlate[PlateId] = CurrentNonGapCount;
+		}
+
+		const int32 PersistentFloorSamples = GetPersistentPlateFloorSamples(PlateId);
+		const int32 PrimaryComponentIndex = FindPrimaryComponentIndex(Components, PlateId);
+		if (PrimaryComponentIndex != INDEX_NONE && Components.IsValidIndex(PrimaryComponentIndex))
+		{
+			for (const int32 SampleIndex : Components[PrimaryComponentIndex].Members)
+			{
+				RegionFlags[SampleIndex] = 1;
+				RegionSamples.Add(SampleIndex);
+			}
+		}
+
+		if (RegionSamples.Num() >= PersistentFloorSamples)
+		{
+			continue;
+		}
+
+		const FVector RescueAnchor = !Plates[PlateId].CanonicalCenterDirection.IsNearlyZero()
+			? Plates[PlateId].CanonicalCenterDirection.GetSafeNormal()
+			: (Plates[PlateId].IdentityAnchorDirection.IsNearlyZero()
+				? FVector::ForwardVector
+				: Plates[PlateId].IdentityAnchorDirection.GetSafeNormal());
+
+		int32 RescuedSamplesForPlate = 0;
+		auto ClaimSampleForPlate = [this, &InOutSamples, &CurrentNonGapCountsByPlate, &RegionFlags, &RegionSamples, PlateId, &RescuedSamplesForPlate](const int32 SampleIndex) -> bool
+		{
+			if (!InOutSamples.IsValidIndex(SampleIndex))
+			{
+				return false;
+			}
+
+			FCanonicalSample& Sample = InOutSamples[SampleIndex];
+			if (Sample.bGapDetected || Sample.PlateId == PlateId || !Plates.IsValidIndex(Sample.PlateId))
+			{
+				return false;
+			}
+
+			const int32 DonorPlateId = Sample.PlateId;
+			if (CurrentNonGapCountsByPlate.IsValidIndex(DonorPlateId))
+			{
+				--CurrentNonGapCountsByPlate[DonorPlateId];
+			}
+			if (CurrentNonGapCountsByPlate.IsValidIndex(PlateId))
+			{
+				++CurrentNonGapCountsByPlate[PlateId];
+			}
+
+			Sample.PlateId = PlateId;
+			if (!RegionFlags[SampleIndex])
+			{
+				RegionFlags[SampleIndex] = 1;
+				RegionSamples.Add(SampleIndex);
+			}
+
+			++RescuedSamplesForPlate;
+			++RescuedProtectedSampleCount;
+			return true;
+		};
+
+		if (RegionSamples.Num() == 0)
+		{
+			int32 BestSeedSampleIndex = INDEX_NONE;
+			double BestAnchorDot = -TNumericLimits<double>::Max();
+			int32 BestDonorSurplus = TNumericLimits<int32>::Lowest();
+			for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
+			{
+				const FCanonicalSample& CandidateSample = InOutSamples[SampleIndex];
+				if (CandidateSample.bGapDetected || !Plates.IsValidIndex(CandidateSample.PlateId) || CandidateSample.PlateId == PlateId)
+				{
+					continue;
+				}
+
+				if (!CanBorrowFromDonorPlate(CandidateSample.PlateId))
+				{
+					continue;
+				}
+
+				const int32 DonorFloor = IsPlateProtected(CandidateSample.PlateId) ? GetPersistentPlateFloorSamples(CandidateSample.PlateId) : 0;
+				const int32 DonorSurplus = CurrentNonGapCountsByPlate[CandidateSample.PlateId] - DonorFloor;
+				const double AnchorDot = FVector::DotProduct(CandidateSample.Position, RescueAnchor);
+				if (AnchorDot > BestAnchorDot + UE_DOUBLE_SMALL_NUMBER ||
+					(FMath::IsNearlyEqual(AnchorDot, BestAnchorDot, UE_DOUBLE_SMALL_NUMBER) && DonorSurplus > BestDonorSurplus) ||
+					(FMath::IsNearlyEqual(AnchorDot, BestAnchorDot, UE_DOUBLE_SMALL_NUMBER) && DonorSurplus == BestDonorSurplus && (BestSeedSampleIndex == INDEX_NONE || SampleIndex < BestSeedSampleIndex)))
+				{
+					BestSeedSampleIndex = SampleIndex;
+					BestAnchorDot = AnchorDot;
+					BestDonorSurplus = DonorSurplus;
+				}
+			}
+
+			if (BestSeedSampleIndex != INDEX_NONE)
+			{
+				ClaimSampleForPlate(BestSeedSampleIndex);
+			}
+		}
+
+		while (RegionSamples.Num() > 0 && RegionSamples.Num() < PersistentFloorSamples)
+		{
+			TMap<int32, int32> CandidateAdjacencyCounts;
+			for (const int32 RegionSampleIndex : RegionSamples)
+			{
+				for (const int32 NeighborIndex : Adjacency[RegionSampleIndex])
+				{
+					if (!InOutSamples.IsValidIndex(NeighborIndex) || RegionFlags[NeighborIndex] != 0)
+					{
+						continue;
+					}
+
+					const FCanonicalSample& CandidateSample = InOutSamples[NeighborIndex];
+					if (CandidateSample.bGapDetected || !Plates.IsValidIndex(CandidateSample.PlateId) || CandidateSample.PlateId == PlateId)
+					{
+						continue;
+					}
+
+					if (!CanBorrowFromDonorPlate(CandidateSample.PlateId))
+					{
+						continue;
+					}
+
+					CandidateAdjacencyCounts.FindOrAdd(NeighborIndex) += 1;
+				}
+			}
+
+			int32 BestCandidateIndex = INDEX_NONE;
+			int32 BestAdjacencyCount = -1;
+			float BestOwnershipMargin = TNumericLimits<float>::Max();
+			double BestAnchorDot = -TNumericLimits<double>::Max();
+			for (const TPair<int32, int32>& Entry : CandidateAdjacencyCounts)
+			{
+				const int32 CandidateIndex = Entry.Key;
+				const FCanonicalSample& CandidateSample = InOutSamples[CandidateIndex];
+				const double AnchorDot = FVector::DotProduct(CandidateSample.Position, RescueAnchor);
+				if (Entry.Value > BestAdjacencyCount ||
+					(Entry.Value == BestAdjacencyCount && CandidateSample.OwnershipMargin < BestOwnershipMargin - KINDA_SMALL_NUMBER) ||
+					(Entry.Value == BestAdjacencyCount && FMath::IsNearlyEqual(CandidateSample.OwnershipMargin, BestOwnershipMargin, KINDA_SMALL_NUMBER) && AnchorDot > BestAnchorDot + UE_DOUBLE_SMALL_NUMBER) ||
+					(Entry.Value == BestAdjacencyCount && FMath::IsNearlyEqual(CandidateSample.OwnershipMargin, BestOwnershipMargin, KINDA_SMALL_NUMBER) && FMath::IsNearlyEqual(AnchorDot, BestAnchorDot, UE_DOUBLE_SMALL_NUMBER) && (BestCandidateIndex == INDEX_NONE || CandidateIndex < BestCandidateIndex)))
+				{
+					BestCandidateIndex = CandidateIndex;
+					BestAdjacencyCount = Entry.Value;
+					BestOwnershipMargin = CandidateSample.OwnershipMargin;
+					BestAnchorDot = AnchorDot;
+				}
+			}
+
+			if (BestCandidateIndex == INDEX_NONE || !ClaimSampleForPlate(BestCandidateIndex))
+			{
+				break;
+			}
+		}
+
+		if (RescuedSamplesForPlate > 0)
+		{
+			++RescuedProtectedPlateCount;
+			bAnyRescueApplied = true;
+		}
+	}
+
+	return bAnyRescueApplied;
 }
 
 FVector FTectonicPlanet::GetRotatedSamplePosition(const FPlate& Plate, int32 CanonicalSampleIndex) const
@@ -1163,26 +3931,25 @@ FContainmentQueryResult FTectonicPlanet::QueryContainment(const FVector& Positio
 			continue;
 		}
 
+		const FVector3d Barycentric = NormalizeContainmentBarycentric(ComputePlanarBarycentric(A, B, C, QueryPointLocal));
+		const int32 GlobalTriangleIndex = PlateState.SoupData.GlobalTriangleIndices[LocalTriangleId];
+		if (!Triangles.IsValidIndex(GlobalTriangleIndex) || !IsPreferredPlateForTriangle(Samples, Triangles[GlobalTriangleIndex], PlateState.PlateId, Barycentric))
+		{
+			continue;
+		}
+
 		++Result.NumContainingPlates;
 		if (Result.NumContainingPlates <= UE_ARRAY_COUNT(Result.ContainingPlateIds))
 		{
 			Result.ContainingPlateIds[Result.NumContainingPlates - 1] = PlateState.PlateId;
 		}
 
-		if (DotToCap > BestContainmentScore)
+		const double ContainmentScore = ComputeContainmentScore(Barycentric);
+		if (IsBetterContainmentCandidate(ContainmentScore, PlateState.PlateId, BestContainmentScore, Result.PlateId))
 		{
-			BestContainmentScore = DotToCap;
+			BestContainmentScore = ContainmentScore;
 			Result.PlateId = PlateState.PlateId;
-			Result.TriangleIndex = PlateState.SoupData.GlobalTriangleIndices[LocalTriangleId];
-			FVector3d Barycentric = ComputePlanarBarycentric(A, B, C, QueryPointLocal);
-			Barycentric.X = FMath::Max(0.0, Barycentric.X);
-			Barycentric.Y = FMath::Max(0.0, Barycentric.Y);
-			Barycentric.Z = FMath::Max(0.0, Barycentric.Z);
-			const double BarySum = Barycentric.X + Barycentric.Y + Barycentric.Z;
-			if (BarySum > UE_DOUBLE_SMALL_NUMBER)
-			{
-				Barycentric /= BarySum;
-			}
+			Result.TriangleIndex = GlobalTriangleIndex;
 			Result.Barycentric = FVector(Barycentric.X, Barycentric.Y, Barycentric.Z);
 		}
 	}
@@ -1308,18 +4075,37 @@ void FTectonicPlanet::ClassifyTrianglesForSamples(TArray<FCanonicalSample>& InOu
 			Sample.FlankingPlateIdB = INDEX_NONE;
 		}
 		BoundarySampleCount = 0;
+		BoundaryMeanDepthHops = 0.0;
+		BoundaryMaxDepthHops = 0;
+		BoundaryDeepSampleCount = 0;
+		ContinentalSampleCount = 0;
+		ContinentalComponentCount = 0;
+		LargestContinentalComponentSize = 0;
+		MaxPlateComponentCount = 0;
+		DetachedPlateFragmentSampleCount = 0;
+		LargestDetachedPlateFragmentSize = 0;
+		SubductionFrontSampleCount = 0;
+		AndeanSampleCount = 0;
+		TrackedTerraneCount = 0;
+		ActiveTerraneCount = 0;
+		MergedTerraneCount = 0;
+		CollisionEventCount = CollisionEvents.Num();
+		HimalayanSampleCount = 0;
+		PendingCollisionSampleCount = 0;
+		MaxSubductionDistanceKm = 0.0f;
 		InvalidateSpatialQueryData();
 		return;
 	}
 
-	TArray<uint64> PreviousInteriorHashes;
-	TArray<int32> PreviousInteriorCounts;
-	PreviousInteriorHashes.SetNumZeroed(NumPlates);
-	PreviousInteriorCounts.SetNumZeroed(NumPlates);
+	TArray<uint64> PreviousSoupHashes;
+	TArray<int32> PreviousSoupCounts;
+	PreviousSoupHashes.SetNumZeroed(NumPlates);
+	PreviousSoupCounts.SetNumZeroed(NumPlates);
 	for (int32 PlateIndex = 0; PlateIndex < NumPlates; ++PlateIndex)
 	{
-		PreviousInteriorCounts[PlateIndex] = Plates[PlateIndex].InteriorTriangles.Num();
-		PreviousInteriorHashes[PlateIndex] = HashTriangleIndexList(Plates[PlateIndex].InteriorTriangles);
+		const FPlate& Plate = Plates[PlateIndex];
+		PreviousSoupCounts[PlateIndex] = Plate.InteriorTriangles.Num() + Plate.BoundaryTriangles.Num();
+		PreviousSoupHashes[PlateIndex] = HashPlateSoupTriangleLists(Plate);
 	}
 
 	struct FChunkTriangleBins
@@ -1471,6 +4257,7 @@ void FTectonicPlanet::ClassifyTrianglesForSamples(TArray<FCanonicalSample>& InOu
 	BoundarySampleCount = LocalBoundarySampleCount;
 	UpdateBoundaryClassificationForSamples(InOutSamples);
 	UpdateGapFlankingPlatesForSamples(InOutSamples);
+	UpdateBoundaryAndContinentDiagnosticsForSamples(InOutSamples);
 
 	if (!SpatialQueryData)
 	{
@@ -1492,10 +4279,11 @@ void FTectonicPlanet::ClassifyTrianglesForSamples(TArray<FCanonicalSample>& InOu
 
 		for (int32 PlateIndex = 0; PlateIndex < NumPlates; ++PlateIndex)
 		{
-			const int32 NewCount = Plates[PlateIndex].InteriorTriangles.Num();
-			const uint64 NewHash = HashTriangleIndexList(Plates[PlateIndex].InteriorTriangles);
-			const bool bInteriorChanged = (NewCount != PreviousInteriorCounts[PlateIndex]) || (NewHash != PreviousInteriorHashes[PlateIndex]);
-			if (bInteriorChanged)
+			const FPlate& Plate = Plates[PlateIndex];
+			const int32 NewCount = Plate.InteriorTriangles.Num() + Plate.BoundaryTriangles.Num();
+			const uint64 NewHash = HashPlateSoupTriangleLists(Plate);
+			const bool bSoupChanged = (NewCount != PreviousSoupCounts[PlateIndex]) || (NewHash != PreviousSoupHashes[PlateIndex]);
+			if (bSoupChanged)
 			{
 				SpatialQueryData->DirtyPlateFlags[PlateIndex] = 1;
 			}
@@ -1544,6 +4332,7 @@ void FTectonicPlanet::UpdateBoundaryFlagsForSamples(TArray<FCanonicalSample>& In
 	BoundarySampleCount = LocalBoundarySampleCount;
 	UpdateBoundaryClassificationForSamples(InOutSamples);
 	UpdateGapFlankingPlatesForSamples(InOutSamples);
+	UpdateBoundaryAndContinentDiagnosticsForSamples(InOutSamples);
 }
 
 void FTectonicPlanet::UpdateBoundaryClassificationForSamples(TArray<FCanonicalSample>& InOutSamples)
@@ -1701,12 +4490,22 @@ void FTectonicPlanet::UpdateGapFlankingPlatesForSamples(TArray<FCanonicalSample>
 	for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
 	{
 		FCanonicalSample& Sample = InOutSamples[SampleIndex];
-		Sample.FlankingPlateIdA = INDEX_NONE;
-		Sample.FlankingPlateIdB = INDEX_NONE;
 		if (!Sample.bGapDetected)
+		{
+			Sample.FlankingPlateIdA = INDEX_NONE;
+			Sample.FlankingPlateIdB = INDEX_NONE;
+			continue;
+		}
+
+		const bool bHasValidFlankA = Plates.IsValidIndex(Sample.FlankingPlateIdA);
+		const bool bHasValidFlankB = Plates.IsValidIndex(Sample.FlankingPlateIdB) && Sample.FlankingPlateIdB != Sample.FlankingPlateIdA;
+		if (bHasValidFlankA && bHasValidFlankB)
 		{
 			continue;
 		}
+
+		Sample.FlankingPlateIdA = INDEX_NONE;
+		Sample.FlankingPlateIdB = INDEX_NONE;
 
 		int32 NeighborPlateIds[MaxNeighborPlateBins];
 		int32 NeighborPlateCounts[MaxNeighborPlateBins];
@@ -1789,15 +4588,259 @@ void FTectonicPlanet::UpdateGapFlankingPlatesForSamples(TArray<FCanonicalSample>
 	}
 }
 
+void FTectonicPlanet::UpdateBoundaryAndContinentDiagnosticsForSamples(const TArray<FCanonicalSample>& InSamples)
+{
+	BoundaryMeanDepthHops = 0.0;
+	BoundaryMaxDepthHops = 0;
+	BoundaryDeepSampleCount = 0;
+	ContinentalSampleCount = 0;
+	ContinentalPlateCount = 0;
+	ContinentalAreaFraction = 0.0;
+	ContinentalComponentCount = 0;
+	LargestContinentalComponentSize = 0;
+	MaxPlateComponentCount = 0;
+	DetachedPlateFragmentSampleCount = 0;
+	LargestDetachedPlateFragmentSize = 0;
+
+	const int32 NumSamples = InSamples.Num();
+	if (NumSamples <= 0)
+	{
+		return;
+	}
+
+	TArray<uint8> PlatesWithContinentalSamples;
+	PlatesWithContinentalSamples.Init(0, Plates.Num());
+	for (const FCanonicalSample& Sample : InSamples)
+	{
+		ContinentalSampleCount += (Sample.CrustType == ECrustType::Continental) ? 1 : 0;
+		if (Sample.CrustType == ECrustType::Continental && PlatesWithContinentalSamples.IsValidIndex(Sample.PlateId))
+		{
+			PlatesWithContinentalSamples[Sample.PlateId] = 1;
+		}
+	}
+
+	ContinentalAreaFraction = static_cast<double>(ContinentalSampleCount) / static_cast<double>(NumSamples);
+	for (const uint8 bHasContinentalSamples : PlatesWithContinentalSamples)
+	{
+		ContinentalPlateCount += (bHasContinentalSamples != 0) ? 1 : 0;
+	}
+
+	if (Adjacency.Num() != NumSamples)
+	{
+		return;
+	}
+
+	if (BoundarySampleCount > 0)
+	{
+		TArray<int32> DistanceToInterior;
+		DistanceToInterior.Init(INDEX_NONE, NumSamples);
+		TArray<int32> Queue;
+		Queue.Reserve(NumSamples);
+		for (int32 SampleIndex = 0; SampleIndex < NumSamples; ++SampleIndex)
+		{
+			if (!InSamples[SampleIndex].bIsBoundary)
+			{
+				DistanceToInterior[SampleIndex] = 0;
+				Queue.Add(SampleIndex);
+			}
+		}
+
+		for (int32 QueueIndex = 0; QueueIndex < Queue.Num(); ++QueueIndex)
+		{
+			const int32 SampleIndex = Queue[QueueIndex];
+			const int32 NextDistance = DistanceToInterior[SampleIndex] + 1;
+			for (const int32 NeighborIndex : Adjacency[SampleIndex])
+			{
+				if (!InSamples.IsValidIndex(NeighborIndex) || DistanceToInterior[NeighborIndex] != INDEX_NONE)
+				{
+					continue;
+				}
+
+				DistanceToInterior[NeighborIndex] = NextDistance;
+				Queue.Add(NeighborIndex);
+			}
+		}
+
+		double TotalBoundaryDepth = 0.0;
+		for (int32 SampleIndex = 0; SampleIndex < NumSamples; ++SampleIndex)
+		{
+			if (!InSamples[SampleIndex].bIsBoundary)
+			{
+				continue;
+			}
+
+			int32 DepthHops = DistanceToInterior[SampleIndex];
+			if (DepthHops == INDEX_NONE)
+			{
+				DepthHops = NumSamples;
+			}
+
+			TotalBoundaryDepth += static_cast<double>(DepthHops);
+			BoundaryMaxDepthHops = FMath::Max(BoundaryMaxDepthHops, DepthHops);
+			BoundaryDeepSampleCount += (DepthHops >= 2) ? 1 : 0;
+		}
+
+		BoundaryMeanDepthHops = TotalBoundaryDepth / static_cast<double>(BoundarySampleCount);
+	}
+
+	if (ContinentalSampleCount > 0)
+	{
+		TArray<uint8> Visited;
+		Visited.Init(0, NumSamples);
+		TArray<int32> Stack;
+		Stack.Reserve(256);
+		for (int32 SeedIndex = 0; SeedIndex < NumSamples; ++SeedIndex)
+		{
+			if (Visited[SeedIndex] != 0 || InSamples[SeedIndex].CrustType != ECrustType::Continental)
+			{
+				continue;
+			}
+
+			++ContinentalComponentCount;
+			int32 ComponentSize = 0;
+			Stack.Reset();
+			Stack.Add(SeedIndex);
+			Visited[SeedIndex] = 1;
+			while (Stack.Num() > 0)
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				++ComponentSize;
+				for (const int32 NeighborIndex : Adjacency[SampleIndex])
+				{
+					if (!InSamples.IsValidIndex(NeighborIndex) || Visited[NeighborIndex] != 0 || InSamples[NeighborIndex].CrustType != ECrustType::Continental)
+					{
+						continue;
+					}
+
+					Visited[NeighborIndex] = 1;
+					Stack.Add(NeighborIndex);
+				}
+			}
+
+			LargestContinentalComponentSize = FMath::Max(LargestContinentalComponentSize, ComponentSize);
+		}
+	}
+
+	if (Plates.Num() <= 0)
+	{
+		return;
+	}
+
+	struct FPlateComponentInfo
+	{
+		int32 Size = 0;
+		int32 PrevMatchCount = 0;
+		int32 MinSampleIndex = TNumericLimits<int32>::Max();
+	};
+
+	auto SelectPrimaryComponentIndex = [](const TArray<FPlateComponentInfo>& Components) -> int32
+	{
+		int32 BestIndex = INDEX_NONE;
+		for (int32 ComponentIndex = 0; ComponentIndex < Components.Num(); ++ComponentIndex)
+		{
+			const FPlateComponentInfo& Candidate = Components[ComponentIndex];
+			if (BestIndex == INDEX_NONE)
+			{
+				BestIndex = ComponentIndex;
+				continue;
+			}
+
+			const FPlateComponentInfo& Best = Components[BestIndex];
+			if (Candidate.PrevMatchCount > Best.PrevMatchCount ||
+				(Candidate.PrevMatchCount == Best.PrevMatchCount && Candidate.Size > Best.Size) ||
+				(Candidate.PrevMatchCount == Best.PrevMatchCount && Candidate.Size == Best.Size && Candidate.MinSampleIndex < Best.MinSampleIndex))
+			{
+				BestIndex = ComponentIndex;
+			}
+		}
+		return BestIndex;
+	};
+
+	TArray<uint8> VisitedNonGap;
+	VisitedNonGap.Init(0, NumSamples);
+	TArray<int32> Stack;
+	Stack.Reserve(256);
+	TArray<TArray<FPlateComponentInfo>> ComponentsByPlate;
+	ComponentsByPlate.SetNum(Plates.Num());
+	for (int32 SeedIndex = 0; SeedIndex < NumSamples; ++SeedIndex)
+	{
+		if (VisitedNonGap[SeedIndex] != 0 || InSamples[SeedIndex].bGapDetected || !Plates.IsValidIndex(InSamples[SeedIndex].PlateId))
+		{
+			continue;
+		}
+
+		const int32 PlateId = InSamples[SeedIndex].PlateId;
+		FPlateComponentInfo Component;
+		Stack.Reset();
+		Stack.Add(SeedIndex);
+		VisitedNonGap[SeedIndex] = 1;
+		while (Stack.Num() > 0)
+		{
+			const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+			++Component.Size;
+			Component.PrevMatchCount += (InSamples[SampleIndex].PrevPlateId == PlateId) ? 1 : 0;
+			Component.MinSampleIndex = FMath::Min(Component.MinSampleIndex, SampleIndex);
+			for (const int32 NeighborIndex : Adjacency[SampleIndex])
+			{
+				if (!InSamples.IsValidIndex(NeighborIndex) || VisitedNonGap[NeighborIndex] != 0)
+				{
+					continue;
+				}
+				if (InSamples[NeighborIndex].bGapDetected || InSamples[NeighborIndex].PlateId != PlateId)
+				{
+					continue;
+				}
+
+				VisitedNonGap[NeighborIndex] = 1;
+				Stack.Add(NeighborIndex);
+			}
+		}
+
+		ComponentsByPlate[PlateId].Add(Component);
+	}
+
+	for (const TArray<FPlateComponentInfo>& Components : ComponentsByPlate)
+	{
+		if (Components.Num() <= 0)
+		{
+			continue;
+		}
+
+		MaxPlateComponentCount = FMath::Max(MaxPlateComponentCount, Components.Num());
+		if (Components.Num() <= 1)
+		{
+			continue;
+		}
+
+		const int32 PrimaryComponentIndex = SelectPrimaryComponentIndex(Components);
+		for (int32 ComponentIndex = 0; ComponentIndex < Components.Num(); ++ComponentIndex)
+		{
+			if (ComponentIndex == PrimaryComponentIndex)
+			{
+				continue;
+			}
+
+			DetachedPlateFragmentSampleCount += Components[ComponentIndex].Size;
+			LargestDetachedPlateFragmentSize = FMath::Max(LargestDetachedPlateFragmentSize, Components[ComponentIndex].Size);
+		}
+	}
+}
+
 void FTectonicPlanet::RebuildPlateMembershipFromSamples(const TArray<FCanonicalSample>& InSamples)
 {
 	TArray<int32> PlateSampleCounts;
 	PlateSampleCounts.Init(0, Plates.Num());
+	TArray<int32> PlateNonGapSampleCounts;
+	PlateNonGapSampleCounts.Init(0, Plates.Num());
 	for (const FCanonicalSample& Sample : InSamples)
 	{
 		if (Plates.IsValidIndex(Sample.PlateId))
 		{
 			++PlateSampleCounts[Sample.PlateId];
+			if (!Sample.bGapDetected)
+			{
+				++PlateNonGapSampleCounts[Sample.PlateId];
+			}
 		}
 	}
 
@@ -1818,12 +4861,417 @@ void FTectonicPlanet::RebuildPlateMembershipFromSamples(const TArray<FCanonicalS
 		}
 	}
 
+	MinProtectedPlateSampleCount = TNumericLimits<int32>::Max();
+	EmptyProtectedPlateCount = 0;
 	for (const FPlate& Plate : Plates)
 	{
-		if (Plate.SampleIndices.Num() == 0)
+		if (Plate.PersistencePolicy != EPlatePersistencePolicy::Protected)
 		{
-			UE_LOG(LogTemp, Warning, TEXT("Plate %d is empty after membership rebuild."), Plate.Id);
+			continue;
 		}
+
+		const int32 PlateId = Plate.Id;
+		const int32 NonGapSampleCount = PlateNonGapSampleCounts.IsValidIndex(PlateId) ? PlateNonGapSampleCounts[PlateId] : 0;
+		MinProtectedPlateSampleCount = FMath::Min(MinProtectedPlateSampleCount, NonGapSampleCount);
+		if (NonGapSampleCount == 0)
+		{
+			++EmptyProtectedPlateCount;
+			UE_LOG(LogTemp, Warning, TEXT("Protected plate %d has no non-gap ownership after membership rebuild."), PlateId);
+		}
+	}
+
+	if (MinProtectedPlateSampleCount == TNumericLimits<int32>::Max())
+	{
+		MinProtectedPlateSampleCount = 0;
+	}
+}
+
+void FTectonicPlanet::UpdatePlateCanonicalCentersFromSamples(const TArray<FCanonicalSample>& InSamples)
+{
+	ParallelFor(Plates.Num(), [this, &InSamples](int32 PlateIndex)
+	{
+		FPlate& Plate = Plates[PlateIndex];
+		FVector MeanDirection = FVector::ZeroVector;
+		for (const int32 SampleIndex : Plate.SampleIndices)
+		{
+			if (InSamples.IsValidIndex(SampleIndex))
+			{
+				MeanDirection += InSamples[SampleIndex].Position;
+			}
+		}
+
+		if (!MeanDirection.IsNearlyZero())
+		{
+			Plate.CanonicalCenterDirection = MeanDirection.GetSafeNormal();
+		}
+		else if (!Plate.CanonicalCenterDirection.IsNearlyZero())
+		{
+			Plate.CanonicalCenterDirection = Plate.CanonicalCenterDirection.GetSafeNormal();
+		}
+		else
+		{
+			Plate.CanonicalCenterDirection = Plate.IdentityAnchorDirection.IsNearlyZero()
+				? FVector::ForwardVector
+				: Plate.IdentityAnchorDirection.GetSafeNormal();
+		}
+	}, EParallelForFlags::Unbalanced);
+}
+
+bool FTectonicPlanet::ResolveDominantConvergentInteractionForSample(
+	const TArray<FCanonicalSample>& InSamples,
+	const int32 SampleIndex,
+	int32& OutOpposingPlateId,
+	int32& OutRepresentativeNeighborIndex,
+	float& OutConvergenceSpeedMmPerYear) const
+{
+	OutOpposingPlateId = INDEX_NONE;
+	OutRepresentativeNeighborIndex = INDEX_NONE;
+	OutConvergenceSpeedMmPerYear = 0.0f;
+
+	if (!InSamples.IsValidIndex(SampleIndex) || !Adjacency.IsValidIndex(SampleIndex))
+	{
+		return false;
+	}
+
+	const FCanonicalSample& Sample = InSamples[SampleIndex];
+	if (!Sample.bIsBoundary || !Sample.bOverlapDetected || Sample.BoundaryType != EBoundaryType::Convergent || !Plates.IsValidIndex(Sample.PlateId))
+	{
+		return false;
+	}
+
+	const FVector Position = Sample.Position.GetSafeNormal();
+	const FVector BoundaryNormal = Sample.BoundaryNormal.GetSafeNormal();
+	if (Position.IsNearlyZero() || BoundaryNormal.IsNearlyZero())
+	{
+		return false;
+	}
+
+	constexpr int32 MaxNeighborPlateBins = 16;
+	constexpr double KmToMm = 1.0e6;
+	int32 CandidatePlateIds[MaxNeighborPlateBins];
+	int32 NumCandidatePlates = 0;
+	for (int32 SlotIndex = 0; SlotIndex < MaxNeighborPlateBins; ++SlotIndex)
+	{
+		CandidatePlateIds[SlotIndex] = INDEX_NONE;
+	}
+
+	auto AddUniquePlateId = [&CandidatePlateIds, &NumCandidatePlates](const int32 PlateId)
+	{
+		if (PlateId == INDEX_NONE)
+		{
+			return;
+		}
+
+		for (int32 Index = 0; Index < NumCandidatePlates; ++Index)
+		{
+			if (CandidatePlateIds[Index] == PlateId)
+			{
+				return;
+			}
+		}
+
+		if (NumCandidatePlates < MaxNeighborPlateBins)
+		{
+			CandidatePlateIds[NumCandidatePlates++] = PlateId;
+		}
+	};
+
+	for (int32 OverlapIndex = 0; OverlapIndex < Sample.NumOverlapPlateIds; ++OverlapIndex)
+	{
+		const int32 CandidatePlateId = Sample.OverlapPlateIds[OverlapIndex];
+		if (CandidatePlateId != Sample.PlateId && Plates.IsValidIndex(CandidatePlateId) && IsPlateActive(CandidatePlateId))
+		{
+			AddUniquePlateId(CandidatePlateId);
+		}
+	}
+
+	if (NumCandidatePlates == 0)
+	{
+		for (const int32 NeighborIndex : Adjacency[SampleIndex])
+		{
+			if (!InSamples.IsValidIndex(NeighborIndex))
+			{
+				continue;
+			}
+
+			const int32 NeighborPlateId = InSamples[NeighborIndex].PlateId;
+			if (NeighborPlateId != Sample.PlateId && Plates.IsValidIndex(NeighborPlateId) && IsPlateActive(NeighborPlateId))
+			{
+				AddUniquePlateId(NeighborPlateId);
+			}
+		}
+	}
+
+	int32 BestOpposingNeighborCount = -1;
+	float BestConvergenceSpeed = -1.0f;
+	double BestRepresentativeNeighborDistSq = TNumericLimits<double>::Max();
+	for (int32 CandidateIndex = 0; CandidateIndex < NumCandidatePlates; ++CandidateIndex)
+	{
+		const int32 CandidatePlateId = CandidatePlateIds[CandidateIndex];
+		if (!Plates.IsValidIndex(CandidatePlateId))
+		{
+			continue;
+		}
+
+		int32 DirectNeighborCount = 0;
+		int32 RepresentativeNeighborIndex = INDEX_NONE;
+		double RepresentativeNeighborDistSq = TNumericLimits<double>::Max();
+		for (const int32 NeighborIndex : Adjacency[SampleIndex])
+		{
+			if (!InSamples.IsValidIndex(NeighborIndex) || InSamples[NeighborIndex].PlateId != CandidatePlateId)
+			{
+				continue;
+			}
+
+			++DirectNeighborCount;
+			const double DistSq = FVector::DistSquared(Sample.Position, InSamples[NeighborIndex].Position);
+			if (DistSq < RepresentativeNeighborDistSq)
+			{
+				RepresentativeNeighborDistSq = DistSq;
+				RepresentativeNeighborIndex = NeighborIndex;
+			}
+		}
+
+		const FVector RelativeVelocity = ComputeSurfaceVelocity(Sample.PlateId, Position) - ComputeSurfaceVelocity(CandidatePlateId, Position);
+		const float CandidateConvergenceSpeed = static_cast<float>(
+			FMath::Max(0.0, -static_cast<double>(FVector::DotProduct(RelativeVelocity, BoundaryNormal))) *
+			PlanetRadius *
+			KmToMm /
+			TimestepDurationYears);
+
+		const bool bBetterCandidate =
+			(OutOpposingPlateId == INDEX_NONE) ||
+			(DirectNeighborCount > BestOpposingNeighborCount) ||
+			(DirectNeighborCount == BestOpposingNeighborCount && CandidateConvergenceSpeed > BestConvergenceSpeed + KINDA_SMALL_NUMBER) ||
+			(DirectNeighborCount == BestOpposingNeighborCount && FMath::IsNearlyEqual(CandidateConvergenceSpeed, BestConvergenceSpeed, KINDA_SMALL_NUMBER) && CandidatePlateId < OutOpposingPlateId);
+		if (bBetterCandidate)
+		{
+			OutOpposingPlateId = CandidatePlateId;
+			BestOpposingNeighborCount = DirectNeighborCount;
+			BestConvergenceSpeed = CandidateConvergenceSpeed;
+			OutRepresentativeNeighborIndex = RepresentativeNeighborIndex;
+			BestRepresentativeNeighborDistSq = RepresentativeNeighborDistSq;
+		}
+		else if (CandidatePlateId == OutOpposingPlateId && RepresentativeNeighborDistSq < BestRepresentativeNeighborDistSq)
+		{
+			OutRepresentativeNeighborIndex = RepresentativeNeighborIndex;
+			BestRepresentativeNeighborDistSq = RepresentativeNeighborDistSq;
+		}
+	}
+
+	OutConvergenceSpeedMmPerYear = FMath::Max(0.0f, BestConvergenceSpeed);
+	return Plates.IsValidIndex(OutOpposingPlateId) && InSamples.IsValidIndex(OutRepresentativeNeighborIndex);
+}
+
+void FTectonicPlanet::RefreshSubductionMetricsFromCarriedSamples()
+{
+	int32 LocalFrontSampleCount = 0;
+	int32 LocalAndeanSampleCount = 0;
+	int32 LocalHimalayanSampleCount = 0;
+	float LocalMaxSubductionDistanceKm = 0.0f;
+
+	for (const FPlate& Plate : Plates)
+	{
+		for (const FCarriedSampleData& CarriedSample : Plate.CarriedSamples)
+		{
+			LocalFrontSampleCount += CarriedSample.bIsSubductionFront ? 1 : 0;
+			LocalAndeanSampleCount += (CarriedSample.OrogenyType == EOrogenyType::Andean) ? 1 : 0;
+			LocalHimalayanSampleCount += (CarriedSample.OrogenyType == EOrogenyType::Himalayan) ? 1 : 0;
+			if (CarriedSample.SubductionRole != ESubductionRole::None && CarriedSample.SubductionDistanceKm >= 0.0f)
+			{
+				LocalMaxSubductionDistanceKm = FMath::Max(LocalMaxSubductionDistanceKm, CarriedSample.SubductionDistanceKm);
+			}
+		}
+	}
+
+	SubductionFrontSampleCount = LocalFrontSampleCount;
+	AndeanSampleCount = LocalAndeanSampleCount;
+	HimalayanSampleCount = LocalHimalayanSampleCount;
+	MaxSubductionDistanceKm = LocalMaxSubductionDistanceKm;
+}
+
+void FTectonicPlanet::UpdateSubductionFieldsForSamples(TArray<FCanonicalSample>& InOutSamples)
+{
+	SubductionFrontSampleCount = 0;
+	PendingCollisionSampleCount = 0;
+	MaxSubductionDistanceKm = 0.0f;
+	AndeanSampleCount = 0;
+	HimalayanSampleCount = 0;
+
+	for (FCanonicalSample& Sample : InOutSamples)
+	{
+		Sample.SubductionRole = ESubductionRole::None;
+		Sample.SubductionOpposingPlateId = INDEX_NONE;
+		Sample.SubductionDistanceKm = -1.0f;
+		Sample.SubductionConvergenceSpeedMmPerYear = 0.0f;
+		Sample.bIsSubductionFront = false;
+		AndeanSampleCount += (Sample.OrogenyType == EOrogenyType::Andean) ? 1 : 0;
+		HimalayanSampleCount += (Sample.OrogenyType == EOrogenyType::Himalayan) ? 1 : 0;
+	}
+
+	if (Plates.Num() == 0 || Adjacency.Num() != InOutSamples.Num())
+	{
+		return;
+	}
+
+	bool bAdjacencyEdgeCacheValid = (AdjacencyEdgeDistancesKm.Num() == Adjacency.Num());
+	for (int32 SampleIndex = 0; bAdjacencyEdgeCacheValid && SampleIndex < Adjacency.Num(); ++SampleIndex)
+	{
+		bAdjacencyEdgeCacheValid = AdjacencyEdgeDistancesKm[SampleIndex].Num() == Adjacency[SampleIndex].Num();
+	}
+	if (!bAdjacencyEdgeCacheValid)
+	{
+		RebuildAdjacencyEdgeDistanceCache(InOutSamples);
+	}
+	if (AdjacencyEdgeDistancesKm.Num() != InOutSamples.Num())
+	{
+		return;
+	}
+
+	TArray<FInfluenceSeed> OverridingSeeds;
+	TArray<FInfluenceSeed> SubductingSeeds;
+	OverridingSeeds.Reserve(BoundarySampleCount);
+	SubductingSeeds.Reserve(BoundarySampleCount);
+
+	for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
+	{
+		FCanonicalSample& Sample = InOutSamples[SampleIndex];
+		int32 BestOpposingPlateId = INDEX_NONE;
+		int32 BestRepresentativeNeighborIndex = INDEX_NONE;
+		float BestConvergenceSpeed = 0.0f;
+		if (!ResolveDominantConvergentInteractionForSample(
+			InOutSamples,
+			SampleIndex,
+			BestOpposingPlateId,
+			BestRepresentativeNeighborIndex,
+			BestConvergenceSpeed))
+		{
+			continue;
+		}
+
+		if (!Plates.IsValidIndex(BestOpposingPlateId) || !InOutSamples.IsValidIndex(BestRepresentativeNeighborIndex))
+		{
+			continue;
+		}
+
+		const FCanonicalSample& OpposingSample = InOutSamples[BestRepresentativeNeighborIndex];
+		if (Sample.CrustType == ECrustType::Continental && OpposingSample.CrustType == ECrustType::Continental)
+		{
+			++PendingCollisionSampleCount;
+			continue;
+		}
+
+		bool bSampleSubducting = false;
+		if (Sample.CrustType != OpposingSample.CrustType)
+		{
+			bSampleSubducting = (Sample.CrustType == ECrustType::Oceanic);
+		}
+		else if (Sample.CrustType == ECrustType::Oceanic)
+		{
+			if (Sample.Age > OpposingSample.Age + KINDA_SMALL_NUMBER)
+			{
+				bSampleSubducting = true;
+			}
+			else if (OpposingSample.Age > Sample.Age + KINDA_SMALL_NUMBER)
+			{
+				bSampleSubducting = false;
+			}
+			else
+			{
+				bSampleSubducting = Sample.PlateId > BestOpposingPlateId;
+			}
+		}
+		else
+		{
+			++PendingCollisionSampleCount;
+			continue;
+		}
+
+		FInfluenceSeed Seed;
+		Seed.SampleIndex = SampleIndex;
+		Seed.PlateId = Sample.PlateId;
+		Seed.SecondaryId = BestOpposingPlateId;
+		Seed.InfluenceWeight = FMath::Max(0.0f, BestConvergenceSpeed);
+		if (bSampleSubducting)
+		{
+			SubductingSeeds.Add(Seed);
+		}
+		else
+		{
+			OverridingSeeds.Add(Seed);
+		}
+	}
+
+	TArray<FInfluencePathCandidate> BestOverridingCandidates;
+	TArray<FInfluencePathCandidate> BestSubductingCandidates;
+	FGraphEventArray PropagationTasks;
+	PropagationTasks.Reserve(2);
+	PropagationTasks.Add(FFunctionGraphTask::CreateAndDispatchWhenReady(
+		[this, &InOutSamples, &OverridingSeeds, &BestOverridingCandidates]()
+		{
+			auto CanTraverse = [](const FCanonicalSample& TraversedSample, const auto& SeedOrEntry)
+			{
+				return !TraversedSample.bGapDetected && TraversedSample.PlateId == SeedOrEntry.PlateId;
+			};
+			PropagateInfluenceSeeds(
+				InOutSamples,
+				Adjacency,
+				AdjacencyEdgeDistancesKm,
+				OverridingSeeds,
+				SubductionInfluenceRadiusKm,
+				CanTraverse,
+				BestOverridingCandidates);
+		},
+		TStatId(),
+		nullptr,
+		ENamedThreads::AnyBackgroundThreadNormalTask));
+	PropagationTasks.Add(FFunctionGraphTask::CreateAndDispatchWhenReady(
+		[this, &InOutSamples, &SubductingSeeds, &BestSubductingCandidates]()
+		{
+			auto CanTraverse = [](const FCanonicalSample& TraversedSample, const auto& SeedOrEntry)
+			{
+				return !TraversedSample.bGapDetected && TraversedSample.PlateId == SeedOrEntry.PlateId;
+			};
+			PropagateInfluenceSeeds(
+				InOutSamples,
+				Adjacency,
+				AdjacencyEdgeDistancesKm,
+				SubductingSeeds,
+				SubductionTrenchRadiusKm,
+				CanTraverse,
+				BestSubductingCandidates);
+		},
+		TStatId(),
+		nullptr,
+		ENamedThreads::AnyBackgroundThreadNormalTask));
+	FTaskGraphInterface::Get().WaitUntilTasksComplete(PropagationTasks);
+
+	for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
+	{
+		FCanonicalSample& Sample = InOutSamples[SampleIndex];
+		const FInfluencePathCandidate& OverridingCandidate = BestOverridingCandidates[SampleIndex];
+		const FInfluencePathCandidate& SubductingCandidate = BestSubductingCandidates[SampleIndex];
+
+		const bool bUseOverriding = IsInfluenceCandidateBetterAcrossRoles(
+			OverridingCandidate,
+			SubductionInfluenceRadiusKm,
+			SubductingCandidate,
+			SubductionTrenchRadiusKm);
+		const bool bUseSubducting = !bUseOverriding && SubductingCandidate.bValid;
+
+		if (!bUseOverriding && !bUseSubducting)
+		{
+			continue;
+		}
+
+		const FInfluencePathCandidate& ChosenCandidate = bUseOverriding ? OverridingCandidate : SubductingCandidate;
+		Sample.SubductionRole = bUseOverriding ? ESubductionRole::Overriding : ESubductionRole::Subducting;
+		Sample.SubductionOpposingPlateId = ChosenCandidate.SecondaryId;
+		Sample.SubductionDistanceKm = ChosenCandidate.DistanceKm;
+		Sample.SubductionConvergenceSpeedMmPerYear = ChosenCandidate.InfluenceWeight;
+		Sample.bIsSubductionFront = (ChosenCandidate.FrontSampleIndex == SampleIndex);
+		SubductionFrontSampleCount += Sample.bIsSubductionFront ? 1 : 0;
+		MaxSubductionDistanceKm = FMath::Max(MaxSubductionDistanceKm, ChosenCandidate.DistanceKm);
 	}
 }
 
@@ -1855,8 +5303,18 @@ void FTectonicPlanet::RebuildCarriedSampleWorkspacesForSamples(const TArray<FCan
 			Carried.OrogenyType = Sample.OrogenyType;
 			Carried.OrogenyAge = Sample.OrogenyAge;
 			Carried.CrustType = Sample.CrustType;
+			Carried.SubductionRole = Sample.SubductionRole;
+			Carried.SubductionOpposingPlateId = Sample.SubductionOpposingPlateId;
+			Carried.SubductionDistanceKm = Sample.SubductionDistanceKm;
+			Carried.SubductionConvergenceSpeedMmPerYear = Sample.SubductionConvergenceSpeedMmPerYear;
+			Carried.bIsSubductionFront = Sample.bIsSubductionFront;
+			Carried.CollisionDistanceKm = Sample.CollisionDistanceKm;
+			Carried.CollisionConvergenceSpeedMmPerYear = Sample.CollisionConvergenceSpeedMmPerYear;
+			Carried.bIsCollisionFront = Sample.bIsCollisionFront;
 		}
 	}, EParallelForFlags::Unbalanced);
+
+	RefreshSubductionMetricsFromCarriedSamples();
 }
 
 void FTectonicPlanet::InvalidateSpatialQueryData()
@@ -1899,9 +5357,10 @@ void FTectonicPlanet::BuildSpatialQueryDataInternal() const
 	{
 		const FPlate& Plate = Plates[PlateIndex];
 		const FSpatialQueryData::FPlateSpatialState& ExistingState = SpatialQueryData->PlateStates[PlateIndex];
-		const bool bHasInteriorTriangles = Plate.InteriorTriangles.Num() > 0;
+		const int32 SoupTriangleCount = Plate.InteriorTriangles.Num() + Plate.BoundaryTriangles.Num();
+		const bool bHasSoupTriangles = SoupTriangleCount > 0;
 		const bool bMissingState = ExistingState.PlateId != Plate.Id;
-		const bool bMissingSpatial = bHasInteriorTriangles && (!ExistingState.Adapter || !ExistingState.BVH);
+		const bool bMissingSpatial = bHasSoupTriangles && (!ExistingState.Adapter || !ExistingState.BVH);
 		const bool bMarkedDirty = SpatialQueryData->DirtyPlateFlags[PlateIndex] != 0;
 		if (bMarkedDirty || bMissingState || bMissingSpatial)
 		{
@@ -1941,47 +5400,155 @@ void FTectonicPlanet::BuildSpatialQueryDataInternal() const
 		PlateState.SoupData.PlateId = Plate.Id;
 		PlateState.SoupData.ChangeStamp = static_cast<uint64>(ReconcileCount) + 1;
 
-		PlateState.SoupData.GlobalTriangleIndices.Reserve(Plate.InteriorTriangles.Num());
-		PlateState.SoupData.LocalTriangles.Reserve(Plate.InteriorTriangles.Num());
-		PlateState.SoupData.CanonicalToLocalVertex.Reserve(Plate.InteriorTriangles.Num() * 2);
-		PlateState.SoupData.LocalToCanonicalVertex.Reserve(Plate.InteriorTriangles.Num() * 2);
-		PlateState.SoupData.RotatedVertices.Reserve(Plate.InteriorTriangles.Num() * 2);
+		const int32 BaseSoupTriangleCount = Plate.InteriorTriangles.Num() + Plate.BoundaryTriangles.Num();
+		const int32 EstimatedSoupTriangleCount = Plate.InteriorTriangles.Num() + (2 * Plate.BoundaryTriangles.Num());
+		const int32 EstimatedSoupVertexCount = (Plate.InteriorTriangles.Num() * 3) + (Plate.BoundaryTriangles.Num() * 6);
+		PlateState.SoupData.GlobalTriangleIndices.Reserve(EstimatedSoupTriangleCount);
+		PlateState.SoupData.LocalTriangles.Reserve(EstimatedSoupTriangleCount);
+		PlateState.SoupData.CanonicalToLocalVertex.Reserve(BaseSoupTriangleCount * 2);
+		PlateState.SoupData.LocalToCanonicalVertex.Reserve(EstimatedSoupVertexCount);
+		PlateState.SoupData.RotatedVertices.Reserve(EstimatedSoupVertexCount);
 
-		for (const int32 TriangleIndex : Plate.InteriorTriangles)
+		auto FindOrAddCanonicalVertex = [&Samples, &PlateState](const int32 CanonicalSampleIndex) -> int32
+		{
+			const int32* ExistingLocalVertex = PlateState.SoupData.CanonicalToLocalVertex.Find(CanonicalSampleIndex);
+			if (ExistingLocalVertex)
+			{
+				return *ExistingLocalVertex;
+			}
+
+			checkSlow(Samples.IsValidIndex(CanonicalSampleIndex));
+			const int32 NewLocalVertex = PlateState.SoupData.RotatedVertices.Num();
+			PlateState.SoupData.CanonicalToLocalVertex.Add(CanonicalSampleIndex, NewLocalVertex);
+			PlateState.SoupData.LocalToCanonicalVertex.Add(CanonicalSampleIndex);
+			const FVector& CanonicalPosition = Samples[CanonicalSampleIndex].Position;
+			PlateState.SoupData.RotatedVertices.Add(FVector3d(CanonicalPosition.X, CanonicalPosition.Y, CanonicalPosition.Z));
+			return NewLocalVertex;
+		};
+
+		auto AddSyntheticVertex = [&PlateState](const FVector3d& CanonicalPosition) -> int32
+		{
+			const FVector3d NormalizedPosition = CanonicalPosition.GetSafeNormal();
+			if (NormalizedPosition.IsNearlyZero())
+			{
+				return INDEX_NONE;
+			}
+
+			const int32 NewLocalVertex = PlateState.SoupData.RotatedVertices.Num();
+			PlateState.SoupData.LocalToCanonicalVertex.Add(INDEX_NONE);
+			PlateState.SoupData.RotatedVertices.Add(NormalizedPosition);
+			return NewLocalVertex;
+		};
+
+		auto AppendLocalTriangle = [&PlateState](const int32 GlobalTriangleIndex, const int32 LocalVertex0, const int32 LocalVertex1, const int32 LocalVertex2)
+		{
+			if (LocalVertex0 == INDEX_NONE || LocalVertex1 == INDEX_NONE || LocalVertex2 == INDEX_NONE)
+			{
+				return;
+			}
+			if (LocalVertex0 == LocalVertex1 || LocalVertex1 == LocalVertex2 || LocalVertex0 == LocalVertex2)
+			{
+				return;
+			}
+
+			PlateState.SoupData.GlobalTriangleIndices.Add(GlobalTriangleIndex);
+			PlateState.SoupData.LocalTriangles.Add(UE::Geometry::FIndex3i(LocalVertex0, LocalVertex1, LocalVertex2));
+		};
+
+		auto AppendWholeTriangleToSoup = [this, &FindOrAddCanonicalVertex, &AppendLocalTriangle](const int32 TriangleIndex)
 		{
 			checkSlow(Triangles.IsValidIndex(TriangleIndex));
 			const FDelaunayTriangle& GlobalTriangle = Triangles[TriangleIndex];
-			int32 LocalVertices[3] = { INDEX_NONE, INDEX_NONE, INDEX_NONE };
+			const int32 LocalVertex0 = FindOrAddCanonicalVertex(GlobalTriangle.V[0]);
+			const int32 LocalVertex1 = FindOrAddCanonicalVertex(GlobalTriangle.V[1]);
+			const int32 LocalVertex2 = FindOrAddCanonicalVertex(GlobalTriangle.V[2]);
+			AppendLocalTriangle(TriangleIndex, LocalVertex0, LocalVertex1, LocalVertex2);
+		};
 
+		auto AppendBoundaryTriangleRegionToSoup = [this, &Samples, &Plate, &FindOrAddCanonicalVertex, &AddSyntheticVertex, &AppendLocalTriangle](const int32 TriangleIndex)
+		{
+			checkSlow(Triangles.IsValidIndex(TriangleIndex));
+			const FDelaunayTriangle& GlobalTriangle = Triangles[TriangleIndex];
+			const int32 VertexSampleIndices[3] = { GlobalTriangle.V[0], GlobalTriangle.V[1], GlobalTriangle.V[2] };
+			const int32 VertexPlateIds[3] = {
+				Samples[VertexSampleIndices[0]].PlateId,
+				Samples[VertexSampleIndices[1]].PlateId,
+				Samples[VertexSampleIndices[2]].PlateId };
+			const FVector3d CanonicalPositions[3] = {
+				FVector3d(Samples[VertexSampleIndices[0]].Position.X, Samples[VertexSampleIndices[0]].Position.Y, Samples[VertexSampleIndices[0]].Position.Z),
+				FVector3d(Samples[VertexSampleIndices[1]].Position.X, Samples[VertexSampleIndices[1]].Position.Y, Samples[VertexSampleIndices[1]].Position.Z),
+				FVector3d(Samples[VertexSampleIndices[2]].Position.X, Samples[VertexSampleIndices[2]].Position.Y, Samples[VertexSampleIndices[2]].Position.Z) };
+			const int32 LocalVertices[3] = {
+				FindOrAddCanonicalVertex(VertexSampleIndices[0]),
+				FindOrAddCanonicalVertex(VertexSampleIndices[1]),
+				FindOrAddCanonicalVertex(VertexSampleIndices[2]) };
+
+			int32 MatchingCorners[3] = { INDEX_NONE, INDEX_NONE, INDEX_NONE };
+			int32 NonMatchingCorners[3] = { INDEX_NONE, INDEX_NONE, INDEX_NONE };
+			int32 MatchingCount = 0;
+			int32 NonMatchingCount = 0;
 			for (int32 Corner = 0; Corner < 3; ++Corner)
 			{
-				const int32 CanonicalSampleIndex = GlobalTriangle.V[Corner];
-				checkSlow(Samples.IsValidIndex(CanonicalSampleIndex));
-
-				const int32* ExistingLocalVertex = PlateState.SoupData.CanonicalToLocalVertex.Find(CanonicalSampleIndex);
-				if (ExistingLocalVertex)
+				if (VertexPlateIds[Corner] == Plate.Id)
 				{
-					LocalVertices[Corner] = *ExistingLocalVertex;
-					continue;
+					MatchingCorners[MatchingCount++] = Corner;
 				}
-
-				const int32 NewLocalVertex = PlateState.SoupData.RotatedVertices.Num();
-				PlateState.SoupData.CanonicalToLocalVertex.Add(CanonicalSampleIndex, NewLocalVertex);
-				PlateState.SoupData.LocalToCanonicalVertex.Add(CanonicalSampleIndex);
-				const FVector& CanonicalPosition = Samples[CanonicalSampleIndex].Position;
-				PlateState.SoupData.RotatedVertices.Add(FVector3d(CanonicalPosition.X, CanonicalPosition.Y, CanonicalPosition.Z));
-				LocalVertices[Corner] = NewLocalVertex;
+				else
+				{
+					NonMatchingCorners[NonMatchingCount++] = Corner;
+				}
 			}
 
-			if (LocalVertices[0] == LocalVertices[1] ||
-				LocalVertices[1] == LocalVertices[2] ||
-				LocalVertices[0] == LocalVertices[2])
+			if (MatchingCount == 3)
 			{
-				continue;
+				AppendLocalTriangle(TriangleIndex, LocalVertices[0], LocalVertices[1], LocalVertices[2]);
+				return;
+			}
+			if (MatchingCount == 0)
+			{
+				return;
 			}
 
-			PlateState.SoupData.GlobalTriangleIndices.Add(TriangleIndex);
-			PlateState.SoupData.LocalTriangles.Add(UE::Geometry::FIndex3i(LocalVertices[0], LocalVertices[1], LocalVertices[2]));
+			auto AddMidpointVertex = [&CanonicalPositions, &AddSyntheticVertex](const int32 CornerA, const int32 CornerB) -> int32
+			{
+				return AddSyntheticVertex(CanonicalPositions[CornerA] + CanonicalPositions[CornerB]);
+			};
+
+			if (MatchingCount == 2)
+			{
+				const int32 OwnedCornerA = MatchingCorners[0];
+				const int32 OwnedCornerB = MatchingCorners[1];
+				const int32 OtherCorner = NonMatchingCorners[0];
+				const int32 MidA = AddMidpointVertex(OwnedCornerA, OtherCorner);
+				const int32 MidB = AddMidpointVertex(OwnedCornerB, OtherCorner);
+				AppendLocalTriangle(TriangleIndex, LocalVertices[OwnedCornerA], LocalVertices[OwnedCornerB], MidB);
+				AppendLocalTriangle(TriangleIndex, LocalVertices[OwnedCornerA], MidB, MidA);
+				return;
+			}
+
+			const int32 OwnedCorner = MatchingCorners[0];
+			const int32 OtherCornerA = NonMatchingCorners[0];
+			const int32 OtherCornerB = NonMatchingCorners[1];
+			const int32 MidA = AddMidpointVertex(OwnedCorner, OtherCornerA);
+			const int32 MidB = AddMidpointVertex(OwnedCorner, OtherCornerB);
+			if (VertexPlateIds[OtherCornerA] == VertexPlateIds[OtherCornerB])
+			{
+				AppendLocalTriangle(TriangleIndex, LocalVertices[OwnedCorner], MidA, MidB);
+				return;
+			}
+
+			const int32 CentroidVertex = AddSyntheticVertex(CanonicalPositions[0] + CanonicalPositions[1] + CanonicalPositions[2]);
+			AppendLocalTriangle(TriangleIndex, LocalVertices[OwnedCorner], MidA, CentroidVertex);
+			AppendLocalTriangle(TriangleIndex, LocalVertices[OwnedCorner], CentroidVertex, MidB);
+		};
+
+		for (const int32 TriangleIndex : Plate.InteriorTriangles)
+		{
+			AppendWholeTriangleToSoup(TriangleIndex);
+		}
+		for (const int32 TriangleIndex : Plate.BoundaryTriangles)
+		{
+			AppendBoundaryTriangleRegionToSoup(TriangleIndex);
 		}
 		SoupExtractMsPerPlate[PlateIndex] = (FPlatformTime::Seconds() - SoupStart) * 1000.0;
 
@@ -2145,12 +5712,17 @@ int32 FTectonicPlanet::FindNearestPlateByCap(const FVector& Direction) const
 	}
 
 	double BestDot = -TNumericLimits<double>::Max();
-	int32 BestPlateId = 0;
+	int32 BestPlateId = INDEX_NONE;
 	for (const FSpatialQueryData::FPlateSpatialState& PlateState : SpatialQueryData->PlateStates)
 	{
+		if (!IsPlateActive(PlateState.PlateId))
+		{
+			continue;
+		}
+
 		const FVector Center = PlateState.bHasValidCap
 			? PlateState.CapCenterDirection
-			: Plates[PlateState.PlateId].CumulativeRotation.RotateVector(Plates[PlateState.PlateId].RotationAxis).GetSafeNormal();
+			: Plates[PlateState.PlateId].CumulativeRotation.RotateVector(Plates[PlateState.PlateId].CanonicalCenterDirection).GetSafeNormal();
 		const double Dot = FVector::DotProduct(Direction, Center);
 		if (Dot > BestDot)
 		{
@@ -2159,7 +5731,7 @@ int32 FTectonicPlanet::FindNearestPlateByCap(const FVector& Direction) const
 		}
 	}
 
-	return BestPlateId;
+	return BestPlateId == INDEX_NONE ? 0 : BestPlateId;
 }
 
 float FTectonicPlanet::ComputeOwnershipMarginFromCaps(const FVector& Direction) const
@@ -2174,9 +5746,14 @@ float FTectonicPlanet::ComputeOwnershipMarginFromCaps(const FVector& Direction) 
 	double SecondBestDot = -TNumericLimits<double>::Max();
 	for (const FSpatialQueryData::FPlateSpatialState& PlateState : SpatialQueryData->PlateStates)
 	{
+		if (!IsPlateActive(PlateState.PlateId))
+		{
+			continue;
+		}
+
 		const FVector Center = PlateState.bHasValidCap
 			? PlateState.CapCenterDirection
-			: Plates[PlateState.PlateId].CumulativeRotation.RotateVector(Plates[PlateState.PlateId].RotationAxis).GetSafeNormal();
+			: Plates[PlateState.PlateId].CumulativeRotation.RotateVector(Plates[PlateState.PlateId].CanonicalCenterDirection).GetSafeNormal();
 		const double Dot = FVector::DotProduct(Direction, Center);
 		if (Dot > BestDot)
 		{
@@ -2207,11 +5784,590 @@ float FTectonicPlanet::ComputeOwnershipMarginFromCaps(const FVector& Direction) 
 	return static_cast<float>(MarginNumerator / AverageSampleSpacing);
 }
 
-void FTectonicPlanet::RunTerraneDetectionStub() const
+void FTectonicPlanet::RefreshTerraneMetrics()
 {
-	// TODO[M4]: Replace stub with terrane connected-component detection on continental crust.
-	// TODO[M4]: Add stable terrane identity tracking across reconciliations (split/merge handling).
-	UE_LOG(LogTemp, Verbose, TEXT("Reconcile Phase 7: Terrane detection stub (M1 no-op)."));
+	TrackedTerraneCount = TerraneRecords.Num();
+	ActiveTerraneCount = 0;
+	MergedTerraneCount = 0;
+	CollisionEventCount = CollisionEvents.Num();
+	for (const FTerraneRecord& Record : TerraneRecords)
+	{
+		ActiveTerraneCount += Record.bActive ? 1 : 0;
+		MergedTerraneCount += (Record.MergedIntoTerraneId != INDEX_NONE) ? 1 : 0;
+	}
+}
+
+void FTectonicPlanet::DetectTerranesForSamples(TArray<FCanonicalSample>& InOutSamples)
+{
+	const int32 CurrentReconcileOrdinal = ReconcileCount + 1;
+	for (FCanonicalSample& Sample : InOutSamples)
+	{
+		if (Sample.CrustType != ECrustType::Continental || Sample.bGapDetected || !Plates.IsValidIndex(Sample.PlateId))
+		{
+			Sample.TerraneId = INDEX_NONE;
+		}
+	}
+
+	struct FDetectedTerraneComponent
+	{
+		int32 PlateId = INDEX_NONE;
+		TArray<int32> Members;
+		FVector CentroidDirection = FVector::ZeroVector;
+		double AreaKm2 = 0.0;
+		int32 AnchorSampleIndex = INDEX_NONE;
+		int32 AssignedTerraneId = INDEX_NONE;
+		TMap<int32, int32> PriorTerraneSampleCounts;
+		TArray<int32> AnchorTerraneIds;
+	};
+
+	TMultiMap<int32, int32> PriorAnchorTerraneIdsBySample;
+	for (const FTerraneRecord& Record : TerraneRecords)
+	{
+		if (Record.bActive && Record.AnchorSampleIndex != INDEX_NONE)
+		{
+			PriorAnchorTerraneIdsBySample.Add(Record.AnchorSampleIndex, Record.TerraneId);
+		}
+	}
+
+	TArray<FDetectedTerraneComponent> Components;
+	if (Adjacency.Num() == InOutSamples.Num())
+	{
+		TArray<uint8> Visited;
+		Visited.Init(0, InOutSamples.Num());
+		TArray<int32> Stack;
+		Stack.Reserve(256);
+		for (int32 SeedIndex = 0; SeedIndex < InOutSamples.Num(); ++SeedIndex)
+		{
+			const FCanonicalSample& SeedSample = InOutSamples[SeedIndex];
+			if (Visited[SeedIndex] != 0 ||
+				SeedSample.CrustType != ECrustType::Continental ||
+				SeedSample.bGapDetected ||
+				!Plates.IsValidIndex(SeedSample.PlateId))
+			{
+				continue;
+			}
+
+			FDetectedTerraneComponent& Component = Components.Emplace_GetRef();
+			Component.PlateId = SeedSample.PlateId;
+			FVector MeanDirection = FVector::ZeroVector;
+
+			Visited[SeedIndex] = 1;
+			Stack.Reset();
+			Stack.Add(SeedIndex);
+			while (Stack.Num() > 0)
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				FCanonicalSample& Sample = InOutSamples[SampleIndex];
+				Component.Members.Add(SampleIndex);
+				MeanDirection += Sample.Position;
+				if (Sample.TerraneId != INDEX_NONE)
+				{
+					Component.PriorTerraneSampleCounts.FindOrAdd(Sample.TerraneId) += 1;
+				}
+
+				TArray<int32> AnchoredTerranes;
+				PriorAnchorTerraneIdsBySample.MultiFind(SampleIndex, AnchoredTerranes);
+				for (const int32 AnchoredTerraneId : AnchoredTerranes)
+				{
+					Component.AnchorTerraneIds.AddUnique(AnchoredTerraneId);
+				}
+
+				for (const int32 NeighborIndex : Adjacency[SampleIndex])
+				{
+					if (!InOutSamples.IsValidIndex(NeighborIndex) || Visited[NeighborIndex] != 0)
+					{
+						continue;
+					}
+
+					const FCanonicalSample& Neighbor = InOutSamples[NeighborIndex];
+					if (Neighbor.CrustType != ECrustType::Continental ||
+						Neighbor.bGapDetected ||
+						Neighbor.PlateId != Component.PlateId)
+					{
+						continue;
+					}
+
+					Visited[NeighborIndex] = 1;
+					Stack.Add(NeighborIndex);
+				}
+			}
+
+			Component.CentroidDirection = MeanDirection.GetSafeNormal();
+			Component.AreaKm2 = static_cast<double>(Component.Members.Num()) * AverageCellAreaKm2;
+			double BestAnchorDot = -TNumericLimits<double>::Max();
+			for (const int32 SampleIndex : Component.Members)
+			{
+				const double CandidateDot = FVector::DotProduct(InOutSamples[SampleIndex].Position, Component.CentroidDirection);
+				if (Component.AnchorSampleIndex == INDEX_NONE ||
+					CandidateDot > BestAnchorDot + UE_DOUBLE_SMALL_NUMBER ||
+					(FMath::IsNearlyEqual(CandidateDot, BestAnchorDot, UE_DOUBLE_SMALL_NUMBER) && SampleIndex < Component.AnchorSampleIndex))
+				{
+					Component.AnchorSampleIndex = SampleIndex;
+					BestAnchorDot = CandidateDot;
+				}
+			}
+		}
+	}
+
+	TSet<int32> MatchedTerraneIds;
+	TMap<int32, int32> MergedIntoTerraneById;
+	auto GetPriorTerranePriority = [this](const FDetectedTerraneComponent& Component, const int32 TerraneId) -> int32
+	{
+		const int32* PriorContribution = Component.PriorTerraneSampleCounts.Find(TerraneId);
+		if (PriorContribution)
+		{
+			return *PriorContribution;
+		}
+
+		if (const FTerraneRecord* Record = FindTerraneRecordById(TerraneId))
+		{
+			return Record->SampleCount;
+		}
+
+		return 0;
+	};
+
+	for (FDetectedTerraneComponent& Component : Components)
+	{
+		if (Component.AnchorTerraneIds.Num() <= 0)
+		{
+			continue;
+		}
+
+		int32 WinningTerraneId = INDEX_NONE;
+		int32 WinningPriority = -1;
+		for (const int32 CandidateTerraneId : Component.AnchorTerraneIds)
+		{
+			const int32 CandidatePriority = GetPriorTerranePriority(Component, CandidateTerraneId);
+			if (WinningTerraneId == INDEX_NONE ||
+				CandidatePriority > WinningPriority ||
+				(CandidatePriority == WinningPriority && CandidateTerraneId < WinningTerraneId))
+			{
+				WinningTerraneId = CandidateTerraneId;
+				WinningPriority = CandidatePriority;
+			}
+		}
+
+		Component.AssignedTerraneId = WinningTerraneId;
+		for (const int32 CandidateTerraneId : Component.AnchorTerraneIds)
+		{
+			MatchedTerraneIds.Add(CandidateTerraneId);
+			if (CandidateTerraneId != WinningTerraneId)
+			{
+				MergedIntoTerraneById.Add(CandidateTerraneId, WinningTerraneId);
+			}
+		}
+	}
+
+	auto FindBestFallbackTerraneId = [this, &MatchedTerraneIds, &InOutSamples](const FDetectedTerraneComponent& Component, const bool bRestrictToSamePlate) -> int32
+	{
+		int32 BestTerraneId = INDEX_NONE;
+		double BestMatchDot = -TNumericLimits<double>::Max();
+		int32 BestSampleCount = -1;
+		for (const FTerraneRecord& Record : TerraneRecords)
+		{
+			if (!Record.bActive || Record.MergedIntoTerraneId != INDEX_NONE || MatchedTerraneIds.Contains(Record.TerraneId))
+			{
+				continue;
+			}
+			if (bRestrictToSamePlate && Record.PlateId != Component.PlateId)
+			{
+				continue;
+			}
+
+			double CandidateBestDot = -TNumericLimits<double>::Max();
+			for (const int32 SampleIndex : Component.Members)
+			{
+				CandidateBestDot = FMath::Max(
+					CandidateBestDot,
+					static_cast<double>(FVector::DotProduct(InOutSamples[SampleIndex].Position, Record.CentroidDirection)));
+			}
+
+			if (BestTerraneId == INDEX_NONE ||
+				CandidateBestDot > BestMatchDot + UE_DOUBLE_SMALL_NUMBER ||
+				(FMath::IsNearlyEqual(CandidateBestDot, BestMatchDot, UE_DOUBLE_SMALL_NUMBER) && Record.SampleCount > BestSampleCount) ||
+				(FMath::IsNearlyEqual(CandidateBestDot, BestMatchDot, UE_DOUBLE_SMALL_NUMBER) && Record.SampleCount == BestSampleCount && Record.TerraneId < BestTerraneId))
+			{
+				BestTerraneId = Record.TerraneId;
+				BestMatchDot = CandidateBestDot;
+				BestSampleCount = Record.SampleCount;
+			}
+		}
+		return BestTerraneId;
+	};
+
+	for (FDetectedTerraneComponent& Component : Components)
+	{
+		if (Component.AssignedTerraneId != INDEX_NONE)
+		{
+			continue;
+		}
+
+		int32 FallbackTerraneId = FindBestFallbackTerraneId(Component, true);
+		if (FallbackTerraneId == INDEX_NONE)
+		{
+			FallbackTerraneId = FindBestFallbackTerraneId(Component, false);
+		}
+		if (FallbackTerraneId != INDEX_NONE)
+		{
+			Component.AssignedTerraneId = FallbackTerraneId;
+			MatchedTerraneIds.Add(FallbackTerraneId);
+		}
+	}
+
+	for (FDetectedTerraneComponent& Component : Components)
+	{
+		if (Component.AssignedTerraneId == INDEX_NONE)
+		{
+			Component.AssignedTerraneId = NextTerraneId++;
+		}
+
+		for (const int32 SampleIndex : Component.Members)
+		{
+			InOutSamples[SampleIndex].TerraneId = Component.AssignedTerraneId;
+		}
+	}
+
+	for (FTerraneRecord& Record : TerraneRecords)
+	{
+		Record.bActive = false;
+	}
+
+	for (const TPair<int32, int32>& MergeEntry : MergedIntoTerraneById)
+	{
+		if (FTerraneRecord* MergedRecord = FindTerraneRecordById(MergeEntry.Key))
+		{
+			MergedRecord->bActive = false;
+			MergedRecord->MergedIntoTerraneId = MergeEntry.Value;
+			MergedRecord->LastSeenReconcile = CurrentReconcileOrdinal;
+		}
+	}
+
+	for (const FDetectedTerraneComponent& Component : Components)
+	{
+		FTerraneRecord* Record = FindTerraneRecordById(Component.AssignedTerraneId);
+		if (!Record)
+		{
+			Record = &TerraneRecords.Emplace_GetRef();
+			Record->TerraneId = Component.AssignedTerraneId;
+		}
+
+		Record->PlateId = Component.PlateId;
+		Record->AnchorSampleIndex = Component.AnchorSampleIndex;
+		Record->CentroidDirection = Component.CentroidDirection;
+		Record->AreaKm2 = Component.AreaKm2;
+		Record->SampleCount = Component.Members.Num();
+		Record->MergedIntoTerraneId = INDEX_NONE;
+		Record->LastSeenReconcile = CurrentReconcileOrdinal;
+		Record->bActive = true;
+	}
+
+	RefreshTerraneMetrics();
+}
+
+bool FTectonicPlanet::ApplyContinentalCollisionEventsForSamples(TArray<FCanonicalSample>& InOutSamples)
+{
+	if (Adjacency.Num() != InOutSamples.Num() || TerraneRecords.Num() <= 0)
+	{
+		return false;
+	}
+	if (AdjacencyEdgeDistancesKm.Num() != InOutSamples.Num())
+	{
+		RebuildAdjacencyEdgeDistanceCache(InOutSamples);
+	}
+	if (AdjacencyEdgeDistancesKm.Num() != InOutSamples.Num())
+	{
+		return false;
+	}
+
+	struct FCollisionPairCandidate
+	{
+		int32 TerraneIdA = INDEX_NONE;
+		int32 TerraneIdB = INDEX_NONE;
+		TArray<int32> FrontSampleIndices;
+		int32 ContactSampleCount = 0;
+		double ConvergenceSpeedSum = 0.0;
+	};
+
+	TArray<FCollisionPairCandidate> PairCandidates;
+	TMap<uint64, int32> PairIndexByKey;
+	for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
+	{
+		const FCanonicalSample& Sample = InOutSamples[SampleIndex];
+		if (Sample.CrustType != ECrustType::Continental || Sample.TerraneId == INDEX_NONE)
+		{
+			continue;
+		}
+
+		int32 OpposingPlateId = INDEX_NONE;
+		int32 OpposingSampleIndex = INDEX_NONE;
+		float ConvergenceSpeedMmPerYear = 0.0f;
+		if (!ResolveDominantConvergentInteractionForSample(
+			InOutSamples,
+			SampleIndex,
+			OpposingPlateId,
+			OpposingSampleIndex,
+			ConvergenceSpeedMmPerYear))
+		{
+			continue;
+		}
+
+		if (!InOutSamples.IsValidIndex(OpposingSampleIndex))
+		{
+			continue;
+		}
+
+		const FCanonicalSample& OpposingSample = InOutSamples[OpposingSampleIndex];
+		if (OpposingSample.CrustType != ECrustType::Continental ||
+			OpposingSample.TerraneId == INDEX_NONE ||
+			OpposingSample.TerraneId == Sample.TerraneId)
+		{
+			continue;
+		}
+
+		const uint64 PairKey = MakeCollisionHistoryKey(Sample.TerraneId, OpposingSample.TerraneId);
+		if (CollisionHistoryKeys.Contains(PairKey))
+		{
+			continue;
+		}
+
+		int32* ExistingPairIndex = PairIndexByKey.Find(PairKey);
+		if (!ExistingPairIndex)
+		{
+			FCollisionPairCandidate& Pair = PairCandidates.Emplace_GetRef();
+			Pair.TerraneIdA = FMath::Min(Sample.TerraneId, OpposingSample.TerraneId);
+			Pair.TerraneIdB = FMath::Max(Sample.TerraneId, OpposingSample.TerraneId);
+			Pair.FrontSampleIndices.Reserve(16);
+			PairIndexByKey.Add(PairKey, PairCandidates.Num() - 1);
+			ExistingPairIndex = PairIndexByKey.Find(PairKey);
+		}
+
+		FCollisionPairCandidate& Pair = PairCandidates[*ExistingPairIndex];
+		Pair.ContactSampleCount += 1;
+		Pair.ConvergenceSpeedSum += static_cast<double>(ConvergenceSpeedMmPerYear);
+		Pair.FrontSampleIndices.AddUnique(SampleIndex);
+		Pair.FrontSampleIndices.AddUnique(OpposingSampleIndex);
+	}
+
+	PairCandidates.Sort([this](const FCollisionPairCandidate& A, const FCollisionPairCandidate& B)
+	{
+		if (A.ContactSampleCount != B.ContactSampleCount)
+		{
+			return A.ContactSampleCount > B.ContactSampleCount;
+		}
+
+		const double MeanSpeedA = (A.ContactSampleCount > 0) ? (A.ConvergenceSpeedSum / static_cast<double>(A.ContactSampleCount)) : 0.0;
+		const double MeanSpeedB = (B.ContactSampleCount > 0) ? (B.ConvergenceSpeedSum / static_cast<double>(B.ContactSampleCount)) : 0.0;
+		if (!FMath::IsNearlyEqual(MeanSpeedA, MeanSpeedB, UE_DOUBLE_SMALL_NUMBER))
+		{
+			return MeanSpeedA > MeanSpeedB;
+		}
+
+		if (A.TerraneIdA != B.TerraneIdA)
+		{
+			return A.TerraneIdA < B.TerraneIdA;
+		}
+		return A.TerraneIdB < B.TerraneIdB;
+	});
+
+	TSet<int32> TerranesUsedThisReconcile;
+	bool bAppliedAnyCollision = false;
+	for (const FCollisionPairCandidate& Pair : PairCandidates)
+	{
+		if (TerranesUsedThisReconcile.Contains(Pair.TerraneIdA) || TerranesUsedThisReconcile.Contains(Pair.TerraneIdB))
+		{
+			continue;
+		}
+
+		const FTerraneRecord* TerraneRecordA = FindTerraneRecordById(Pair.TerraneIdA);
+		const FTerraneRecord* TerraneRecordB = FindTerraneRecordById(Pair.TerraneIdB);
+		if (!TerraneRecordA || !TerraneRecordB || !TerraneRecordA->bActive || !TerraneRecordB->bActive)
+		{
+			continue;
+		}
+
+		const bool bATerraneIsSmaller =
+			(TerraneRecordA->AreaKm2 < TerraneRecordB->AreaKm2 - UE_DOUBLE_SMALL_NUMBER) ||
+			(FMath::IsNearlyEqual(TerraneRecordA->AreaKm2, TerraneRecordB->AreaKm2, UE_DOUBLE_SMALL_NUMBER) && TerraneRecordA->TerraneId < TerraneRecordB->TerraneId);
+		const FTerraneRecord& DonorTerrane = bATerraneIsSmaller ? *TerraneRecordA : *TerraneRecordB;
+		const FTerraneRecord& ReceiverTerrane = bATerraneIsSmaller ? *TerraneRecordB : *TerraneRecordA;
+		if (!Plates.IsValidIndex(ReceiverTerrane.PlateId))
+		{
+			continue;
+		}
+
+		TArray<int32> DonorSampleIndices;
+		DonorSampleIndices.Reserve(DonorTerrane.SampleCount);
+		for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
+		{
+			if (InOutSamples[SampleIndex].TerraneId == DonorTerrane.TerraneId)
+			{
+				DonorSampleIndices.Add(SampleIndex);
+			}
+		}
+		if (DonorSampleIndices.Num() <= 0)
+		{
+			continue;
+		}
+
+		const float MeanConvergenceSpeedMmPerYear = (Pair.ContactSampleCount > 0)
+			? static_cast<float>(Pair.ConvergenceSpeedSum / static_cast<double>(Pair.ContactSampleCount))
+			: 0.0f;
+		const double CollisionAreaKm2 = static_cast<double>(DonorSampleIndices.Num()) * AverageCellAreaKm2;
+		const double AreaNormalizationKm2 = FMath::Max(InitialMeanPlateAreaKm2, AverageCellAreaKm2);
+		const double AreaScale = FMath::Clamp(CollisionAreaKm2 / AreaNormalizationKm2, 0.0, 1.0);
+		const double SpeedScale = FMath::Clamp(
+			static_cast<double>(MeanConvergenceSpeedMmPerYear) / static_cast<double>(MaxSubductionSpeedMmPerYear),
+			0.0,
+			1.0);
+		const float CollisionRadiusKm = static_cast<float>(FMath::Clamp(
+			4200.0 * FMath::Sqrt(SpeedScale * AreaScale),
+			0.0,
+			4200.0));
+
+		for (const int32 SampleIndex : DonorSampleIndices)
+		{
+			InOutSamples[SampleIndex].PlateId = ReceiverTerrane.PlateId;
+		}
+
+		TArray<FInfluenceSeed> CollisionSeeds;
+		CollisionSeeds.Reserve(Pair.FrontSampleIndices.Num());
+		for (const int32 FrontSampleIndex : Pair.FrontSampleIndices)
+		{
+			if (!InOutSamples.IsValidIndex(FrontSampleIndex))
+			{
+				continue;
+			}
+
+			FInfluenceSeed& Seed = CollisionSeeds.Emplace_GetRef();
+			Seed.SampleIndex = FrontSampleIndex;
+			Seed.PlateId = ReceiverTerrane.PlateId;
+			Seed.SecondaryId = DonorTerrane.TerraneId;
+			Seed.InfluenceWeight = MeanConvergenceSpeedMmPerYear;
+		}
+
+		TArray<FInfluencePathCandidate> CollisionCandidates;
+		auto CanTraverse = [ReceiverPlateId = ReceiverTerrane.PlateId](const FCanonicalSample& TraversedSample, const auto& SeedOrEntry)
+		{
+			return !TraversedSample.bGapDetected &&
+				TraversedSample.PlateId == ReceiverPlateId &&
+				TraversedSample.CrustType == ECrustType::Continental &&
+				SeedOrEntry.PlateId == ReceiverPlateId;
+		};
+		PropagateInfluenceSeeds(
+			InOutSamples,
+			Adjacency,
+			AdjacencyEdgeDistancesKm,
+			CollisionSeeds,
+			CollisionRadiusKm,
+			CanTraverse,
+			CollisionCandidates);
+
+		FVector MeanCompressionDirection = FVector::ZeroVector;
+		for (const int32 FrontSampleIndex : Pair.FrontSampleIndices)
+		{
+			if (InOutSamples.IsValidIndex(FrontSampleIndex))
+			{
+				MeanCompressionDirection += InOutSamples[FrontSampleIndex].BoundaryNormal;
+			}
+		}
+		if (MeanCompressionDirection.IsNearlyZero())
+		{
+			MeanCompressionDirection = (ReceiverTerrane.CentroidDirection - DonorTerrane.CentroidDirection).GetSafeNormal();
+		}
+		MeanCompressionDirection = MeanCompressionDirection.GetSafeNormal();
+
+		for (int32 SampleIndex = 0; SampleIndex < InOutSamples.Num(); ++SampleIndex)
+		{
+			const FInfluencePathCandidate& Candidate = CollisionCandidates[SampleIndex];
+			if (!Candidate.bValid || Candidate.DistanceKm < 0.0f || CollisionRadiusKm <= UE_SMALL_NUMBER)
+			{
+				continue;
+			}
+
+			const double RadiusRatio = static_cast<double>(Candidate.DistanceKm) / static_cast<double>(CollisionRadiusKm);
+			if (RadiusRatio >= 1.0)
+			{
+				continue;
+			}
+
+			const double Falloff = FMath::Square(1.0 - (RadiusRatio * RadiusRatio));
+			const float ElevationSurgeKm = static_cast<float>(1.3e-5 * CollisionAreaKm2 * Falloff);
+			if (ElevationSurgeKm <= KINDA_SMALL_NUMBER)
+			{
+				continue;
+			}
+
+			FCanonicalSample& Sample = InOutSamples[SampleIndex];
+			Sample.Elevation += ElevationSurgeKm;
+			Sample.CollisionDistanceKm = Candidate.DistanceKm;
+			Sample.CollisionConvergenceSpeedMmPerYear = MeanConvergenceSpeedMmPerYear;
+			Sample.bIsCollisionFront = (Candidate.FrontSampleIndex == SampleIndex);
+			Sample.OrogenyType = EOrogenyType::Himalayan;
+			Sample.OrogenyAge = 0.0f;
+
+			FVector FoldDirection = FVector::CrossProduct(Sample.Position.GetSafeNormal(), MeanCompressionDirection);
+			FoldDirection = FoldDirection - FVector::DotProduct(FoldDirection, Sample.Position) * Sample.Position;
+			if (!FoldDirection.IsNearlyZero())
+			{
+				Sample.FoldDirection = FoldDirection.GetSafeNormal();
+			}
+		}
+
+		const uint64 PairKey = MakeCollisionHistoryKey(Pair.TerraneIdA, Pair.TerraneIdB);
+		CollisionHistoryKeys.Add(PairKey);
+		FCollisionEventRecord& EventRecord = CollisionEvents.Emplace_GetRef();
+		EventRecord.DonorTerraneId = DonorTerrane.TerraneId;
+		EventRecord.ReceiverTerraneId = ReceiverTerrane.TerraneId;
+		EventRecord.ReceiverPlateId = ReceiverTerrane.PlateId;
+		EventRecord.ReconcileOrdinal = ReconcileCount + 1;
+		EventRecord.ContactSampleCount = Pair.ContactSampleCount;
+		EventRecord.MeanConvergenceSpeedMmPerYear = MeanConvergenceSpeedMmPerYear;
+		TerranesUsedThisReconcile.Add(Pair.TerraneIdA);
+		TerranesUsedThisReconcile.Add(Pair.TerraneIdB);
+		bAppliedAnyCollision = true;
+	}
+
+	CollisionEventCount = CollisionEvents.Num();
+	return bAppliedAnyCollision;
+}
+
+void FTectonicPlanet::RefreshCanonicalStateAfterCollision(
+	const TArray<FPhase2SampleState>& Phase2States,
+	TArray<FCanonicalSample>& InOutSamples)
+{
+	for (FCanonicalSample& Sample : InOutSamples)
+	{
+		if (!Plates.IsValidIndex(Sample.PlateId))
+		{
+			Sample.PlateId = FindNearestPlateByCap(Sample.Position);
+		}
+	}
+
+	RunBoundaryLikeLocalOwnershipSanitizePass(Phase2States, InOutSamples, 1);
+	EnforceConnectedPlateOwnershipForSamples(InOutSamples);
+	const bool bRescuedProtectedOwnership = RescueProtectedPlateOwnershipForSamples(InOutSamples);
+	if (bRescuedProtectedOwnership)
+	{
+		EnforceConnectedPlateOwnershipForSamples(InOutSamples);
+	}
+	RunBoundaryLikeLocalOwnershipSanitizePass(Phase2States, InOutSamples, 1);
+	if (bRescuedProtectedOwnership)
+	{
+		EnforceConnectedPlateOwnershipForSamples(InOutSamples);
+	}
+	RebuildPlateMembershipFromSamples(InOutSamples);
+	UpdatePlateCanonicalCentersFromSamples(InOutSamples);
+	ClassifyTrianglesForSamples(InOutSamples);
+	RebuildSpatialQueryData();
+	DetectTerranesForSamples(InOutSamples);
+}
+
+void FTectonicPlanet::RefreshCanonicalStateAfterCollision(TArray<FCanonicalSample>& InOutSamples)
+{
+	TArray<FPhase2SampleState> EmptyPhase2States;
+	EmptyPhase2States.SetNum(InOutSamples.Num());
+	RefreshCanonicalStateAfterCollision(EmptyPhase2States, InOutSamples);
 }
 
 FVector FTectonicPlanet::ResolveDirectionField(
@@ -2461,5 +6617,42 @@ void FTectonicPlanet::BuildAdjacencyGraph()
 		AverageValence,
 		ZeroValenceVertices);
 
+	RebuildAdjacencyEdgeDistanceCache(Samples);
+
 	ensureMsgf(ZeroValenceVertices == 0, TEXT("Adjacency graph has %d zero-valence vertices."), ZeroValenceVertices);
 }
+
+void FTectonicPlanet::RebuildAdjacencyEdgeDistanceCache(const TArray<FCanonicalSample>& InSamples)
+{
+	AdjacencyEdgeDistancesKm.Reset();
+	if (Adjacency.Num() != InSamples.Num())
+	{
+		return;
+	}
+
+	AdjacencyEdgeDistancesKm.SetNum(InSamples.Num());
+	ParallelFor(Adjacency.Num(), [this, &InSamples](int32 SampleIndex)
+	{
+		const FVector& SamplePosition = InSamples[SampleIndex].Position;
+		const TArray<int32>& Neighbors = Adjacency[SampleIndex];
+		TArray<float>& NeighborDistancesKm = AdjacencyEdgeDistancesKm[SampleIndex];
+		NeighborDistancesKm.SetNumUninitialized(Neighbors.Num());
+
+		for (int32 NeighborSlot = 0; NeighborSlot < Neighbors.Num(); ++NeighborSlot)
+		{
+			const int32 NeighborIndex = Neighbors[NeighborSlot];
+			checkSlow(InSamples.IsValidIndex(NeighborIndex));
+
+			const double Dot = FMath::Clamp(static_cast<double>(FVector::DotProduct(SamplePosition, InSamples[NeighborIndex].Position)), -1.0, 1.0);
+			NeighborDistancesKm[NeighborSlot] = static_cast<float>(PlanetRadius * FMath::Acos(Dot));
+		}
+	}, EParallelForFlags::Unbalanced);
+}
+
+
+
+
+
+
+
+

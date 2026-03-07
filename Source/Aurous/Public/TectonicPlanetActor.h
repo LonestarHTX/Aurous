@@ -18,6 +18,31 @@ struct FPlanetControlPanelMetricsSnapshot
 	int32 PlateCount = 0;
 	TArray<int32> PlateSampleCounts;
 	int32 BoundarySampleCount = 0;
+	double BoundaryMeanDepthHops = 0.0;
+	int32 BoundaryMaxDepthHops = 0;
+	int32 BoundaryDeepSampleCount = 0;
+	int32 ContinentalSampleCount = 0;
+	int32 ContinentalPlateCount = 0;
+	double ContinentalAreaFraction = 0.0;
+	int32 ContinentalComponentCount = 0;
+	int32 LargestContinentalComponentSize = 0;
+	int32 MaxPlateComponentCount = 0;
+	int32 DetachedPlateFragmentSampleCount = 0;
+	int32 LargestDetachedPlateFragmentSize = 0;
+	int32 SubductionFrontSampleCount = 0;
+	int32 AndeanSampleCount = 0;
+	int32 TrackedTerraneCount = 0;
+	int32 ActiveTerraneCount = 0;
+	int32 MergedTerraneCount = 0;
+	int32 CollisionEventCount = 0;
+	int32 HimalayanSampleCount = 0;
+	int32 PendingCollisionSampleCount = 0;
+	float MaxSubductionDistanceKm = 0.0f;
+	int32 MinProtectedPlateSampleCount = 0;
+	int32 EmptyProtectedPlateCount = 0;
+	int32 RescuedProtectedPlateCount = 0;
+	int32 RescuedProtectedSampleCount = 0;
+	int32 RepeatedlyRescuedProtectedSampleCount = 0;
 	int64 Timestep = 0;
 	int32 ReconcileCount = 0;
 	bool bReconcileTriggeredLastStep = false;
@@ -33,6 +58,11 @@ enum class EPlanetDebugMode : uint8
 	Boundary	UMETA(DisplayName = "Boundary"),
 	BoundaryType UMETA(DisplayName = "Boundary Type"),
 	Elevation	UMETA(DisplayName = "Elevation"),
+	CrustAge	UMETA(DisplayName = "Crust Age"),
+	SubductionRole UMETA(DisplayName = "Subduction Role"),
+	SubductionDistance UMETA(DisplayName = "Subduction Distance"),
+	OrogenyType UMETA(DisplayName = "Orogeny Type"),
+	TerraneId UMETA(DisplayName = "Terrane ID"),
 };
 
 UCLASS(BlueprintType, Blueprintable)
@@ -54,6 +84,18 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet")
 	float PlanetRenderRadius = 6370.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Initialization", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float TargetContinentalAreaFraction = 0.30f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Initialization", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MinContinentalAreaFraction = 0.25f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Initialization", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MaxContinentalAreaFraction = 0.40f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Initialization", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MinContinentalPlateFraction = 0.15f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Rendering")
 	TObjectPtr<UMaterialInterface> PlanetMaterial = nullptr;
@@ -111,6 +153,7 @@ protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Tick(float DeltaSeconds) override;
+	virtual bool ShouldTickIfViewportsOnly() const override;
 	virtual void OnConstruction(const FTransform& Transform) override;
 
 #if WITH_EDITOR
@@ -121,10 +164,25 @@ protected:
 	TObjectPtr<URealtimeMeshComponent> MeshComponent;
 
 private:
+	struct FPublishedPlanetState
+	{
+		TSharedPtr<TArray<FCanonicalSample>, ESPMode::ThreadSafe> Samples;
+		TSharedPtr<TArray<FDelaunayTriangle>, ESPMode::ThreadSafe> Triangles;
+		FPlanetControlPanelMetricsSnapshot Metrics;
+	};
+
 	void BuildMesh();
-	// Pure color mapping from already-fetched sample data.
 	FColor GetDebugColor(const FCanonicalSample& Sample) const;
 	void SimulationThreadLoop();
+	FPlanetControlPanelMetricsSnapshot BuildMetricsSnapshotFromPlanet_NoLock() const;
+	void PublishPlanetState(
+		TSharedPtr<TArray<FCanonicalSample>, ESPMode::ThreadSafe> InSamples,
+		TSharedPtr<TArray<FDelaunayTriangle>, ESPMode::ThreadSafe> InTriangles,
+		const FPlanetControlPanelMetricsSnapshot& InMetrics);
+	void GetPublishedPlanetState(
+		TSharedPtr<TArray<FCanonicalSample>, ESPMode::ThreadSafe>& OutSamples,
+		TSharedPtr<TArray<FDelaunayTriangle>, ESPMode::ThreadSafe>& OutTriangles,
+		FPlanetControlPanelMetricsSnapshot& OutMetrics) const;
 
 	FTectonicPlanet Planet;
 	FRealtimeMeshSectionGroupKey MeshGroupKey;
@@ -133,9 +191,15 @@ private:
 	int32 CachedNumPlates = -1;
 	int32 CachedRandomSeed = -1;
 	float CachedPlanetRenderRadius = TNumericLimits<float>::Lowest();
+	float CachedTargetContinentalAreaFraction = TNumericLimits<float>::Lowest();
+	float CachedMinContinentalAreaFraction = TNumericLimits<float>::Lowest();
+	float CachedMaxContinentalAreaFraction = TNumericLimits<float>::Lowest();
+	float CachedMinContinentalPlateFraction = TNumericLimits<float>::Lowest();
 	TWeakObjectPtr<UMaterialInterface> CachedPlanetMaterial;
 	TUniquePtr<TFuture<void>> SimulationFuture;
 	mutable FCriticalSection PlanetMutex;
+	mutable FCriticalSection PublishedStateMutex;
+	FPublishedPlanetState PublishedState;
 	TAtomic<bool> bSimulationThreadShouldRun { false };
 	TAtomic<bool> bSimulationThreadRunning { false };
 	TAtomic<bool> bHasPendingColorUpdate { false };
