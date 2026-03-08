@@ -1,0 +1,19 @@
+# Normalize line endings for source files
+*.cpp text eol=crlf
+*.h text eol=crlf
+*.cs text eol=crlf
+*.ini text eol=crlf
+*.md text eol=crlf
+
+# Binary files
+*.uasset binary
+*.umap binary
+*.png binary
+*.jpg binary
+*.bmp binary
+*.tga binary
+*.wav binary
+*.mp3 binary
+*.ogg binary
+*.ttf binary
+*.otf binary
