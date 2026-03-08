@@ -483,6 +483,7 @@ private:
 	int32 RepeatedlyRescuedProtectedSampleCount = 0;
 	int32 LastGapSampleCount = 0;
 	int32 LastOverlapSampleCount = 0;
+	int32 PendingContinentalFloorDiagnosticPreStabilizerCount = INDEX_NONE;
 	float HysteresisThreshold = 0.15f;
 	float BoundaryConfidenceThreshold = 0.15f;
 	double TargetContinentalAreaFraction = 0.30;

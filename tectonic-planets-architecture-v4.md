@@ -108,6 +108,20 @@ Each plate is a logical grouping. A plate stores:
 | `soup_bvh` | BVH | Bounding volume hierarchy over moved triangle soup |
 | `terranes` | Array | Tracked continental regions within this plate |
 
+**Carried sample collision metadata:**
+
+Each carried sample also preserves collision state across reconciliations, enabling per-step Himalayan uplift between reconciliation events:
+
+| Field | Type | Description |
+|---|---|---|
+| `collision_distance_km` | float | Sample's distance to the collision front at time of collision |
+| `collision_convergence_speed_mm_per_year` | float | Plate convergence speed at time of collision |
+| `collision_opposing_plate_id` | int | The other plate involved in the collision |
+| `collision_influence_radius_km` | float | Influence radius computed at collision time |
+| `is_collision_front` | bool | Whether this sample was on the collision front |
+
+These fields are set during Phase 8 collision events and carried through the plate motion loop, allowing ongoing Himalayan uplift to continue between reconciliations without re-detecting the collision.
+
 ### 3.5 Terranes
 
 A terrane is a connected region of continental crust within a plate. Terranes resist subduction, participate in continental collision, and can detach from one plate to suture onto another.
@@ -157,7 +171,7 @@ These are per-sample scalar updates. No topology involvement.
 
 ### 4.2 Every R Timesteps: Reconciliation
 
-Reconciliation runs in seven phases. All writes target a new buffer; the old buffer remains readable until the swap.
+Reconciliation runs in nine phases. All writes target a new buffer; the old buffer remains readable until the swap.
 
 **Phase 1 — Build per-plate moved triangle soups and BVHs.**
 
@@ -237,11 +251,38 @@ Convergent samples are classified for interaction:
 
 **Phase 6 — Update plate membership.**
 
-Rebuild each plate's `carried_samples` array from canonical samples carrying its plate_id. Update `prev_plate_id` = `plate_id` and `ownership_margin` for all samples. Recompute `is_boundary` flags from the Delaunay neighbor graph.
+Rebuild each plate's `carried_samples` array from canonical samples carrying its plate_id. Update `ownership_margin` for all samples. Recompute `is_boundary` flags from the Delaunay neighbor graph.
 
 **Phase 7 — Terrane detection and identity tracking.**
 
 Run connected component analysis over continental samples within each plate using the Delaunay neighbor graph. Match detected components to tracked terranes via the identity persistence rules (Section 3.5). Update anchor samples, centroids, and areas.
+
+**Phase 8 — Continental collision.**
+
+Detect and apply continental collision events. This phase runs as a sequential event loop:
+
+```
+while (collision detected):
+    1. Identify next collision (convergent boundary with continental overlap between distinct terranes)
+    2. Select donor terrane (smaller) and receiver plate
+    3. Apply terrane detachment: donor samples switch plate_id to receiver plate
+    4. Apply elevation surge with compactly supported falloff (Section 5.2)
+    5. Set collision metadata on affected samples (distance, speed, influence radius)
+    6. Refresh canonical state:
+       - Sanitize plate connectivity (enforce single connected component per plate)
+       - Rescue protected plates (ensure minimum plate persistence)
+       - Rebuild membership, carried samples, classification, spatial structures
+       - Re-detect terranes
+    7. Re-check for new collisions created by topology changes
+```
+
+The sequential loop with per-event topology refresh is necessary because each collision changes plate boundaries, potentially creating or exposing new collision fronts. Batching collisions without refresh risks stale topology.
+
+**Phase 9 — Subduction field propagation.**
+
+Compute BFS distance-to-front for subduction boundaries and apply per-reconciliation subduction uplift (Andean orogeny). This runs after Phase 8 so that collision-modified boundaries are reflected in the distance fields.
+
+After Phase 9, carried samples are rebuilt from the final canonical state, and `prev_plate_id` is written back for all samples.
 
 ### 4.3 Reconciliation Frequency
 
@@ -272,7 +313,17 @@ At 60k, reconciliation runs every timestep. At 500k, reconciliation runs every 3
 | **Total per reconciliation** | **< 10 ms** | **15–55 ms** | **Single-threaded** |
 | **Total (16-core parallel)** | **< 3 ms** | **3–10 ms** | **ParallelFor** |
 
-These numbers are well under the paper's reported 1.9s tectonic total on 2016 hardware. Reconciliation is no longer a performance concern at any resolution.
+These numbers cover the core ownership-and-interpolation pipeline (Phases 1–7). Pre-M5, the full reconciliation step additionally includes Phase 8 collision with per-event topology refresh, Phase 9 subduction propagation, and pre-rifting invariant enforcement (Section 4.4), which materially exceed the core budget at high plate counts. These costs are tracked in benchmarks and expected to improve at M6 with batched refresh and algorithmic optimization.
+
+### 4.4 Pre-Rifting Invariants
+
+Until M5 introduces plate rifting (which creates and destroys plates dynamically), the simulation enforces several structural invariants that would otherwise be maintained by the full plate lifecycle:
+
+- **Plate connectivity:** Each plate must remain a single connected component on the Delaunay graph. If collision or terrane transfer fragments a plate, the largest component is kept and orphaned fragments are reassigned to adjacent plates.
+- **Protected plate persistence:** Plates initialized at startup must retain a minimum sample count floor (derived from total samples / plate count). If a plate shrinks below this floor, samples are rescued from neighboring plates to prevent plate death before rifting mechanics exist to manage plate creation/destruction.
+- **Continental area floor stabilizer:** Total continental area fraction must not drop below a configured minimum (currently 25%). If terrane transfers or collision events reduce continental area below this threshold, the stabilizer converts oceanic boundary samples to continental to compensate.
+
+These invariants are **temporary scaffolding**. At M5, plate rifting will provide the natural mechanisms for plate birth, death, and area rebalancing. At that point, connectivity enforcement and protected plate persistence should be relaxed or removed, and the continental area floor may be replaced by rifting-driven area feedback.
 
 ---
 
@@ -301,8 +352,10 @@ All four processes operate on canonical samples using crust attributes and the D
 **Elevation update:**
 
 ```
-z(p, t+δt) = z(p, t) + ũⱼ(p) · δt
+z(p, t+δt) = min(z(p, t) + ũⱼ(p) · δt, z_c)
 ```
+
+The elevation ceiling clamp `z_c` (max continental altitude, 10 km) prevents unbounded uplift accumulation at long-lived subduction zones.
 
 **Fold direction update:**
 
@@ -346,6 +399,19 @@ r = r_c · √(v(q) / v₀ · A / A₀)
 4. **Fold direction:** Set perpendicular to the collision front via tangent-plane cross product with the surface normal.
 
 5. **Orogeny type:** Himalayan. Age reset to 0.
+
+6. **Elevation ceiling:** `z(p) = min(z(p) + Δz(p), z_c)`. The same ceiling clamp as subduction prevents collision surges from exceeding geophysical bounds.
+
+**Per-step Himalayan uplift:**
+
+Between reconciliations, samples with collision metadata (set during Phase 8) receive continuous uplift each timestep:
+
+```
+ũ_H(p) = u₀ · f_H(d_col(p), r_col) · g(v_col(p)) · h(z̃(p))
+z(p, t+δt) = min(z(p, t) + ũ_H(p) · δt, z_c)
+```
+
+Where `d_col`, `v_col`, and `r_col` are the collision distance, convergence speed, and influence radius carried from the collision event (Section 3.4). This produces ongoing mountain building after the initial discrete surge, using the same transfer functions as subduction uplift but keyed to the collision geometry rather than a live boundary.
 
 ### 5.3 Oceanic Crust Generation
 
@@ -708,7 +774,7 @@ From the paper's Appendix A (Table 3):
 
 **Spherical Delaunay implementation.** ✅ Resolved. Use `TConvexHull3<double>` from UE5's GeometryCore. Native, runtime-capable, O(N log N). No third-party libraries needed.
 
-**Performance at 500k.** ✅ Resolved. Full reconciliation is 15–55 ms single-threaded, 3–10 ms parallel. Well under any reasonable budget. Broad-phase culling via spherical bounding caps reduces BVH queries from O(plates) to O(1–3) per sample.
+**Performance at 500k.** ✅ Resolved (core pipeline). The ownership-and-interpolation pipeline (Phases 1–7) is 15–55 ms single-threaded, 3–10 ms parallel. Broad-phase culling via spherical bounding caps reduces BVH queries from O(plates) to O(1–3) per sample. Full reconciliation including collision and invariant enforcement is higher; see Section 4.3 note.
 
 **Containment query robustness.** ✅ Resolved. Shewchuk's adaptive-precision predicates (`predicates.c`) handle edge cases at 500k queries. Public domain, single C file, no dependencies.
 

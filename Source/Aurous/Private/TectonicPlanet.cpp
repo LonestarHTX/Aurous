@@ -675,6 +675,7 @@ FTectonicPlanet::FTectonicPlanet(const FTectonicPlanet& Other)
 	, RepeatedlyRescuedProtectedSampleCount(Other.RepeatedlyRescuedProtectedSampleCount)
 	, LastGapSampleCount(Other.LastGapSampleCount)
 	, LastOverlapSampleCount(Other.LastOverlapSampleCount)
+	, PendingContinentalFloorDiagnosticPreStabilizerCount(Other.PendingContinentalFloorDiagnosticPreStabilizerCount)
 	, HysteresisThreshold(Other.HysteresisThreshold)
 	, BoundaryConfidenceThreshold(Other.BoundaryConfidenceThreshold)
 	, TargetContinentalAreaFraction(Other.TargetContinentalAreaFraction)
@@ -744,6 +745,7 @@ FTectonicPlanet& FTectonicPlanet::operator=(const FTectonicPlanet& Other)
 		RepeatedlyRescuedProtectedSampleCount = Other.RepeatedlyRescuedProtectedSampleCount;
 		LastGapSampleCount = Other.LastGapSampleCount;
 		LastOverlapSampleCount = Other.LastOverlapSampleCount;
+		PendingContinentalFloorDiagnosticPreStabilizerCount = Other.PendingContinentalFloorDiagnosticPreStabilizerCount;
 		HysteresisThreshold = Other.HysteresisThreshold;
 		BoundaryConfidenceThreshold = Other.BoundaryConfidenceThreshold;
 		TargetContinentalAreaFraction = Other.TargetContinentalAreaFraction;
@@ -813,6 +815,7 @@ FTectonicPlanet::FTectonicPlanet(FTectonicPlanet&& Other) noexcept
 	, RepeatedlyRescuedProtectedSampleCount(Other.RepeatedlyRescuedProtectedSampleCount)
 	, LastGapSampleCount(Other.LastGapSampleCount)
 	, LastOverlapSampleCount(Other.LastOverlapSampleCount)
+	, PendingContinentalFloorDiagnosticPreStabilizerCount(Other.PendingContinentalFloorDiagnosticPreStabilizerCount)
 	, HysteresisThreshold(Other.HysteresisThreshold)
 	, BoundaryConfidenceThreshold(Other.BoundaryConfidenceThreshold)
 	, TargetContinentalAreaFraction(Other.TargetContinentalAreaFraction)
@@ -884,6 +887,7 @@ FTectonicPlanet& FTectonicPlanet::operator=(FTectonicPlanet&& Other) noexcept
 		RepeatedlyRescuedProtectedSampleCount = Other.RepeatedlyRescuedProtectedSampleCount;
 		LastGapSampleCount = Other.LastGapSampleCount;
 		LastOverlapSampleCount = Other.LastOverlapSampleCount;
+		PendingContinentalFloorDiagnosticPreStabilizerCount = Other.PendingContinentalFloorDiagnosticPreStabilizerCount;
 		HysteresisThreshold = Other.HysteresisThreshold;
 		BoundaryConfidenceThreshold = Other.BoundaryConfidenceThreshold;
 		TargetContinentalAreaFraction = Other.TargetContinentalAreaFraction;
@@ -1013,6 +1017,7 @@ void FTectonicPlanet::Initialize(int32 NumSamples)
 	LargestDetachedPlateFragmentSize = 0;
 	LastGapSampleCount = 0;
 	LastOverlapSampleCount = 0;
+	PendingContinentalFloorDiagnosticPreStabilizerCount = INDEX_NONE;
 	TrackedTerraneCount = 0;
 	ActiveTerraneCount = 0;
 	MergedTerraneCount = 0;
@@ -1756,6 +1761,44 @@ void FTectonicPlanet::Reconcile()
 	WriteSamples = ReadSamples;
 	Timings.SampleBufferCopyMs = (FPlatformTime::Seconds() - CopyStart) * 1000.0;
 
+	const auto CountContinentalSamples = [](const TArray<FCanonicalSample>& Samples) -> int32
+	{
+		int32 ContinentalCount = 0;
+		for (const FCanonicalSample& Sample : Samples)
+		{
+			ContinentalCount += (Sample.CrustType == ECrustType::Continental) ? 1 : 0;
+		}
+		return ContinentalCount;
+	};
+	const auto SnapshotContinentalFlags = [](const TArray<FCanonicalSample>& Samples, TArray<uint8>& OutFlags)
+	{
+		OutFlags.SetNumUninitialized(Samples.Num());
+		for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+		{
+			OutFlags[SampleIndex] = (Samples[SampleIndex].CrustType == ECrustType::Continental) ? 1 : 0;
+		}
+	};
+	const auto FindFirstContinentalLossIndex = [](const TArray<uint8>& Before, const TArray<uint8>& After) -> int32
+	{
+		const int32 Count = FMath::Min(Before.Num(), After.Num());
+		for (int32 SampleIndex = 0; SampleIndex < Count; ++SampleIndex)
+		{
+			if (Before[SampleIndex] != 0 && After[SampleIndex] == 0)
+			{
+				return SampleIndex;
+			}
+		}
+		return INDEX_NONE;
+	};
+
+	const int32 ContinentalFloorCheckpointD = PendingContinentalFloorDiagnosticPreStabilizerCount;
+	int32 PreStabilizerContinentalCountForNextReconcile = INDEX_NONE;
+	int32 ContinentalFloorCheckpointA = INDEX_NONE;
+	int32 ContinentalFloorCheckpointB = INDEX_NONE;
+	int32 ContinentalFloorCheckpointC = INDEX_NONE;
+	TArray<uint8> ContinentalFlagsA;
+	TArray<uint8> ContinentalFlagsB;
+
 	const double Phase1Start = FPlatformTime::Seconds();
 	if (!SpatialQueryData)
 	{
@@ -2081,9 +2124,12 @@ void FTectonicPlanet::Reconcile()
 	}
 	Timings.GapSamples = GapSamples; Timings.ArtifactGapResolvedSamples = ArtifactGapResolvedSamples; Timings.DivergentGapSamples = DivergentGapSamples;
 	Timings.Phase4GapMs = (FPlatformTime::Seconds() - Phase4Start) * 1000.0;
+	PreStabilizerContinentalCountForNextReconcile = CountContinentalSamples(WriteSamples);
 	const double StabilizerStart = FPlatformTime::Seconds();
 	StabilizeContinentalCrustForSamples(ReadSamples, WriteSamples, &Timings);
 	Timings.ContinentalStabilizerMs = (FPlatformTime::Seconds() - StabilizerStart) * 1000.0;
+	ContinentalFloorCheckpointA = CountContinentalSamples(WriteSamples);
+	SnapshotContinentalFlags(WriteSamples, ContinentalFlagsA);
 
 	const double Phase5Start = FPlatformTime::Seconds();
 	int32 OverlapSamples = 0;
@@ -2131,6 +2177,8 @@ void FTectonicPlanet::Reconcile()
 	const double Phase8ElapsedMs = (FPlatformTime::Seconds() - Phase8CollisionStart) * 1000.0;
 	Timings.Phase8PostCollisionRefreshMs = Phase8RefreshSeconds * 1000.0;
 	Timings.Phase8CollisionMs = FMath::Max(0.0, Phase8ElapsedMs - Timings.Phase8PostCollisionRefreshMs);
+	ContinentalFloorCheckpointB = CountContinentalSamples(WriteSamples);
+	SnapshotContinentalFlags(WriteSamples, ContinentalFlagsB);
 	const double Phase9Start = FPlatformTime::Seconds();
 	UpdateSubductionFieldsForSamples(WriteSamples); Timings.Phase9SubductionMs = (FPlatformTime::Seconds() - Phase9Start) * 1000.0; Timings.Phase7SubductionMs = Timings.Phase9SubductionMs;
 	const double Phase6CarriedStart = FPlatformTime::Seconds();
@@ -2143,6 +2191,7 @@ void FTectonicPlanet::Reconcile()
 		RebuildCarriedSampleWorkspacesForSamples(WriteSamples);
 		Timings.Phase8PostCollisionRefreshMs += (FPlatformTime::Seconds() - FinalOwnershipRepairStart) * 1000.0;
 	}
+	ContinentalFloorCheckpointC = CountContinentalSamples(WriteSamples);
 	const double PrevPlateWritebackStart = FPlatformTime::Seconds();
 	for (FCanonicalSample& Sample : WriteSamples) { Sample.PrevPlateId = Sample.PlateId; }
 	Timings.PrevPlateWritebackMs = (FPlatformTime::Seconds() - PrevPlateWritebackStart) * 1000.0;
@@ -2161,6 +2210,32 @@ void FTectonicPlanet::Reconcile()
 
 	++ReconcileCount;
 	ResetDisplacementTracking();
+
+	const int32 ContinentalFloorDeltaAB = ContinentalFloorCheckpointB - ContinentalFloorCheckpointA;
+	const int32 ContinentalFloorDeltaBC = ContinentalFloorCheckpointC - ContinentalFloorCheckpointB;
+	const int32 FirstContinentalLossAB = (ContinentalFloorDeltaAB < 0)
+		? FindFirstContinentalLossIndex(ContinentalFlagsA, ContinentalFlagsB)
+		: INDEX_NONE;
+	int32 FirstContinentalLossBC = INDEX_NONE;
+	if (ContinentalFloorDeltaBC < 0)
+	{
+		TArray<uint8> ContinentalFlagsC;
+		SnapshotContinentalFlags(WriteSamples, ContinentalFlagsC);
+		FirstContinentalLossBC = FindFirstContinentalLossIndex(ContinentalFlagsB, ContinentalFlagsC);
+	}
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("Continental floor diagnostic: A=%d B=%d C=%d D=%d delta_AB=%d delta_BC=%d first_loss_AB=%d first_loss_BC=%d"),
+		ContinentalFloorCheckpointA,
+		ContinentalFloorCheckpointB,
+		ContinentalFloorCheckpointC,
+		ContinentalFloorCheckpointD,
+		ContinentalFloorDeltaAB,
+		ContinentalFloorDeltaBC,
+		FirstContinentalLossAB,
+		FirstContinentalLossBC);
+	PendingContinentalFloorDiagnosticPreStabilizerCount = PreStabilizerContinentalCountForNextReconcile;
 
 	UE_LOG(LogTemp, Log, TEXT("Reconcile timings (ms): Copy=%.3f P1=%.3f P2=%.3f P3=%.3f P4=%.3f Stabilize=%.3f P5=%.3f P6=%.3f P7=%.3f P8=%.3f P8b=%.3f Writeback=%.3f P9=%.3f Sum=%.3f Unaccounted=%.3f (%.2f%%) Total=%.3f Gap=%d ArtifactResolved=%d DivergentGap=%d Overlap=%d"), LastReconcileTimings.SampleBufferCopyMs, LastReconcileTimings.Phase1BuildSpatialMs, LastReconcileTimings.Phase2OwnershipMs, LastReconcileTimings.Phase3InterpolationMs, LastReconcileTimings.Phase4GapMs, LastReconcileTimings.ContinentalStabilizerMs, LastReconcileTimings.Phase5OverlapMs, LastReconcileTimings.Phase6MembershipMs, LastReconcileTimings.Phase7TerraneMs, LastReconcileTimings.Phase8CollisionMs, LastReconcileTimings.Phase8PostCollisionRefreshMs, LastReconcileTimings.PrevPlateWritebackMs, LastReconcileTimings.Phase9SubductionMs, LastReconcileTimings.PhaseSumMs, LastReconcileTimings.UnaccountedMs, LastReconcileTimings.UnaccountedPct, LastReconcileTimings.TotalMs, LastReconcileTimings.GapSamples, LastReconcileTimings.ArtifactGapResolvedSamples, LastReconcileTimings.DivergentGapSamples, LastReconcileTimings.OverlapSamples);
 	UE_LOG(LogTemp, Log, TEXT("Reconcile subphase (ms): P1 Soup sum/max=%.3f/%.3f Cap sum/max=%.3f/%.3f BVH sum/max=%.3f/%.3f | Stabilizer min/build/prune/promote/trim=%.3f/%.3f/%.3f/%.3f/%.3f counts[promote/component/trim]=%d/%d/%d heap[push/stale]=%d/%d | P6 Sanitize=%.3f Membership=%.3f Carried=%.3f Classify=%.3f SpatialRebuild=%.3f | P7 Terrane=%.3f P8 Collision=%.3f P8b Refresh=%.3f P9 Subduction=%.3f"), LastReconcileTimings.Phase1SoupExtractTotalMs, LastReconcileTimings.Phase1SoupExtractMaxMs, LastReconcileTimings.Phase1CapBuildTotalMs, LastReconcileTimings.Phase1CapBuildMaxMs, LastReconcileTimings.Phase1BVHBuildTotalMs, LastReconcileTimings.Phase1BVHBuildMaxMs, LastReconcileTimings.StabilizerPromoteToMinimumMs, LastReconcileTimings.StabilizerBuildComponentsMs, LastReconcileTimings.StabilizerComponentPruneMs, LastReconcileTimings.StabilizerPromoteToTargetMs, LastReconcileTimings.StabilizerTrimMs, LastReconcileTimings.StabilizerPromotionCount, LastReconcileTimings.StabilizerComponentDemotionCount, LastReconcileTimings.StabilizerTrimDemotionCount, LastReconcileTimings.StabilizerHeapPushCount, LastReconcileTimings.StabilizerHeapStalePopCount, LastReconcileTimings.Phase6SanitizeOwnershipMs, LastReconcileTimings.Phase6RebuildMembershipMs, LastReconcileTimings.Phase6RebuildCarriedMs, LastReconcileTimings.Phase6ClassifyTrianglesMs, LastReconcileTimings.Phase6SpatialRebuildMs, LastReconcileTimings.Phase7TerraneMs, LastReconcileTimings.Phase8CollisionMs, LastReconcileTimings.Phase8PostCollisionRefreshMs, LastReconcileTimings.Phase9SubductionMs);

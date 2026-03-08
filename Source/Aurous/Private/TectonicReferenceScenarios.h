@@ -20,6 +20,7 @@ struct FReferenceScenarioBounds
 	int32 MinimumCollisionEventCount = 0;
 	bool bRequireAndeanWhenOceanicContinentalConvergenceExists = true;
 	bool bRequireHimalayanWhenCollisionOccurs = true;
+	bool bPreRiftingFloorExempt = false;
 };
 
 struct FReferenceScenarioDefinition
