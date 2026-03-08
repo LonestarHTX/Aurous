@@ -9,6 +9,7 @@ constexpr double MaxAcceptableBoundaryMeanDepthHops = 1.25;
 constexpr int32 MaxAcceptableBoundaryMaxDepthHops = 6;
 constexpr double MaxContinentalFractionIncreaseEpsilon = 1.0e-5;
 constexpr double MaxAcceptableUnaccountedPct = 10.0;
+constexpr double MaxReferenceScenarioElevationCeilingKm = 10.0;
 
 struct FReferenceScenarioBounds
 {
@@ -16,9 +17,9 @@ struct FReferenceScenarioBounds
 	double InitialContinentalAreaFractionMin = 0.25;
 	double InitialContinentalAreaFractionMax = 0.40;
 	double MinimumRuntimeContinentalAreaFraction = 0.25;
-	int32 MaximumContinentalComponentCount = 0;
 	int32 MinimumCollisionEventCount = 0;
 	bool bRequireAndeanWhenOceanicContinentalConvergenceExists = true;
+	bool bRequireHimalayanWhenCollisionOccurs = true;
 };
 
 struct FReferenceScenarioDefinition
@@ -31,15 +32,25 @@ struct FReferenceScenarioDefinition
 	FReferenceScenarioBounds Bounds;
 };
 
+struct FReferenceScenarioFailureObservation
+{
+	FString Label;
+	int32 StepIndex = INDEX_NONE;
+	FString Detail;
+};
+
 struct FReferenceScenarioObservedMetrics
 {
 	int32 InitialContinentalPlateCount = 0;
 	double InitialContinentalAreaFraction = 0.0;
 	double MinimumRuntimeContinentalAreaFraction = 1.0;
+	double MaximumObservedElevationKm = -TNumericLimits<double>::Max();
+	double MaximumObservedContinentalElevationKm = -TNumericLimits<double>::Max();
 	int32 MaximumContinentalComponentCount = 0;
 	int32 FinalCollisionEventCount = 0;
 	bool bObservedOceanicContinentalConvergence = false;
 	bool bObservedAndean = false;
+	bool bObservedHimalayan = false;
 	int32 ReconcileSteps = 0;
 	int32 InvalidPlateAssignments = 0;
 	int32 InvalidPreviousAssignments = 0;
@@ -68,10 +79,12 @@ struct FReferenceScenarioObservedMetrics
 	double AverageUnaccountedPct = 0.0;
 	double MaxUnaccountedPct = 0.0;
 	bool bRuntimeContinentalFractionIncreased = false;
+	TArray<FReferenceScenarioFailureObservation> FailureObservations;
 };
 
 int32 ComputeExpectedInitialPlateFloorSamples(int32 TotalSampleCount, int32 PlateCount);
 int32 ComputeExpectedPersistentPlateFloorSamples(const FPlate& Plate);
+int32 GetExpectedMaximumContinentalComponentCount(const FReferenceScenarioBounds& Bounds);
 const TArray<FReferenceScenarioDefinition>& GetLockedReferenceScenarios();
 const FReferenceScenarioDefinition* FindLockedReferenceScenarioByName(const FString& ScenarioName);
 bool CollectReferenceScenarioObservedMetrics(
@@ -84,6 +97,10 @@ FString FormatReferenceScenarioSummary(
 	const FReferenceScenarioDefinition& Scenario,
 	const FReferenceScenarioObservedMetrics& Metrics,
 	bool bPass);
+FString DescribeReferenceScenarioFailures(
+	const FReferenceScenarioDefinition& Scenario,
+	const FReferenceScenarioObservedMetrics& Metrics);
+FString DescribeReferenceScenarioFailureDetails(const FReferenceScenarioObservedMetrics& Metrics);
 bool DoesReferenceScenarioObservedMetricsPass(
 	const FReferenceScenarioDefinition& Scenario,
 	const FReferenceScenarioObservedMetrics& Metrics);
@@ -92,3 +109,6 @@ bool TryDiscoverLowestPassingReferenceScenarioSeed(
 	const FTectonicPlanet& BasePlanet,
 	int32& OutSeed,
 	FReferenceScenarioObservedMetrics& OutMetrics);
+
+
+

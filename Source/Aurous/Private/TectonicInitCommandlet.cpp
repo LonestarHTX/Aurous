@@ -132,30 +132,12 @@ int32 UTectonicInitCommandlet::Main(const FString& Params)
 		int32 ExitCode = 0;
 		for (const FReferenceScenarioDefinition& LockedScenario : ScenariosToRun)
 		{
-			FTectonicPlanet& BasePlanet = GetBasePlanet(LockedScenario.SampleCount);
-			if (bSeedSweep)
-			{
-				int32 LockedSeed = INDEX_NONE;
-				FReferenceScenarioObservedMetrics Metrics;
-				if (!TryDiscoverLowestPassingReferenceScenarioSeed(LockedScenario, BasePlanet, LockedSeed, Metrics))
-				{
-					UE_LOG(LogTemp, Error, TEXT("Reference scenario sweep failed for %s: no passing seed in [1, 256]."), LockedScenario.Name);
-					return 1;
-				}
-
-				FReferenceScenarioDefinition SummaryScenario = LockedScenario;
-				SummaryScenario.Seed = LockedSeed;
-				const bool bPass = DoesReferenceScenarioObservedMetricsPass(SummaryScenario, Metrics);
-				UE_LOG(
-					LogTemp,
-					Display,
-					TEXT("%s stabilizer_mode=%s sweep=true"),
-					*FormatReferenceScenarioSummary(SummaryScenario, Metrics, bPass),
-					ContinentalStabilizerModeToString(EContinentalStabilizerMode::Incremental));
-				continue;
-			}
-
 			FReferenceScenarioDefinition Scenario = LockedScenario;
+			int32 OverrideSamples = Scenario.SampleCount;
+			if (FParse::Value(*Params, TEXT("Samples="), OverrideSamples) || FParse::Value(*Params, TEXT("Count="), OverrideSamples))
+			{
+				Scenario.SampleCount = OverrideSamples;
+			}
 			int32 OverrideSeed = Scenario.Seed;
 			if (FParse::Value(*Params, TEXT("Seed="), OverrideSeed))
 			{
@@ -165,6 +147,29 @@ int32 UTectonicInitCommandlet::Main(const FString& Params)
 			if (FParse::Value(*Params, TEXT("Steps="), OverrideSteps))
 			{
 				Scenario.NumSteps = OverrideSteps;
+			}
+
+			FTectonicPlanet& BasePlanet = GetBasePlanet(Scenario.SampleCount);
+			if (bSeedSweep)
+			{
+				int32 LockedSeed = INDEX_NONE;
+				FReferenceScenarioObservedMetrics Metrics;
+				if (!TryDiscoverLowestPassingReferenceScenarioSeed(Scenario, BasePlanet, LockedSeed, Metrics))
+				{
+					UE_LOG(LogTemp, Error, TEXT("Reference scenario sweep failed for %s: no passing seed in [1, 256]."), Scenario.Name);
+					return 1;
+				}
+
+				FReferenceScenarioDefinition SummaryScenario = Scenario;
+				SummaryScenario.Seed = LockedSeed;
+				const bool bPass = DoesReferenceScenarioObservedMetricsPass(SummaryScenario, Metrics);
+				UE_LOG(
+					LogTemp,
+					Display,
+					TEXT("%s stabilizer_mode=%s sweep=true"),
+					*FormatReferenceScenarioSummary(SummaryScenario, Metrics, bPass),
+					ContinentalStabilizerModeToString(EContinentalStabilizerMode::Incremental));
+				continue;
 			}
 
 			FReferenceScenarioObservedMetrics Metrics;
@@ -178,6 +183,12 @@ int32 UTectonicInitCommandlet::Main(const FString& Params)
 				ContinentalStabilizerModeToString(StabilizerMode));
 			if (!bCollected || !bPass)
 			{
+				UE_LOG(
+					LogTemp,
+					Warning,
+					TEXT("Reference scenario [%s] failure details: %s"),
+					Scenario.Name,
+					*DescribeReferenceScenarioFailureDetails(Metrics));
 				ExitCode = 1;
 			}
 		}

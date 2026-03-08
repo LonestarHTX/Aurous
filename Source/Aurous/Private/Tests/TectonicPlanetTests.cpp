@@ -175,11 +175,33 @@ namespace
 			return Planet.ApplyContinentalCollisionEventsForSamples(InOutSamples);
 		}
 
+		static bool ApplyContinentalCollisions(FTectonicPlanet& Planet, TArray<FCanonicalSample>& InOutSamples, TArray<uint8>& OutDirtyPlateFlags)
+		{
+			return Planet.ApplyContinentalCollisionEventsForSamples(InOutSamples, &OutDirtyPlateFlags);
+		}
+
+		static bool ApplyNextContinentalCollision(
+			FTectonicPlanet& Planet,
+			TArray<FCanonicalSample>& InOutSamples,
+			TSet<int32>& InOutTerranesUsedThisReconcile,
+			TArray<uint8>* OutDirtyPlateFlags = nullptr)
+		{
+			return Planet.ApplyNextContinentalCollisionEventForSamples(InOutSamples, &InOutTerranesUsedThisReconcile, OutDirtyPlateFlags, nullptr);
+		}
+
 		static void RefreshCanonicalAfterCollision(
 			FTectonicPlanet& Planet,
 			TArray<FCanonicalSample>& InOutSamples)
 		{
 			Planet.RefreshCanonicalStateAfterCollision(InOutSamples);
+		}
+
+		static void RefreshCanonicalAfterCollision(
+			FTectonicPlanet& Planet,
+			TArray<FCanonicalSample>& InOutSamples,
+			TArray<uint8>& InOutDirtyPlateFlags)
+		{
+			Planet.RefreshCanonicalStateAfterCollision(InOutSamples, &InOutDirtyPlateFlags);
 		}
 
 		static void SetAreaMetrics(FTectonicPlanet& Planet, const double InAverageCellAreaKm2, const double InInitialMeanPlateAreaKm2)
@@ -202,6 +224,17 @@ namespace
 			Planet.StabilizeContinentalCrustForSamplesIncremental(PreviousSamples, InOutSamples, InOutTimings);
 		}
 
+		static void InterpolateTriangleFields(
+			const TArray<FCanonicalSample>& ReadSamples,
+			const FDelaunayTriangle& Triangle,
+			const FCarriedSampleData& V0,
+			const FCarriedSampleData& V1,
+			const FCarriedSampleData& V2,
+			const FVector& Barycentric,
+			FCanonicalSample& InOutDestSample)
+		{
+			FTectonicPlanet::InterpolateTriangleFields(ReadSamples, Triangle, V0, V1, V2, Barycentric, InOutDestSample);
+		}
 		static int32 GetTerraneMergedIntoId(const FTectonicPlanet& Planet, const int32 TerraneId)
 		{
 			for (const auto& Record : Planet.TerraneRecords)
@@ -224,6 +257,51 @@ namespace
 				}
 			}
 			return INDEX_NONE;
+		}
+
+		static int32 GetCollisionHistoryKeyCount(const FTectonicPlanet& Planet)
+		{
+			return Planet.CollisionHistoryKeys.Num();
+		}
+
+		static int32 GetCollisionEventDonorTerraneId(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.CollisionEvents.IsValidIndex(EventIndex) ? Planet.CollisionEvents[EventIndex].DonorTerraneId : INDEX_NONE;
+		}
+
+		static int32 GetCollisionEventReceiverTerraneId(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.CollisionEvents.IsValidIndex(EventIndex) ? Planet.CollisionEvents[EventIndex].ReceiverTerraneId : INDEX_NONE;
+		}
+
+		static int32 GetCollisionEventDonorPlateId(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.CollisionEvents.IsValidIndex(EventIndex) ? Planet.CollisionEvents[EventIndex].DonorPlateId : INDEX_NONE;
+		}
+
+		static int32 GetCollisionEventReceiverPlateId(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.CollisionEvents.IsValidIndex(EventIndex) ? Planet.CollisionEvents[EventIndex].ReceiverPlateId : INDEX_NONE;
+		}
+
+		static int32 GetCollisionEventContactSampleCount(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.CollisionEvents.IsValidIndex(EventIndex) ? Planet.CollisionEvents[EventIndex].ContactSampleCount : 0;
+		}
+
+		static float GetCollisionEventMeanConvergenceSpeed(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.CollisionEvents.IsValidIndex(EventIndex) ? Planet.CollisionEvents[EventIndex].MeanConvergenceSpeedMmPerYear : 0.0f;
+		}
+
+		static float GetCollisionEventRadiusKm(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.CollisionEvents.IsValidIndex(EventIndex) ? Planet.CollisionEvents[EventIndex].CollisionRadiusKm : 0.0f;
+		}
+
+		static double GetCollisionEventAreaKm2(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.CollisionEvents.IsValidIndex(EventIndex) ? Planet.CollisionEvents[EventIndex].CollisionAreaKm2 : 0.0;
 		}
 	};
 
@@ -788,6 +866,97 @@ bool FPlateInitTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FInterpolationCategoricalMajorityVoteTest, "Aurous.TectonicPlanet.InterpolationCategoricalMajorityVote",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FInterpolationCategoricalMajorityVoteTest::RunTest(const FString& Parameters)
+{
+	TArray<FCanonicalSample> ReadSamples;
+	ReadSamples.SetNum(3);
+	ReadSamples[0].Position = FVector(1.0, 0.0, 0.0);
+	ReadSamples[1].Position = FVector(0.0, 1.0, 0.0);
+	ReadSamples[2].Position = FVector(0.0, 0.0, 1.0);
+	ReadSamples[0].TerraneId = 101;
+	ReadSamples[1].TerraneId = 202;
+	ReadSamples[2].TerraneId = 303;
+
+	FDelaunayTriangle Triangle;
+	Triangle.V[0] = 0;
+	Triangle.V[1] = 1;
+	Triangle.V[2] = 2;
+
+	auto MakeCarriedSample = [](
+		const int32 SampleIndex,
+		const float Elevation,
+		const float Thickness,
+		const float Age,
+		const float OrogenyAge,
+		const ECrustType CrustType,
+		const EOrogenyType OrogenyType,
+		const float CollisionDistanceKm,
+		const float CollisionSpeedMmPerYear,
+		const int32 CollisionOpposingPlateId,
+		const float CollisionInfluenceRadiusKm,
+		const bool bIsCollisionFront) -> FCarriedSampleData
+	{
+		FCarriedSampleData Sample;
+		Sample.CanonicalSampleIndex = SampleIndex;
+		Sample.Elevation = Elevation;
+		Sample.Thickness = Thickness;
+		Sample.Age = Age;
+		Sample.OrogenyAge = OrogenyAge;
+		Sample.CrustType = CrustType;
+		Sample.OrogenyType = OrogenyType;
+		Sample.RidgeDirection = FVector(1.0, 0.0, 0.0);
+		Sample.FoldDirection = FVector(0.0, 1.0, 0.0);
+		Sample.CollisionDistanceKm = CollisionDistanceKm;
+		Sample.CollisionConvergenceSpeedMmPerYear = CollisionSpeedMmPerYear;
+		Sample.CollisionOpposingPlateId = CollisionOpposingPlateId;
+		Sample.CollisionInfluenceRadiusKm = CollisionInfluenceRadiusKm;
+		Sample.bIsCollisionFront = bIsCollisionFront;
+		return Sample;
+	};
+
+	{
+		const FVector Barycentric(0.60f, 0.25f, 0.15f);
+		const FCarriedSampleData V0 = MakeCarriedSample(0, 10.0f, 30.0f, 100.0f, 1.0f, ECrustType::Oceanic, EOrogenyType::None, 11.0f, 12.0f, 7, 13.0f, true);
+		const FCarriedSampleData V1 = MakeCarriedSample(1, 20.0f, 40.0f, 200.0f, 2.0f, ECrustType::Continental, EOrogenyType::Andean, 21.0f, 22.0f, 8, 23.0f, false);
+		const FCarriedSampleData V2 = MakeCarriedSample(2, 30.0f, 50.0f, 300.0f, 3.0f, ECrustType::Continental, EOrogenyType::Andean, 31.0f, 32.0f, 9, 33.0f, false);
+		FCanonicalSample DestSample;
+		DestSample.Position = FVector(0.2, 0.3, 0.93).GetSafeNormal();
+
+		FTectonicPlanetTestAccess::InterpolateTriangleFields(ReadSamples, Triangle, V0, V1, V2, Barycentric, DestSample);
+
+		TestTrue(TEXT("Continuous elevation stays barycentric when categorical majority differs from highest weight"), FMath::IsNearlyEqual(DestSample.Elevation, 15.5f, KINDA_SMALL_NUMBER));
+		TestTrue(TEXT("Continuous thickness stays barycentric when categorical majority differs from highest weight"), FMath::IsNearlyEqual(DestSample.Thickness, 35.5f, KINDA_SMALL_NUMBER));
+		TestEqual(TEXT("Crust type uses majority vote when highest weight disagrees"), DestSample.CrustType, ECrustType::Continental);
+		TestEqual(TEXT("Orogeny type uses majority vote when highest weight disagrees"), DestSample.OrogenyType, EOrogenyType::Andean);
+		TestEqual(TEXT("Terrane selection remains highest-weight driven"), DestSample.TerraneId, 101);
+		TestTrue(TEXT("Collision distance remains highest-weight driven"), FMath::IsNearlyEqual(DestSample.CollisionDistanceKm, 11.0f, KINDA_SMALL_NUMBER));
+		TestEqual(TEXT("Collision opposing plate id remains highest-weight driven"), DestSample.CollisionOpposingPlateId, 7);
+		TestTrue(TEXT("Collision influence radius remains highest-weight driven"), FMath::IsNearlyEqual(DestSample.CollisionInfluenceRadiusKm, 13.0f, KINDA_SMALL_NUMBER));
+	}
+
+	{
+		const FVector Barycentric(0.55f, 0.30f, 0.15f);
+		const FCarriedSampleData V0 = MakeCarriedSample(0, 40.0f, 60.0f, 400.0f, 4.0f, ECrustType::Oceanic, EOrogenyType::None, 41.0f, 42.0f, 10, 43.0f, true);
+		const FCarriedSampleData V1 = MakeCarriedSample(1, 50.0f, 70.0f, 500.0f, 5.0f, ECrustType::Oceanic, EOrogenyType::None, 51.0f, 52.0f, 11, 53.0f, false);
+		const FCarriedSampleData V2 = MakeCarriedSample(2, 60.0f, 80.0f, 600.0f, 6.0f, ECrustType::Continental, EOrogenyType::Himalayan, 61.0f, 62.0f, 12, 63.0f, false);
+		FCanonicalSample DestSample;
+		DestSample.Position = FVector(0.4, 0.2, 0.89).GetSafeNormal();
+
+		FTectonicPlanetTestAccess::InterpolateTriangleFields(ReadSamples, Triangle, V0, V1, V2, Barycentric, DestSample);
+
+		TestTrue(TEXT("Continuous age stays barycentric when highest weight is also the majority"), FMath::IsNearlyEqual(DestSample.Age, 460.0f, KINDA_SMALL_NUMBER));
+		TestTrue(TEXT("Continuous orogeny age stays barycentric when highest weight is also the majority"), FMath::IsNearlyEqual(DestSample.OrogenyAge, 4.6f, KINDA_SMALL_NUMBER));
+		TestEqual(TEXT("Crust type remains the majority value when highest weight agrees"), DestSample.CrustType, ECrustType::Oceanic);
+		TestEqual(TEXT("Orogeny type remains the majority value when highest weight agrees"), DestSample.OrogenyType, EOrogenyType::None);
+		TestEqual(TEXT("Dominant-source collision opposing plate id follows highest weight"), DestSample.CollisionOpposingPlateId, 10);
+		TestTrue(TEXT("Dominant-source collision radius follows highest weight"), FMath::IsNearlyEqual(DestSample.CollisionInfluenceRadiusKm, 43.0f, KINDA_SMALL_NUMBER));
+	}
+
+	return true;
+}
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTriangleClassificationTest, "Aurous.TectonicPlanet.TriangleClassification",
 	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
 
@@ -2063,6 +2232,93 @@ bool FSubductionDistanceFieldFixtureTest::RunTest(const FString& Parameters)
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSubductionPerStepUpdateTest, "Aurous.TectonicPlanet.SubductionPerStepUpdate",
 	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSubductionInfluenceProfileFixtureTest, "Aurous.TectonicPlanet.SubductionInfluenceProfileFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FSubductionInfluenceProfileFixtureTest::RunTest(const FString& Parameters)
+{
+	FTectonicPlanet Planet;
+	TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+	TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+	Samples.SetNum(5);
+	Plates.SetNum(2);
+	for (int32 PlateIndex = 0; PlateIndex < Plates.Num(); ++PlateIndex)
+	{
+		Plates[PlateIndex].Id = PlateIndex;
+		Plates[PlateIndex].RotationAxis = FVector::UpVector;
+		Plates[PlateIndex].AngularSpeed = 0.0f;
+	}
+
+	const FVector Positions[5] = {
+		FVector(1.0, 0.0, 0.0),
+		FVector(0.98, 0.20, 0.0),
+		FVector(0.92, 0.39, 0.0),
+		FVector(0.83, 0.56, 0.0),
+		FVector(0.0, 1.0, 0.0)
+	};
+
+	for (int32 SampleIndex = 0; SampleIndex < 4; ++SampleIndex)
+	{
+		FCanonicalSample& Sample = Samples[SampleIndex];
+		Sample.Position = Positions[SampleIndex].GetSafeNormal();
+		Sample.PlateId = 0;
+		Sample.PrevPlateId = 0;
+		Sample.CrustType = ECrustType::Continental;
+		Sample.Elevation = 0.0f;
+		Sample.Thickness = 35.0f;
+		Sample.Age = 0.0f;
+		Sample.SubductionRole = ESubductionRole::Overriding;
+		Sample.SubductionOpposingPlateId = 1;
+		Sample.SubductionConvergenceSpeedMmPerYear = 100.0f;
+	}
+
+	const float RadiusKm = 1800.0f;
+	Samples[0].SubductionDistanceKm = 0.0f;
+	Samples[1].SubductionDistanceKm = Planet.GetSubductionPeakDistanceKm();
+	Samples[2].SubductionDistanceKm = 1000.0f;
+	Samples[3].SubductionDistanceKm = RadiusKm;
+
+	Samples[4].Position = Positions[4].GetSafeNormal();
+	Samples[4].PlateId = 1;
+	Samples[4].PrevPlateId = 1;
+	Samples[4].CrustType = ECrustType::Oceanic;
+	Samples[4].Elevation = -4.0f;
+	Samples[4].Thickness = 7.0f;
+	Samples[4].Age = 20.0f;
+
+	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+	FTectonicPlanetTestAccess::RebuildCarriedWorkspaces(Planet, Samples);
+
+	Planet.AdvancePlateMotionStep();
+
+	const TArray<FCarriedSampleData>& UpdatedCarried = Planet.GetPlates()[0].CarriedSamples;
+	TestEqual(TEXT("All overriding samples remain on the same plate"), UpdatedCarried.Num(), 4);
+
+	auto SmoothStep01 = [](const float X) -> float
+	{
+		const float Clamped = FMath::Clamp(X, 0.0f, 1.0f);
+		return (3.0f * Clamped * Clamped) - (2.0f * Clamped * Clamped * Clamped);
+	};
+
+	const float PeakDistanceKm = Planet.GetSubductionPeakDistanceKm();
+	const float BaseUpliftStepKm = 1.2f;
+	const float ElevationInfluence = 0.25f;
+	const float ExpectedPeakElevationKm = BaseUpliftStepKm * ElevationInfluence;
+	const float MidDistanceAlpha = (1000.0f - PeakDistanceKm) / (RadiusKm - PeakDistanceKm);
+	const float ExpectedMidElevationKm = BaseUpliftStepKm * (1.0f - SmoothStep01(MidDistanceAlpha)) * ElevationInfluence;
+
+	TestTrue(TEXT("Subduction uplift is zero at the trench front"), FMath::IsNearlyEqual(UpdatedCarried[0].Elevation, 0.0f, 1e-4f));
+	TestTrue(TEXT("Subduction uplift peaks inland at the control distance"), FMath::IsNearlyEqual(UpdatedCarried[1].Elevation, ExpectedPeakElevationKm, 1e-3f));
+	TestTrue(TEXT("Subduction uplift fades smoothly after the inland peak"), FMath::IsNearlyEqual(UpdatedCarried[2].Elevation, ExpectedMidElevationKm, 1e-3f));
+	TestTrue(TEXT("Subduction uplift returns to zero at the outer influence radius"), FMath::IsNearlyEqual(UpdatedCarried[3].Elevation, 0.0f, 1e-4f));
+	TestTrue(TEXT("The inland peak exceeds the trench front and outer-radius uplift"), UpdatedCarried[1].Elevation > UpdatedCarried[0].Elevation && UpdatedCarried[1].Elevation > UpdatedCarried[3].Elevation);
+	TestTrue(TEXT("The inland peak exceeds the far-field uplift"), UpdatedCarried[1].Elevation > UpdatedCarried[2].Elevation);
+
+	return true;
+}
+
 bool FSubductionPerStepUpdateTest::RunTest(const FString& Parameters)
 {
 	FTectonicPlanet Planet;
@@ -2111,6 +2367,7 @@ bool FSubductionPerStepUpdateTest::RunTest(const FString& Parameters)
 	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
 	FTectonicPlanetTestAccess::RebuildCarriedWorkspaces(Planet, Samples);
 
+	const FVector InitialOverridingAxis = Planet.GetPlates()[0].RotationAxis.GetSafeNormal();
 	const FVector InitialSubductingAxis = Planet.GetPlates()[1].RotationAxis.GetSafeNormal();
 	FTectonicPlanetTestAccess::MutablePlates(Planet)[1].CanonicalCenterDirection = FVector::UpVector;
 
@@ -2131,10 +2388,115 @@ bool FSubductionPerStepUpdateTest::RunTest(const FString& Parameters)
 
 	TestTrue(TEXT("Subducting sample age advances by one timestep"), FMath::IsNearlyEqual(UpdatedSubducting.Age, 22.0f, 1e-6f));
 	TestTrue(TEXT("Subducting trench lowering matches dampening plus trench term"), FMath::IsNearlyEqual(UpdatedSubducting.Elevation, ExpectedSubductingElevation, 1e-3f));
+	TestTrue(TEXT("Slab pull does not perturb the overriding plate axis"), Planet.GetPlates()[0].RotationAxis.GetSafeNormal().Equals(InitialOverridingAxis, 1e-6f));
 	TestTrue(TEXT("Slab pull keeps axis normalized"), FMath::IsNearlyEqual(Planet.GetPlates()[1].RotationAxis.Size(), 1.0f, 1e-5f));
 	TestFalse(TEXT("Slab pull perturbs the subducting plate axis"), Planet.GetPlates()[1].RotationAxis.GetSafeNormal().Equals(InitialSubductingAxis, 1e-6f));
+	const FVector MovedCenter = Planet.GetPlates()[1].CumulativeRotation.RotateVector(Planet.GetPlates()[1].CanonicalCenterDirection).GetSafeNormal();
+	const FVector FrontPosition = Planet.GetPlates()[1].CumulativeRotation.RotateVector(Samples[1].Position).GetSafeNormal();
+	const FVector SlabPullVote = FVector::CrossProduct(MovedCenter, FrontPosition).GetSafeNormal();
+	const float InitialVoteAngle = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(FVector::DotProduct(InitialSubductingAxis, SlabPullVote), -1.0f, 1.0f)));
+	const float UpdatedVoteAngle = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(FVector::DotProduct(Planet.GetPlates()[1].RotationAxis.GetSafeNormal(), SlabPullVote), -1.0f, 1.0f)));
+	const float AxisStepAngle = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(FVector::DotProduct(InitialSubductingAxis, Planet.GetPlates()[1].RotationAxis.GetSafeNormal()), -1.0f, 1.0f)));
+	TestTrue(TEXT("Slab pull rotates the subducting plate axis toward the front vote direction"), UpdatedVoteAngle + 1e-4f < InitialVoteAngle);
+	TestTrue(TEXT("Slab pull axis correction stays within the configured per-step clamp"), AxisStepAngle <= Planet.GetSlabPullAxisMaxDegreesPerStep() + 1e-3f);
 	TestTrue(TEXT("Planet metrics track Andean samples"), Planet.GetAndeanSampleCount() > 0);
 	TestTrue(TEXT("Planet metrics keep subduction front samples"), Planet.GetSubductionFrontSampleCount() >= 2);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCollisionPerStepUpdateFixtureTest, "Aurous.TectonicPlanet.CollisionPerStepUpdateFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FCollisionPerStepUpdateFixtureTest::RunTest(const FString& Parameters)
+{
+	FTectonicPlanet Planet;
+	TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+	TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+	Samples.SetNum(2);
+	Plates.SetNum(2);
+	for (int32 PlateIndex = 0; PlateIndex < Plates.Num(); ++PlateIndex)
+	{
+		Plates[PlateIndex].Id = PlateIndex;
+	}
+
+	Plates[0].RotationAxis = FVector::UpVector;
+	Plates[0].AngularSpeed = 0.01f;
+	Plates[0].CanonicalCenterDirection = FVector::ForwardVector;
+	Plates[1].RotationAxis = -FVector::UpVector;
+	Plates[1].AngularSpeed = 0.01f;
+	Plates[1].CanonicalCenterDirection = FVector::RightVector;
+
+	Samples[0].Position = FVector(1.0, 0.0, 0.0);
+	Samples[0].PlateId = 0;
+	Samples[0].PrevPlateId = 0;
+	Samples[0].CrustType = ECrustType::Continental;
+	Samples[0].Elevation = 0.0f;
+	Samples[0].Thickness = 35.0f;
+	Samples[0].Age = 0.0f;
+	Samples[0].OrogenyType = EOrogenyType::Andean;
+	Samples[0].OrogenyAge = 7.0f;
+	Samples[0].CollisionDistanceKm = 0.0f;
+	Samples[0].CollisionConvergenceSpeedMmPerYear = 100.0f;
+	Samples[0].CollisionOpposingPlateId = 1;
+	Samples[0].CollisionInfluenceRadiusKm = 1200.0f;
+	Samples[0].SubductionRole = ESubductionRole::Overriding;
+	Samples[0].SubductionOpposingPlateId = 1;
+	Samples[0].SubductionDistanceKm = 350.0f;
+	Samples[0].SubductionConvergenceSpeedMmPerYear = 100.0f;
+	Samples[0].bIsSubductionFront = true;
+
+	Samples[1].Position = FVector(0.0, 1.0, 0.0);
+	Samples[1].PlateId = 1;
+	Samples[1].PrevPlateId = 1;
+	Samples[1].CrustType = ECrustType::Oceanic;
+	Samples[1].Elevation = -4.0f;
+	Samples[1].Thickness = 7.0f;
+	Samples[1].Age = 20.0f;
+
+	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+	FTectonicPlanetTestAccess::RebuildCarriedWorkspaces(Planet, Samples);
+
+	Planet.AdvancePlateMotionStep();
+
+	const FCarriedSampleData& FirstStepSample = Planet.GetPlates()[0].CarriedSamples[0];
+	auto ComputeElevationInfluence = [](const float ElevationKm) -> float
+	{
+		const float NormalizedElevation = FMath::Clamp((ElevationKm + 10.0f) / 20.0f, 0.0f, 1.0f);
+		return NormalizedElevation * NormalizedElevation;
+	};
+	const float BaseUpliftStepKm = 1.2f;
+	const float HimalayanStepKm = BaseUpliftStepKm * ComputeElevationInfluence(0.0f);
+	const float ExpectedFirstStepElevationKm = HimalayanStepKm + BaseUpliftStepKm * ComputeElevationInfluence(HimalayanStepKm);
+	const FVector FirstMovedPosition = Planet.GetPlates()[0].CumulativeRotation.RotateVector(Samples[0].Position).GetSafeNormal();
+	FVector CompressionAxis = Planet.ComputeSurfaceVelocity(1, FirstMovedPosition) - Planet.ComputeSurfaceVelocity(0, FirstMovedPosition);
+	CompressionAxis = CompressionAxis - FVector::DotProduct(CompressionAxis, FirstMovedPosition) * FirstMovedPosition;
+	CompressionAxis = CompressionAxis.GetSafeNormal();
+	FVector HimalayanFoldTarget = FVector::CrossProduct(FirstMovedPosition, CompressionAxis);
+	HimalayanFoldTarget = HimalayanFoldTarget - FVector::DotProduct(HimalayanFoldTarget, FirstMovedPosition) * FirstMovedPosition;
+	HimalayanFoldTarget = HimalayanFoldTarget.GetSafeNormal();
+	FVector ExpectedFoldDirection = FMath::Lerp(HimalayanFoldTarget, CompressionAxis, 0.2f);
+	ExpectedFoldDirection = ExpectedFoldDirection - FVector::DotProduct(ExpectedFoldDirection, FirstMovedPosition) * FirstMovedPosition;
+	ExpectedFoldDirection = ExpectedFoldDirection.GetSafeNormal();
+
+	TestTrue(TEXT("Per-step Himalayan and Andean uplift contributions stack"), FMath::IsNearlyEqual(FirstStepSample.Elevation, ExpectedFirstStepElevationKm, 1e-3f));
+	TestEqual(TEXT("Active Himalayan uplift takes precedence over Andean labeling"), FirstStepSample.OrogenyType, EOrogenyType::Himalayan);
+	TestTrue(TEXT("Himalayan precedence resets orogeny age when it overrides Andean"), FMath::IsNearlyEqual(FirstStepSample.OrogenyAge, 0.0f, 1e-6f));
+	TestFalse(TEXT("Himalayan fold direction becomes non-zero"), FirstStepSample.FoldDirection.IsNearlyZero());
+	TestTrue(TEXT("Himalayan fold direction remains tangent"), FMath::Abs(FVector::DotProduct(FirstStepSample.FoldDirection.GetSafeNormal(), FirstMovedPosition)) <= 1e-4f);
+	TestTrue(TEXT("Himalayan fold direction follows the collision compression axis orientation"), FVector::DotProduct(FirstStepSample.FoldDirection.GetSafeNormal(), ExpectedFoldDirection) >= 0.99f);
+
+	const float FirstStepElevation = FirstStepSample.Elevation;
+	Planet.AdvancePlateMotionStep();
+	const FCarriedSampleData& SecondStepSample = Planet.GetPlates()[0].CarriedSamples[0];
+
+	TestTrue(TEXT("Persistent Himalayan uplift continues between reconciles"), SecondStepSample.Elevation > FirstStepElevation);
+	TestEqual(TEXT("Persistent uplift keeps the Himalayan label"), SecondStepSample.OrogenyType, EOrogenyType::Himalayan);
+	TestTrue(TEXT("Persistent Himalayan uplift advances the orogeny age after the first step"), FMath::IsNearlyEqual(SecondStepSample.OrogenyAge, 2.0f, 1e-6f));
+	TestTrue(TEXT("Planet metrics track Himalayan samples during per-step updates"), Planet.GetHimalayanSampleCount() > 0);
+	TestEqual(TEXT("Andean metrics drop to zero when Himalayan precedence wins"), Planet.GetAndeanSampleCount(), 0);
 
 	return true;
 }
@@ -2221,43 +2583,244 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCollisionOrderingFixtureTest, "Aurous.Tectonic
 
 bool FCollisionOrderingFixtureTest::RunTest(const FString& Parameters)
 {
-	FTectonicPlanet Planet;
-	TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
-	TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
-	TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+	{
+		FTectonicPlanet Planet;
+		TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
+		TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
 
-	Samples.SetNum(6);
-	Adjacency.SetNum(6);
-	Plates.SetNum(3);
-	InitializeFixturePlate(Plates[0], 0, FVector::UpVector);
-	InitializeFixturePlate(Plates[1], 1, -FVector::UpVector);
-	InitializeFixturePlate(Plates[2], 2, -FVector::UpVector);
-	FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 1000.0, 3000.0);
+		Samples.SetNum(2);
+		Adjacency.SetNum(2);
+		Plates.SetNum(2);
+		InitializeFixturePlate(Plates[0], 0, FVector::UpVector);
+		InitializeFixturePlate(Plates[1], 1, -FVector::UpVector);
+		FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 1000.0, 3000.0);
 
-	InitializeConvergentBoundarySample(Samples[0], 0, FVector(1.0, 0.0, 0.0), 1, ECrustType::Continental, 40.0f, true);
-	InitializeConvergentBoundarySample(Samples[1], 0, FVector(0.93, 0.36, 0.0), 1, ECrustType::Continental, 40.0f, true);
-	InitializeConvergentBoundarySample(Samples[2], 0, FVector(0.93, -0.36, 0.0), 2, ECrustType::Continental, 40.0f, true);
-	InitializeConvergentBoundarySample(Samples[3], 1, FVector(0.99, 0.05, 0.0), 0, ECrustType::Continental, 60.0f);
-	InitializeConvergentBoundarySample(Samples[4], 1, FVector(0.89, 0.46, 0.0), 0, ECrustType::Continental, 60.0f);
-	InitializeConvergentBoundarySample(Samples[5], 2, FVector(0.89, -0.46, 0.0), 0, ECrustType::Continental, 55.0f);
+		InitializeConvergentBoundarySample(Samples[0], 0, FVector(1.0, 0.0, 0.0), 1, ECrustType::Continental, 40.0f, true);
+		InitializeConvergentBoundarySample(Samples[1], 1, FVector(0.99, 0.05, 0.0), 0, ECrustType::Continental, 60.0f);
+		LinkBidirectional(Adjacency, 0, 1);
 
-	LinkBidirectional(Adjacency, 0, 1);
-	LinkBidirectional(Adjacency, 1, 2);
-	LinkBidirectional(Adjacency, 3, 4);
-	LinkBidirectional(Adjacency, 0, 3);
-	LinkBidirectional(Adjacency, 1, 4);
-	LinkBidirectional(Adjacency, 2, 5);
+		FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+		FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+		FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
 
-	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
-	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
-	FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
-	const bool bApplied = FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples);
+		Samples[1].CrustType = ECrustType::Oceanic;
+		FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
+		TestFalse(TEXT("Collision candidate requires a continental opposing terrane"), FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples));
 
-	TestTrue(TEXT("At least one continental collision event is applied"), bApplied);
-	TestEqual(TEXT("Only one collision fires when one terrane contacts two others"), Planet.GetCollisionEventCount(), 1);
-	TestEqual(TEXT("Higher-contact pair detaches the smaller terrane onto receiver plate"), Samples[3].PlateId, 0);
-	TestEqual(TEXT("All samples of the chosen donor terrane detach together"), Samples[4].PlateId, 0);
-	TestEqual(TEXT("Lower-priority competing contact is deferred"), Samples[5].PlateId, 2);
+		Samples[1].CrustType = ECrustType::Continental;
+		FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
+		Samples[0].bOverlapDetected = false;
+		Samples[1].bOverlapDetected = false;
+		TestFalse(TEXT("Collision candidate requires overlap contact"), FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples));
+
+		Samples[0].bOverlapDetected = true;
+		Samples[1].bOverlapDetected = true;
+		Samples[0].BoundaryType = EBoundaryType::Transform;
+		Samples[1].BoundaryType = EBoundaryType::Transform;
+		TestFalse(TEXT("Collision candidate requires a convergent boundary"), FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples));
+	}
+
+	{
+		FTectonicPlanet Planet;
+		TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
+		TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+		Samples.SetNum(6);
+		Adjacency.SetNum(6);
+		Plates.SetNum(3);
+		InitializeFixturePlate(Plates[0], 0, FVector::UpVector);
+		InitializeFixturePlate(Plates[1], 1, -FVector::UpVector);
+		InitializeFixturePlate(Plates[2], 2, -FVector::UpVector);
+		FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 1000.0, 3000.0);
+
+		InitializeConvergentBoundarySample(Samples[0], 0, FVector(1.0, 0.0, 0.0), 1, ECrustType::Continental, 40.0f, true);
+		InitializeConvergentBoundarySample(Samples[1], 0, FVector(0.93, 0.36, 0.0), 1, ECrustType::Continental, 40.0f, true);
+		InitializeConvergentBoundarySample(Samples[2], 0, FVector(0.93, -0.36, 0.0), 2, ECrustType::Continental, 40.0f, true);
+		InitializeConvergentBoundarySample(Samples[3], 1, FVector(0.99, 0.05, 0.0), 0, ECrustType::Continental, 60.0f);
+		InitializeConvergentBoundarySample(Samples[4], 1, FVector(0.89, 0.46, 0.0), 0, ECrustType::Continental, 60.0f);
+		InitializeConvergentBoundarySample(Samples[5], 2, FVector(0.89, -0.46, 0.0), 0, ECrustType::Continental, 55.0f);
+
+		LinkBidirectional(Adjacency, 0, 1);
+		LinkBidirectional(Adjacency, 1, 2);
+		LinkBidirectional(Adjacency, 3, 4);
+		LinkBidirectional(Adjacency, 0, 3);
+		LinkBidirectional(Adjacency, 1, 4);
+		LinkBidirectional(Adjacency, 2, 5);
+
+		FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+		FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+		FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
+		const bool bApplied = FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples);
+
+		TestTrue(TEXT("At least one continental collision event is applied"), bApplied);
+		TestEqual(TEXT("Only one collision fires when one terrane contacts two others"), Planet.GetCollisionEventCount(), 1);
+		TestEqual(TEXT("Higher-contact pair is chosen first"), FTectonicPlanetTestAccess::GetCollisionEventContactSampleCount(Planet, 0), 4);
+		TestEqual(TEXT("Higher-contact pair detaches the smaller terrane onto receiver plate"), Samples[3].PlateId, 0);
+		TestEqual(TEXT("All samples of the chosen donor terrane detach together"), Samples[4].PlateId, 0);
+		TestEqual(TEXT("Lower-priority competing contact is deferred"), Samples[5].PlateId, 2);
+	}
+
+	{
+		FTectonicPlanet Planet;
+		TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
+		TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+		Samples.SetNum(4);
+		Adjacency.SetNum(4);
+		Plates.SetNum(4);
+		InitializeFixturePlate(Plates[0], 0, FVector::UpVector, 0.02f);
+		InitializeFixturePlate(Plates[1], 1, -FVector::UpVector, 0.02f);
+		InitializeFixturePlate(Plates[2], 2, FVector::UpVector, 0.005f);
+		InitializeFixturePlate(Plates[3], 3, -FVector::UpVector, 0.005f);
+		for (FPlate& Plate : Plates)
+		{
+			Plate.PersistencePolicy = EPlatePersistencePolicy::Retirable;
+		}
+		FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 1200.0, 2400.0);
+
+		InitializeConvergentBoundarySample(Samples[0], 0, FVector(1.0, 0.0, 0.0), 1, ECrustType::Continental, 40.0f, true);
+		InitializeConvergentBoundarySample(Samples[1], 1, FVector(0.99, 0.05, 0.0), 0, ECrustType::Continental, 60.0f);
+		InitializeConvergentBoundarySample(Samples[2], 2, FVector(0.0, 1.0, 0.0), 3, ECrustType::Continental, 45.0f, true);
+		InitializeConvergentBoundarySample(Samples[3], 3, FVector(0.0, 0.99, 0.05), 2, ECrustType::Continental, 55.0f);
+
+		LinkBidirectional(Adjacency, 0, 1);
+		LinkBidirectional(Adjacency, 2, 3);
+
+		FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+		FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+		FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
+
+		const int32 FastPairTerraneA = Samples[0].TerraneId;
+		const int32 FastPairTerraneB = Samples[1].TerraneId;
+		TSet<int32> TerranesUsedThisReconcile;
+		const bool bApplied = FTectonicPlanetTestAccess::ApplyNextContinentalCollision(Planet, Samples, TerranesUsedThisReconcile);
+		TestTrue(TEXT("Speed-order fixture applies a collision"), bApplied);
+		TestEqual(TEXT("Speed-order fixture records the chosen first event"), Planet.GetCollisionEventCount(), 1);
+
+		const bool bFastPairFirst =
+			(FTectonicPlanetTestAccess::GetCollisionEventDonorTerraneId(Planet, 0) == FastPairTerraneA &&
+				FTectonicPlanetTestAccess::GetCollisionEventReceiverTerraneId(Planet, 0) == FastPairTerraneB) ||
+			(FTectonicPlanetTestAccess::GetCollisionEventDonorTerraneId(Planet, 0) == FastPairTerraneB &&
+				FTectonicPlanetTestAccess::GetCollisionEventReceiverTerraneId(Planet, 0) == FastPairTerraneA);
+		TestTrue(TEXT("Mean convergence speed breaks ties after contact count"), bFastPairFirst);
+	}
+
+	{
+		FTectonicPlanet Planet;
+		TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
+		TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+		Samples.SetNum(4);
+		Adjacency.SetNum(4);
+		Plates.SetNum(4);
+		InitializeFixturePlate(Plates[0], 0, FVector::UpVector, 0.01f);
+		InitializeFixturePlate(Plates[1], 1, -FVector::UpVector, 0.01f);
+		InitializeFixturePlate(Plates[2], 2, FVector::UpVector, 0.01f);
+		InitializeFixturePlate(Plates[3], 3, -FVector::UpVector, 0.01f);
+		for (FPlate& Plate : Plates)
+		{
+			Plate.PersistencePolicy = EPlatePersistencePolicy::Retirable;
+		}
+		FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 1200.0, 2400.0);
+
+		InitializeConvergentBoundarySample(Samples[0], 0, FVector(1.0, 0.0, 0.0), 1, ECrustType::Continental, 40.0f, true);
+		InitializeConvergentBoundarySample(Samples[1], 1, FVector(0.99, 0.05, 0.0), 0, ECrustType::Continental, 60.0f);
+		InitializeConvergentBoundarySample(Samples[2], 2, FVector(0.0, 1.0, 0.0), 3, ECrustType::Continental, 45.0f, true);
+		InitializeConvergentBoundarySample(Samples[3], 3, FVector(0.0, 0.99, 0.05), 2, ECrustType::Continental, 55.0f);
+
+		LinkBidirectional(Adjacency, 0, 1);
+		LinkBidirectional(Adjacency, 2, 3);
+
+		FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+		FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+		FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
+
+		const int32 LowerPairTerraneA = Samples[0].TerraneId;
+		const int32 LowerPairTerraneB = Samples[1].TerraneId;
+		TSet<int32> TerranesUsedThisReconcile;
+		const bool bApplied = FTectonicPlanetTestAccess::ApplyNextContinentalCollision(Planet, Samples, TerranesUsedThisReconcile);
+		TestTrue(TEXT("Equal-speed disjoint fixture applies a collision"), bApplied);
+		TestEqual(TEXT("Equal-speed disjoint fixture records the chosen first event"), Planet.GetCollisionEventCount(), 1);
+
+		const bool bLowerTerranePairFirst =
+			(FTectonicPlanetTestAccess::GetCollisionEventDonorTerraneId(Planet, 0) == LowerPairTerraneA &&
+				FTectonicPlanetTestAccess::GetCollisionEventReceiverTerraneId(Planet, 0) == LowerPairTerraneB) ||
+			(FTectonicPlanetTestAccess::GetCollisionEventDonorTerraneId(Planet, 0) == LowerPairTerraneB &&
+				FTectonicPlanetTestAccess::GetCollisionEventReceiverTerraneId(Planet, 0) == LowerPairTerraneA);
+		TestTrue(TEXT("Terrane ids break event-order ties after contact count and speed"), bLowerTerranePairFirst);
+	}
+
+	{
+		FTectonicPlanet Planet;
+		TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
+		TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+		Samples.SetNum(4);
+		Adjacency.SetNum(4);
+		Plates.SetNum(2);
+		InitializeFixturePlate(Plates[0], 0, FVector::UpVector);
+		InitializeFixturePlate(Plates[1], 1, -FVector::UpVector);
+		FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 1500.0, 3000.0);
+
+		InitializeConvergentBoundarySample(Samples[0], 0, FVector(1.0, 0.0, 0.0), 1, ECrustType::Continental, 35.0f, true);
+		InitializeConvergentBoundarySample(Samples[1], 0, FVector(0.95, 0.30, 0.0), 1, ECrustType::Continental, 36.0f, true);
+		InitializeConvergentBoundarySample(Samples[2], 1, FVector(0.99, 0.05, 0.0), 0, ECrustType::Continental, 60.0f);
+		Samples[3].Position = FVector(0.92, 0.38, 0.0).GetSafeNormal();
+		Samples[3].PlateId = 1;
+		Samples[3].PrevPlateId = 1;
+		Samples[3].CrustType = ECrustType::Continental;
+		Samples[3].Age = 61.0f;
+
+		LinkBidirectional(Adjacency, 0, 1);
+		LinkBidirectional(Adjacency, 0, 2);
+		LinkBidirectional(Adjacency, 1, 2);
+		LinkBidirectional(Adjacency, 2, 3);
+
+		FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+		FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+		FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
+		const bool bApplied = FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples);
+
+		TestTrue(TEXT("Front-vote fixture applies a collision"), bApplied);
+		TestEqual(TEXT("Fewer overlap-front ownership votes donate first"), FTectonicPlanetTestAccess::GetCollisionEventDonorPlateId(Planet, 0), 1);
+		TestEqual(TEXT("Front-vote donor transfers its entire terrane"), Samples[2].PlateId, 0);
+		TestEqual(TEXT("Front-vote donor transfers its interior followers"), Samples[3].PlateId, 0);
+	}
+
+	{
+		FTectonicPlanet Planet;
+		TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
+		TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+		Samples.SetNum(2);
+		Adjacency.SetNum(2);
+		Plates.SetNum(2);
+		InitializeFixturePlate(Plates[0], 0, FVector::UpVector);
+		InitializeFixturePlate(Plates[1], 1, -FVector::UpVector);
+		FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 1200.0, 1200.0);
+
+		InitializeConvergentBoundarySample(Samples[0], 0, FVector(1.0, 0.0, 0.0), 1, ECrustType::Continental, 45.0f, true);
+		InitializeConvergentBoundarySample(Samples[1], 1, FVector(0.99, 0.05, 0.0), 0, ECrustType::Continental, 45.0f);
+		LinkBidirectional(Adjacency, 0, 1);
+
+		FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+		FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+		FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
+
+		const int32 LowerTerraneId = FMath::Min(Samples[0].TerraneId, Samples[1].TerraneId);
+		const int32 LowerTerraneSampleIndex = (Samples[0].TerraneId <= Samples[1].TerraneId) ? 0 : 1;
+		const int32 ReceiverPlateId = (LowerTerraneSampleIndex == 0) ? 1 : 0;
+		const bool bApplied = FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples);
+		TestTrue(TEXT("Tie-break fixture applies a collision"), bApplied);
+		TestEqual(TEXT("Lower terrane id donates when front votes, area, and speed tie"), FTectonicPlanetTestAccess::GetCollisionEventDonorTerraneId(Planet, 0), LowerTerraneId);
+		TestEqual(TEXT("Lower terrane id sample transfers under final deterministic tie-break"), Samples[LowerTerraneSampleIndex].PlateId, ReceiverPlateId);
+	}
 
 	return true;
 }
@@ -2279,12 +2842,16 @@ bool FCollisionDisjointPairsFixtureTest::RunTest(const FString& Parameters)
 	InitializeFixturePlate(Plates[1], 1, -FVector::UpVector);
 	InitializeFixturePlate(Plates[2], 2, FVector::UpVector);
 	InitializeFixturePlate(Plates[3], 3, -FVector::UpVector);
+	for (FPlate& Plate : Plates)
+	{
+		Plate.PersistencePolicy = EPlatePersistencePolicy::Retirable;
+	}
 	FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 1200.0, 1200.0);
 
 	InitializeConvergentBoundarySample(Samples[0], 0, FVector(1.0, 0.0, 0.0), 1, ECrustType::Continental, 50.0f, true);
 	InitializeConvergentBoundarySample(Samples[1], 1, FVector(0.99, 0.05, 0.0), 0, ECrustType::Continental, 55.0f);
-	InitializeConvergentBoundarySample(Samples[2], 2, FVector(0.0, 1.0, 0.0), 3, ECrustType::Continental, 45.0f, true);
-	InitializeConvergentBoundarySample(Samples[3], 3, FVector(0.0, 0.99, 0.05), 2, ECrustType::Continental, 65.0f);
+	InitializeConvergentBoundarySample(Samples[2], 2, FVector(-1.0, 0.0, 0.0), 3, ECrustType::Continental, 45.0f, true);
+	InitializeConvergentBoundarySample(Samples[3], 3, FVector(-0.99, 0.05, 0.0), 2, ECrustType::Continental, 65.0f);
 
 	LinkBidirectional(Adjacency, 0, 1);
 	LinkBidirectional(Adjacency, 2, 3);
@@ -2292,12 +2859,37 @@ bool FCollisionDisjointPairsFixtureTest::RunTest(const FString& Parameters)
 	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
 	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
 	FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
-	const bool bApplied = FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples);
+	TSet<int32> TerranesUsedThisReconcile;
+	TArray<uint8> FirstDirtyPlateFlags;
+	const bool bAppliedFirst = FTectonicPlanetTestAccess::ApplyNextContinentalCollision(Planet, Samples, TerranesUsedThisReconcile, &FirstDirtyPlateFlags);
+	TestTrue(TEXT("First disjoint collision applies"), bAppliedFirst);
+	FTectonicPlanetTestAccess::RefreshCanonicalAfterCollision(Planet, Samples, FirstDirtyPlateFlags);
 
-	TestTrue(TEXT("Disjoint collision pairs both apply"), bApplied);
+	TArray<uint8> SecondDirtyPlateFlags;
+	const bool bAppliedSecond = FTectonicPlanetTestAccess::ApplyNextContinentalCollision(Planet, Samples, TerranesUsedThisReconcile, &SecondDirtyPlateFlags);
+	TestTrue(TEXT("Second disjoint collision applies after the refresh"), bAppliedSecond);
+	FTectonicPlanetTestAccess::RefreshCanonicalAfterCollision(Planet, Samples, SecondDirtyPlateFlags);
+
+	TArray<uint8> DirtyPlateFlags = FirstDirtyPlateFlags;
+	if (DirtyPlateFlags.Num() != SecondDirtyPlateFlags.Num())
+	{
+		DirtyPlateFlags.Init(0, SecondDirtyPlateFlags.Num());
+	}
+	for (int32 PlateIndex = 0; PlateIndex < SecondDirtyPlateFlags.Num(); ++PlateIndex)
+	{
+		if (SecondDirtyPlateFlags[PlateIndex] != 0)
+		{
+			DirtyPlateFlags[PlateIndex] = 1;
+		}
+	}
+
 	TestEqual(TEXT("Two disjoint terrane pairs can both collide in one reconcile"), Planet.GetCollisionEventCount(), 2);
 	TestEqual(TEXT("Lower terrane id donor of first pair transfers to receiver plate"), Samples[0].PlateId, 1);
 	TestEqual(TEXT("Lower terrane id donor of second pair transfers to receiver plate"), Samples[2].PlateId, 3);
+	TestEqual(TEXT("Sequential collisions record both pair histories"), FTectonicPlanetTestAccess::GetCollisionHistoryKeyCount(Planet), 2);
+	TestTrue(TEXT("Sequential refresh rebuilds the first receiver plate before the second event"), Planet.GetPlates()[1].SampleIndices.Num() >= 2);
+	TestTrue(TEXT("Sequential refresh rebuilds the second receiver plate before reconcile ends"), Planet.GetPlates()[3].SampleIndices.Num() >= 2);
+	TestTrue(TEXT("Dirty set covers every plate touched by the sequential events"), DirtyPlateFlags[0] != 0 && DirtyPlateFlags[1] != 0 && DirtyPlateFlags[2] != 0 && DirtyPlateFlags[3] != 0);
 
 	return true;
 }
@@ -2344,10 +2936,16 @@ bool FCollisionRefreshFixtureTest::RunTest(const FString& Parameters)
 	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
 	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
 	FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
-	const bool bApplied = FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples);
+	TArray<uint8> DirtyPlateFlags;
+	const bool bApplied = FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples, DirtyPlateFlags);
 	TestTrue(TEXT("Collision event applies in refresh fixture"), bApplied);
 	TestEqual(TEXT("Smaller donor terrane switches to receiver plate"), Samples[2].PlateId, 0);
 	TestEqual(TEXT("Non-colliding terrane keeps donor plate alive"), Samples[4].PlateId, 1);
+	TestEqual(TEXT("Transferred sample preserves previous owner through collision refresh"), Samples[2].PrevPlateId, 1);
+	TestFalse(TEXT("Transferred sample recomputes overlap state before the next scan"), Samples[2].bOverlapDetected);
+	TestFalse(TEXT("Transferred sample recomputes boundary flags before the next scan"), Samples[2].bIsBoundary);
+	TestTrue(TEXT("Collision refresh keeps donor plate marked dirty"), DirtyPlateFlags[1] != 0);
+	TestTrue(TEXT("Collision refresh keeps receiver plate marked dirty"), DirtyPlateFlags[0] != 0);
 
 	int32 HimalayanSamples = 0;
 	int32 TangentFoldSamples = 0;
@@ -2374,12 +2972,115 @@ bool FCollisionRefreshFixtureTest::RunTest(const FString& Parameters)
 	FTectonicPlanetTestAccess::RefreshCanonicalAfterCollision(Planet, Samples);
 	TestTrue(TEXT("Post-collision refresh rebuilds receiver membership"), Planet.GetPlates()[0].SampleIndices.Num() >= 4);
 	TestTrue(TEXT("Post-collision refresh keeps donor plate non-empty"), Planet.GetPlates()[1].SampleIndices.Num() >= 1);
+	TestEqual(TEXT("Post-collision refresh restores single-component ownership per plate"), Planet.GetMaxPlateComponentCount(), 1);
+	TestEqual(TEXT("Post-collision refresh clears detached non-gap fragments"), Planet.GetDetachedPlateFragmentSampleCount(), 0);
+	TestEqual(TEXT("Post-collision refresh clears detached fragment size"), Planet.GetLargestDetachedPlateFragmentSize(), 0);
 	TestTrue(TEXT("Terranes remain tracked after refresh"), Planet.GetActiveTerraneCount() >= 2);
 	TestTrue(TEXT("Reassigned samples keep a valid terrane id after refresh"), Samples[2].TerraneId != INDEX_NONE);
 
 	const bool bAppliedAgain = FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples);
 	TestFalse(TEXT("Collision history suppresses repeat event on ongoing contact"), bAppliedAgain);
 	TestEqual(TEXT("Collision event count remains one after repeat suppression"), Planet.GetCollisionEventCount(), 1);
+
+	{
+		FTectonicPlanet DirtyPlanet;
+		TArray<FCanonicalSample>& DirtySamples = FTectonicPlanetTestAccess::MutableSamples(DirtyPlanet);
+		TArray<TArray<int32>>& DirtyAdjacency = FTectonicPlanetTestAccess::MutableAdjacency(DirtyPlanet);
+		TArray<FPlate>& DirtyPlates = FTectonicPlanetTestAccess::MutablePlates(DirtyPlanet);
+
+		DirtySamples.SetNum(5);
+		DirtyAdjacency.SetNum(5);
+		DirtyPlates.SetNum(3);
+		InitializeFixturePlate(DirtyPlates[0], 0, FVector::UpVector);
+		InitializeFixturePlate(DirtyPlates[1], 1, FVector::RightVector);
+		InitializeFixturePlate(DirtyPlates[2], 2, -FVector::UpVector);
+		DirtyPlates[1].PersistencePolicy = EPlatePersistencePolicy::Retirable;
+
+		for (int32 SampleIndex = 0; SampleIndex < DirtySamples.Num(); ++SampleIndex)
+		{
+			DirtySamples[SampleIndex].Position = FVector(1.0, 0.2 * static_cast<double>(SampleIndex), 0.0).GetSafeNormal();
+			DirtySamples[SampleIndex].PlateId = (SampleIndex <= 1) ? 0 : (SampleIndex <= 3 ? 1 : 2);
+			DirtySamples[SampleIndex].PrevPlateId = DirtySamples[SampleIndex].PlateId;
+			DirtySamples[SampleIndex].CrustType = ECrustType::Continental;
+		}
+
+		LinkBidirectional(DirtyAdjacency, 0, 1);
+		LinkBidirectional(DirtyAdjacency, 3, 4);
+
+		FTectonicPlanetTestAccess::RebuildPlateMembership(DirtyPlanet, DirtySamples);
+		FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(DirtyPlanet, DirtySamples);
+
+		TArray<uint8> ExpandedDirtyFlags;
+		ExpandedDirtyFlags.Init(0, DirtyPlates.Num());
+		ExpandedDirtyFlags[0] = 1;
+		ExpandedDirtyFlags[1] = 1;
+		FTectonicPlanetTestAccess::RefreshCanonicalAfterCollision(DirtyPlanet, DirtySamples, ExpandedDirtyFlags);
+
+		TestEqual(TEXT("Connectivity refresh can pull a detached dirty fragment onto a clean neighbor plate"), DirtySamples[3].PlateId, 2);
+		TestTrue(TEXT("Dirty plate set widens when refresh changes ownership onto a new plate"), ExpandedDirtyFlags[2] != 0);
+		TestTrue(TEXT("Expanded dirty set rebuilds the newly touched plate membership"), DirtyPlanet.GetPlates()[2].SampleIndices.Contains(3));
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCollisionFrontAndRadiusFixtureTest, "Aurous.TectonicPlanet.CollisionFrontAndRadiusFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FCollisionFrontAndRadiusFixtureTest::RunTest(const FString& Parameters)
+{
+	FTectonicPlanet Planet;
+	TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+	TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
+	TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+	Samples.SetNum(4);
+	Adjacency.SetNum(4);
+	Plates.SetNum(2);
+	InitializeFixturePlate(Plates[0], 0, FVector::UpVector);
+	InitializeFixturePlate(Plates[1], 1, -FVector::UpVector);
+	FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 1000.0, 4000.0);
+
+	InitializeConvergentBoundarySample(Samples[0], 0, FVector(1.0, 0.0, 0.0), 1, ECrustType::Continental, 35.0f, true);
+	InitializeConvergentBoundarySample(Samples[1], 1, FVector(0.99, 0.05, 0.0), 0, ECrustType::Continental, 60.0f);
+	Samples[2].Position = FVector(0.97, 0.24, 0.0).GetSafeNormal();
+	Samples[2].PlateId = 1;
+	Samples[2].PrevPlateId = 1;
+	Samples[2].CrustType = ECrustType::Continental;
+	Samples[3].Position = FVector(0.70, 0.71, 0.0).GetSafeNormal();
+	Samples[3].PlateId = 1;
+	Samples[3].PrevPlateId = 1;
+	Samples[3].CrustType = ECrustType::Continental;
+
+	LinkBidirectional(Adjacency, 0, 1);
+	LinkBidirectional(Adjacency, 1, 2);
+	LinkBidirectional(Adjacency, 2, 3);
+
+	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+	FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
+	const bool bApplied = FTectonicPlanetTestAccess::ApplyContinentalCollisions(Planet, Samples);
+
+	TestTrue(TEXT("Front-and-radius fixture applies a collision"), bApplied);
+	TestEqual(TEXT("Front samples keep zero collision distance on the donor side"), Samples[0].CollisionDistanceKm, 0.0f);
+	TestEqual(TEXT("Front samples keep zero collision distance on the receiver side"), Samples[1].CollisionDistanceKm, 0.0f);
+	TestTrue(TEXT("Front seed is flagged on the transferred donor sample"), Samples[0].bIsCollisionFront);
+	TestTrue(TEXT("Front seed is flagged on the receiver contact sample"), Samples[1].bIsCollisionFront);
+	TestFalse(TEXT("Interior propagation samples are not marked as front seeds"), Samples[2].bIsCollisionFront);
+	TestTrue(TEXT("Interior receiver sample receives compact-support uplift"), Samples[2].Elevation > 0.0f);
+	TestTrue(TEXT("Interior receiver sample tracks a positive collision distance"), Samples[2].CollisionDistanceKm > 0.0f);
+	TestTrue(TEXT("Receiver sample outside the collision radius stays unaffected"), FMath::IsNearlyEqual(Samples[3].Elevation, 0.0f, 1e-6f));
+	TestTrue(TEXT("Receiver sample outside the collision radius keeps collision metadata cleared"), Samples[3].CollisionDistanceKm < 0.0f);
+
+	const double ExpectedRadiusKm = FMath::Clamp(
+		4200.0 * FMath::Sqrt(
+			(static_cast<double>(FTectonicPlanetTestAccess::GetCollisionEventMeanConvergenceSpeed(Planet, 0)) / 100.0) *
+			(FTectonicPlanetTestAccess::GetCollisionEventAreaKm2(Planet, 0) / 4000.0)),
+		0.0,
+		4200.0);
+	TestTrue(
+		TEXT("Collision radius uses InitialMeanPlateAreaKm2 normalization"),
+		FMath::IsNearlyEqual(FTectonicPlanetTestAccess::GetCollisionEventRadiusKm(Planet, 0), static_cast<float>(ExpectedRadiusKm), 1e-3f));
 
 	return true;
 }
@@ -2433,6 +3134,8 @@ bool FCarriedWorkspaceTest::RunTest(const FString& Parameters)
 				Carried.bIsSubductionFront == Canonical.bIsSubductionFront &&
 				FMath::IsNearlyEqual(Carried.CollisionDistanceKm, Canonical.CollisionDistanceKm) &&
 				FMath::IsNearlyEqual(Carried.CollisionConvergenceSpeedMmPerYear, Canonical.CollisionConvergenceSpeedMmPerYear) &&
+				Carried.CollisionOpposingPlateId == Canonical.CollisionOpposingPlateId &&
+				FMath::IsNearlyEqual(Carried.CollisionInfluenceRadiusKm, Canonical.CollisionInfluenceRadiusKm) &&
 				Carried.bIsCollisionFront == Canonical.bIsCollisionFront;
 			FieldMismatches += bMatches ? 0 : 1;
 		}
@@ -3091,6 +3794,33 @@ bool FActorConstructionTest::RunTest(const FString& Parameters)
 	int64 ExportedTimestep = -1;
 	const bool bExportSucceeded = Actor->GetPlanetExportDataThreadSafe(ExportedSamples, ExportedTriangles, ExportedTimestep);
 	TestTrue(TEXT("Actor export snapshot available after GeneratePlanet"), bExportSucceeded);
+
+	FPlanetControlPanelMetricsSnapshot MetricsSnapshot;
+	const bool bMetricsSnapshotSucceeded = Actor->GetControlPanelMetricsSnapshotThreadSafe(MetricsSnapshot);
+	TestTrue(TEXT("Actor metrics snapshot available after GeneratePlanet"), bMetricsSnapshotSucceeded);
+
+	int32 ExportedContinentalSampleCount = 0;
+	TSet<int32> ExportedContinentalPlateIds;
+	for (const FCanonicalSample& Sample : ExportedSamples)
+	{
+		if (Sample.CrustType != ECrustType::Continental)
+		{
+			continue;
+		}
+
+		++ExportedContinentalSampleCount;
+		ExportedContinentalPlateIds.Add(Sample.PlateId);
+	}
+	const double ExportedContinentalAreaFraction = (ExportedSamples.Num() > 0)
+		? static_cast<double>(ExportedContinentalSampleCount) / static_cast<double>(ExportedSamples.Num())
+		: 0.0;
+
+	if (bMetricsSnapshotSucceeded)
+	{
+		TestEqual(TEXT("Actor metrics snapshot sample count matches export"), MetricsSnapshot.SampleCount, ExportedSamples.Num());
+		TestEqual(TEXT("Actor metrics snapshot continental plate count matches export"), MetricsSnapshot.ContinentalPlateCount, ExportedContinentalPlateIds.Num());
+		TestTrue(TEXT("Actor metrics snapshot continental area fraction matches export"), FMath::IsNearlyEqual(MetricsSnapshot.ContinentalAreaFraction, ExportedContinentalAreaFraction, UE_DOUBLE_SMALL_NUMBER));
+	}
 	TestEqual(TEXT("RealtimeMesh vertex count matches sample count"), PositionVertexCount, TestSampleCount);
 	TestEqual(TEXT("RealtimeMesh triangle count matches exported triangle count"), TriangleCount, ExportedTriangles.Num());
 	TestEqual(TEXT("RealtimeMesh triangles face outward"), InvertedTriangleCount, 0);
@@ -3147,6 +3877,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FProtectedPlateConnectivityFloorTest, "Aurous.T
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FProtectedPlateRescueFixtureTest, "Aurous.TectonicPlanet.ProtectedPlateRescueFixture",
 	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
 
 bool FContinentalStabilizerPromotionTieBreakFixtureTest::RunTest(const FString& Parameters)
 {
@@ -3450,6 +4181,46 @@ bool FReconcileLongRunTest::RunTest(const FString& Parameters)
 			Scenario.NumSteps);
 
 		UE_LOG(LogTemp, Log, TEXT("%s"), *FormatReferenceScenarioSummary(Scenario, Metrics, bPass));
+		if (!bPass)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("Locked reference scenario [%s] failed checks: %s"),
+				Scenario.Name,
+				*DescribeReferenceScenarioFailures(Scenario, Metrics));
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("Locked reference scenario [%s] failure details: %s"),
+				Scenario.Name,
+				*DescribeReferenceScenarioFailureDetails(Metrics));
+
+			int32 DiscoveredSeed = INDEX_NONE;
+			FReferenceScenarioObservedMetrics DiscoveredMetrics;
+			if (TryDiscoverLowestPassingReferenceScenarioSeed(Scenario, GetCachedPlanet(Scenario.SampleCount), DiscoveredSeed, DiscoveredMetrics))
+			{
+				FReferenceScenarioDefinition DiscoveredScenario = Scenario;
+				DiscoveredScenario.Seed = DiscoveredSeed;
+				UE_LOG(
+					LogTemp,
+					Warning,
+					TEXT("Locked reference scenario [%s] failed at seed=%d; lowest passing seed in [1,256] is %d. %s"),
+					Scenario.Name,
+					Scenario.Seed,
+					DiscoveredSeed,
+					*FormatReferenceScenarioSummary(DiscoveredScenario, DiscoveredMetrics, true));
+			}
+			else
+			{
+				UE_LOG(
+					LogTemp,
+					Warning,
+					TEXT("Locked reference scenario [%s] failed at seed=%d and no passing seed was found in [1,256]."),
+					Scenario.Name,
+					Scenario.Seed);
+			}
+		}
 
 		TestTrue(FString::Printf(TEXT("Reference metrics collect successfully [%s]"), *ScenarioLabel), bCollected);
 		TestEqual(FString::Printf(TEXT("No stabilizer mismatches are reported [%s]"), *ScenarioLabel), Metrics.StabilizerShadowMismatchCount, 0);
@@ -3482,8 +4253,11 @@ bool FReconcileLongRunTest::RunTest(const FString& Parameters)
 			FString::Printf(TEXT("Minimum runtime continental area fraction stays above floor [%s]"), *ScenarioLabel),
 			Metrics.MinimumRuntimeContinentalAreaFraction + UE_DOUBLE_SMALL_NUMBER >= Scenario.Bounds.MinimumRuntimeContinentalAreaFraction);
 		TestTrue(
+			FString::Printf(TEXT("Maximum elevation stays below z_c [%s]"), *ScenarioLabel),
+			Metrics.MaximumObservedElevationKm <= MaxReferenceScenarioElevationCeilingKm + static_cast<double>(KINDA_SMALL_NUMBER));
+		TestTrue(
 			FString::Printf(TEXT("Continental component count stays within scenario cap [%s]"), *ScenarioLabel),
-			Metrics.MaximumContinentalComponentCount <= Scenario.Bounds.MaximumContinentalComponentCount);
+			Metrics.MaximumContinentalComponentCount <= GetExpectedMaximumContinentalComponentCount(Scenario.Bounds));
 		TestTrue(
 			FString::Printf(TEXT("Collision event count meets scenario minimum [%s]"), *ScenarioLabel),
 			Metrics.FinalCollisionEventCount >= Scenario.Bounds.MinimumCollisionEventCount);

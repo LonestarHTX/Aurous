@@ -80,6 +80,8 @@ struct FCanonicalSample
 	bool bIsSubductionFront = false;
 	float CollisionDistanceKm = -1.0f;
 	float CollisionConvergenceSpeedMmPerYear = 0.0f;
+	int32 CollisionOpposingPlateId = INDEX_NONE;
+	float CollisionInfluenceRadiusKm = -1.0f;
 	bool bIsCollisionFront = false;
 	uint8 NumOverlapPlateIds = 0;
 	int32 OverlapPlateIds[4] = { INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE };
@@ -112,6 +114,8 @@ struct FCarriedSampleData
 	bool bIsSubductionFront = false;
 	float CollisionDistanceKm = -1.0f;
 	float CollisionConvergenceSpeedMmPerYear = 0.0f;
+	int32 CollisionOpposingPlateId = INDEX_NONE;
+	float CollisionInfluenceRadiusKm = -1.0f;
 	bool bIsCollisionFront = false;
 };
 
@@ -327,9 +331,12 @@ private:
 	{
 		int32 DonorTerraneId = INDEX_NONE;
 		int32 ReceiverTerraneId = INDEX_NONE;
+		int32 DonorPlateId = INDEX_NONE;
 		int32 ReceiverPlateId = INDEX_NONE;
 		int32 ReconcileOrdinal = -1;
 		int32 ContactSampleCount = 0;
+		double CollisionAreaKm2 = 0.0;
+		float CollisionRadiusKm = 0.0f;
 		float MeanConvergenceSpeedMmPerYear = 0.0f;
 	};
 
@@ -338,7 +345,7 @@ private:
 	void BuildAdjacencyGraph();
 	void RebuildAdjacencyEdgeDistanceCache(const TArray<FCanonicalSample>& InSamples);
 	void RebuildCarriedSampleWorkspaces();
-	void RebuildCarriedSampleWorkspacesForSamples(const TArray<FCanonicalSample>& InSamples);
+	void RebuildCarriedSampleWorkspacesForSamples(const TArray<FCanonicalSample>& InSamples, const TArray<uint8>* DirtyPlateFlags = nullptr);
 	void InvalidateSpatialQueryData();
 	void BuildSpatialQueryDataInternal() const;
 	double UpdateSpatialCapsForCurrentRotationsInternal() const;
@@ -387,10 +394,21 @@ private:
 		float& OutConvergenceSpeedMmPerYear) const;
 	void DetectTerranesForSamples(TArray<FCanonicalSample>& InOutSamples);
 	bool ApplyContinentalCollisionEventsForSamples(TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* OutDirtyPlateFlags = nullptr);
+	bool ApplyContinentalCollisionEventsForSamples(
+		const TArray<FPhase2SampleState>& Phase2States,
+		TArray<FCanonicalSample>& InOutSamples,
+		TArray<uint8>* OutDirtyPlateFlags,
+		double* OutRefreshSeconds = nullptr);
+	bool ApplyNextContinentalCollisionEventForSamples(
+		TArray<FCanonicalSample>& InOutSamples,
+		TSet<int32>* InOutTerranesUsedThisReconcile = nullptr,
+		TArray<uint8>* OutDirtyPlateFlags = nullptr,
+		TArray<int32>* InOutBestCollisionDonorTerraneIds = nullptr);
 	void RefreshCanonicalStateAfterCollision(
 		const TArray<FPhase2SampleState>& Phase2States,
 		TArray<FCanonicalSample>& InOutSamples,
-		const TArray<uint8>* DirtyPlateFlags = nullptr);
+		TArray<uint8>* InOutDirtyPlateFlags = nullptr);
+	void RefreshCanonicalStateAfterCollision(TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* InOutDirtyPlateFlags);
 	void RefreshCanonicalStateAfterCollision(TArray<FCanonicalSample>& InOutSamples);
 	void UpdateSubductionFieldsForSamples(TArray<FCanonicalSample>& InOutSamples);
 	void RefreshSubductionMetricsFromCarriedSamples();
@@ -404,6 +422,14 @@ private:
 		const FVector& V1,
 		const FVector& V2,
 		const FVector& Barycentric);
+	static void InterpolateTriangleFields(
+		const TArray<FCanonicalSample>& ReadSamples,
+		const FDelaunayTriangle& Triangle,
+		const FCarriedSampleData& V0,
+		const FCarriedSampleData& V1,
+		const FCarriedSampleData& V2,
+		const FVector& Barycentric,
+		FCanonicalSample& InOutDestSample);
 	static ECrustType MajorityCrustType(ECrustType A, ECrustType B, ECrustType C);
 	static EOrogenyType MajorityOrogenyType(EOrogenyType A, EOrogenyType B, EOrogenyType C);
 	static FVector3d ComputePlanarBarycentric(const FVector3d& A, const FVector3d& B, const FVector3d& C, const FVector3d& P);
@@ -488,6 +514,10 @@ private:
 	friend struct FTectonicPlanetTestAccess;
 #endif
 };
+
+
+
+
 
 
 

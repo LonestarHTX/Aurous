@@ -16,6 +16,33 @@ namespace
 			Metrics.AverageUnaccountedPct /= ReconcileCount;
 		}
 	}
+
+	bool HasFailureObservation(const FReferenceScenarioObservedMetrics& Metrics, const TCHAR* Label)
+	{
+		return Metrics.FailureObservations.ContainsByPredicate(
+			[Label](const FReferenceScenarioFailureObservation& Observation)
+			{
+				return Observation.Label.Equals(Label, ESearchCase::CaseSensitive);
+			});
+	}
+
+	void RecordFailureObservation(
+		FReferenceScenarioObservedMetrics& Metrics,
+		const TCHAR* Label,
+		const int32 StepIndex,
+		const FString& Detail)
+	{
+		if (HasFailureObservation(Metrics, Label))
+		{
+			return;
+		}
+
+		FReferenceScenarioFailureObservation Observation;
+		Observation.Label = Label;
+		Observation.StepIndex = StepIndex;
+		Observation.Detail = Detail;
+		Metrics.FailureObservations.Add(MoveTemp(Observation));
+	}
 }
 
 int32 ComputeExpectedInitialPlateFloorSamples(const int32 TotalSampleCount, const int32 PlateCount)
@@ -38,12 +65,17 @@ int32 ComputeExpectedPersistentPlateFloorSamples(const FPlate& Plate)
 	return FMath::Max(32, FMath::CeilToInt(0.05 * static_cast<double>(FMath::Max(0, Plate.InitialSampleCount))));
 }
 
+int32 GetExpectedMaximumContinentalComponentCount(const FReferenceScenarioBounds& Bounds)
+{
+	return FMath::Max(0, 3 * Bounds.ExpectedInitialContinentalPlateCount);
+}
+
 const TArray<FReferenceScenarioDefinition>& GetLockedReferenceScenarios()
 {
 	static const TArray<FReferenceScenarioDefinition> Scenarios = {
-		{ TEXT("Smoke7"), 100000, 7, 1, 40, { 2, 0.25, 0.40, 0.25, 6, 0, true } },
-		{ TEXT("Nominal20"), 200000, 20, 1, 60, { 6, 0.25, 0.40, 0.25, 18, 1, true } },
-		{ TEXT("Stress40"), 500000, 40, 1, 60, { 12, 0.25, 0.40, 0.25, 36, 1, true } }
+		{ TEXT("Smoke7"), 100000, 7, 1, 40, { 2, 0.25, 0.40, 0.25, 0, true } },
+		{ TEXT("Nominal20"), 200000, 20, 6, 60, { 6, 0.25, 0.40, 0.25, 1, true } },
+		{ TEXT("Stress40"), 500000, 40, 4, 60, { 12, 0.25, 0.40, 0.25, 1, true } }
 	};
 	return Scenarios;
 }
@@ -70,6 +102,8 @@ bool CollectReferenceScenarioObservedMetrics(
 {
 	OutMetrics = FReferenceScenarioObservedMetrics{};
 	OutMetrics.StartupToMainMs = StartupToMainMs;
+	const FReferenceScenarioBounds& Bounds = Scenario.Bounds;
+	const int32 MaxContinentalComponentCount = GetExpectedMaximumContinentalComponentCount(Bounds);
 
 	const double ScenarioStartSeconds = FPlatformTime::Seconds();
 	FTectonicPlanet Planet = BasePlanet;
@@ -95,6 +129,30 @@ bool CollectReferenceScenarioObservedMetrics(
 	OutMetrics.InitialContinentalPlateCount = Planet.GetContinentalPlateCount();
 	OutMetrics.InitialContinentalAreaFraction = Planet.GetContinentalAreaFraction();
 	OutMetrics.MinimumRuntimeContinentalAreaFraction = OutMetrics.InitialContinentalAreaFraction;
+	if (OutMetrics.InitialContinentalPlateCount != Bounds.ExpectedInitialContinentalPlateCount)
+	{
+		RecordFailureObservation(
+			OutMetrics,
+			TEXT("initial_continental_plate_count"),
+			0,
+			FString::Printf(
+				TEXT("value=%d expected=%d"),
+				OutMetrics.InitialContinentalPlateCount,
+				Bounds.ExpectedInitialContinentalPlateCount));
+	}
+	if (OutMetrics.InitialContinentalAreaFraction + UE_DOUBLE_SMALL_NUMBER < Bounds.InitialContinentalAreaFractionMin ||
+		OutMetrics.InitialContinentalAreaFraction - UE_DOUBLE_SMALL_NUMBER > Bounds.InitialContinentalAreaFractionMax)
+	{
+		RecordFailureObservation(
+			OutMetrics,
+			TEXT("initial_continental_area_fraction"),
+			0,
+			FString::Printf(
+				TEXT("value=%.6f bounds=[%.6f, %.6f]"),
+				OutMetrics.InitialContinentalAreaFraction,
+				Bounds.InitialContinentalAreaFractionMin,
+				Bounds.InitialContinentalAreaFractionMax));
+	}
 
 	const int32 SampleStride = FMath::Max(1, Scenario.SampleCount / 2048);
 	TArray<int32> WatchSampleIndices;
@@ -122,23 +180,66 @@ bool CollectReferenceScenarioObservedMetrics(
 	{
 		Planet.StepSimulation();
 		const TArray<FCanonicalSample>& Samples = Planet.GetSamples();
+		const int32 StepNumber = StepIndex + 1;
+		double StepMaximumElevationKm = 0.0;
+		bool bStepInvalidPlateAssignments = false;
+		bool bStepInvalidPreviousAssignments = false;
+		bool bStepGapOrphanMismatch = false;
+		bool bStepPositionDrift = false;
 
 		for (const FCanonicalSample& Sample : Samples)
 		{
+			StepMaximumElevationKm = FMath::Max(StepMaximumElevationKm, static_cast<double>(Sample.Elevation));
+			OutMetrics.MaximumObservedElevationKm = FMath::Max(
+				OutMetrics.MaximumObservedElevationKm,
+				static_cast<double>(Sample.Elevation));
+			if (Sample.CrustType == ECrustType::Continental)
+			{
+				OutMetrics.MaximumObservedContinentalElevationKm = FMath::Max(
+					OutMetrics.MaximumObservedContinentalElevationKm,
+					static_cast<double>(Sample.Elevation));
+			}
+
 			if (Sample.PlateId < 0 || Sample.PlateId >= Scenario.PlateCount)
 			{
+				bStepInvalidPlateAssignments = true;
 				++OutMetrics.InvalidPlateAssignments;
 			}
 
 			if (Sample.PrevPlateId < 0 || Sample.PrevPlateId >= Scenario.PlateCount)
 			{
+				bStepInvalidPreviousAssignments = true;
 				++OutMetrics.InvalidPreviousAssignments;
 			}
 
 			if (Sample.bGapDetected && (Sample.PlateId < 0 || Sample.PlateId >= Scenario.PlateCount))
 			{
+				bStepGapOrphanMismatch = true;
 				++OutMetrics.GapOrphanMismatchCount;
 			}
+		}
+		if (StepMaximumElevationKm > MaxReferenceScenarioElevationCeilingKm + static_cast<double>(KINDA_SMALL_NUMBER))
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("max_elevation"),
+				StepNumber,
+				FString::Printf(
+					TEXT("value=%.3f ceiling=%.3f"),
+					StepMaximumElevationKm,
+					MaxReferenceScenarioElevationCeilingKm));
+		}
+		if (bStepInvalidPlateAssignments)
+		{
+			RecordFailureObservation(OutMetrics, TEXT("invalid_plate_assignments"), StepNumber, TEXT("observed invalid PlateId"));
+		}
+		if (bStepInvalidPreviousAssignments)
+		{
+			RecordFailureObservation(OutMetrics, TEXT("invalid_prev_plate_assignments"), StepNumber, TEXT("observed invalid PrevPlateId"));
+		}
+		if (bStepGapOrphanMismatch)
+		{
+			RecordFailureObservation(OutMetrics, TEXT("gap_orphan_mismatch"), StepNumber, TEXT("gap sample had invalid owner"));
 		}
 
 		for (int32 WatchIndex = 0; WatchIndex < WatchSampleIndices.Num(); ++WatchIndex)
@@ -146,7 +247,9 @@ bool CollectReferenceScenarioObservedMetrics(
 			const int32 SampleIndex = WatchSampleIndices[WatchIndex];
 			const FCanonicalSample& Sample = Samples[SampleIndex];
 
-			OutMetrics.PositionDriftCount += Sample.Position.Equals(WatchInitialPositions[WatchIndex], 1e-10) ? 0 : 1;
+			const bool bPositionDrifted = !Sample.Position.Equals(WatchInitialPositions[WatchIndex], 1e-10);
+			bStepPositionDrift |= bPositionDrifted;
+			OutMetrics.PositionDriftCount += bPositionDrifted ? 1 : 0;
 
 			if (Planet.WasReconcileTriggeredLastStep())
 			{
@@ -161,6 +264,10 @@ bool CollectReferenceScenarioObservedMetrics(
 				WatchPreviousPlateIds[WatchIndex] = PreviousPlateIdForWatch;
 				WatchCurrentPlateIds[WatchIndex] = CurrentPlateId;
 			}
+		}
+		if (bStepPositionDrift)
+		{
+			RecordFailureObservation(OutMetrics, TEXT("position_drift"), StepNumber, TEXT("watch sample position changed"));
 		}
 
 		if (!Planet.WasReconcileTriggeredLastStep())
@@ -191,6 +298,10 @@ bool CollectReferenceScenarioObservedMetrics(
 			Timings.UnaccountedPct >= 0.0 &&
 			Timings.TotalMs > 0.0;
 		OutMetrics.InvalidTimingSnapshots += bTimingsValid ? 0 : 1;
+		if (!bTimingsValid)
+		{
+			RecordFailureObservation(OutMetrics, TEXT("invalid_timing_snapshots"), StepNumber, TEXT("negative or zero reconcile timing field"));
+		}
 		OutMetrics.AverageReconcileMs += Timings.TotalMs;
 		OutMetrics.MaxReconcileMs = FMath::Max(OutMetrics.MaxReconcileMs, Timings.TotalMs);
 		OutMetrics.AverageUnaccountedPct += Timings.UnaccountedPct;
@@ -198,24 +309,143 @@ bool CollectReferenceScenarioObservedMetrics(
 		if (Timings.UnaccountedPct > MaxAcceptableUnaccountedPct)
 		{
 			++OutMetrics.UnaccountedBudgetFailures;
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("unaccounted_budget"),
+				StepNumber,
+				FString::Printf(
+					TEXT("value=%.2f%% limit=%.2f%%"),
+					Timings.UnaccountedPct,
+					MaxAcceptableUnaccountedPct));
 		}
 
 		const double SampleCountDouble = static_cast<double>(FMath::Max(1, Samples.Num()));
-		OutMetrics.MaxGapFraction = FMath::Max(OutMetrics.MaxGapFraction, static_cast<double>(Planet.GetLastGapSampleCount()) / SampleCountDouble);
-		OutMetrics.MaxOverlapFraction = FMath::Max(OutMetrics.MaxOverlapFraction, static_cast<double>(Planet.GetLastOverlapSampleCount()) / SampleCountDouble);
-		OutMetrics.MaxBoundaryMeanDepthHops = FMath::Max(OutMetrics.MaxBoundaryMeanDepthHops, Planet.GetBoundaryMeanDepthHops());
-		OutMetrics.MaxBoundaryMaxDepthHops = FMath::Max(OutMetrics.MaxBoundaryMaxDepthHops, Planet.GetBoundaryMaxDepthHops());
-		OutMetrics.MaxNonGapPlateComponentCount = FMath::Max(OutMetrics.MaxNonGapPlateComponentCount, Planet.GetMaxPlateComponentCount());
-		OutMetrics.MaxDetachedPlateFragmentSampleCount = FMath::Max(OutMetrics.MaxDetachedPlateFragmentSampleCount, Planet.GetDetachedPlateFragmentSampleCount());
-		OutMetrics.MaxLargestDetachedPlateFragmentSize = FMath::Max(OutMetrics.MaxLargestDetachedPlateFragmentSize, Planet.GetLargestDetachedPlateFragmentSize());
-		OutMetrics.MaximumContinentalComponentCount = FMath::Max(OutMetrics.MaximumContinentalComponentCount, Planet.GetContinentalComponentCount());
-		OutMetrics.MinObservedProtectedPlateSampleCount = FMath::Min(OutMetrics.MinObservedProtectedPlateSampleCount, Planet.GetMinProtectedPlateSampleCount());
-		OutMetrics.MaxEmptyProtectedPlateCount = FMath::Max(OutMetrics.MaxEmptyProtectedPlateCount, Planet.GetEmptyProtectedPlateCount());
+		const double CurrentGapFraction = static_cast<double>(Planet.GetLastGapSampleCount()) / SampleCountDouble;
+		const double CurrentOverlapFraction = static_cast<double>(Planet.GetLastOverlapSampleCount()) / SampleCountDouble;
+		const double CurrentBoundaryMeanDepthHops = Planet.GetBoundaryMeanDepthHops();
+		const int32 CurrentBoundaryMaxDepthHops = Planet.GetBoundaryMaxDepthHops();
+		const int32 CurrentPlateComponentCount = Planet.GetMaxPlateComponentCount();
+		const int32 CurrentDetachedPlateFragmentSampleCount = Planet.GetDetachedPlateFragmentSampleCount();
+		const int32 CurrentLargestDetachedPlateFragmentSize = Planet.GetLargestDetachedPlateFragmentSize();
+		const int32 CurrentContinentalComponentCount = Planet.GetContinentalComponentCount();
+		const int32 CurrentProtectedPlateSampleCount = Planet.GetMinProtectedPlateSampleCount();
+		const int32 CurrentEmptyProtectedPlateCount = Planet.GetEmptyProtectedPlateCount();
+		OutMetrics.MaxGapFraction = FMath::Max(OutMetrics.MaxGapFraction, CurrentGapFraction);
+		OutMetrics.MaxOverlapFraction = FMath::Max(OutMetrics.MaxOverlapFraction, CurrentOverlapFraction);
+		OutMetrics.MaxBoundaryMeanDepthHops = FMath::Max(OutMetrics.MaxBoundaryMeanDepthHops, CurrentBoundaryMeanDepthHops);
+		OutMetrics.MaxBoundaryMaxDepthHops = FMath::Max(OutMetrics.MaxBoundaryMaxDepthHops, CurrentBoundaryMaxDepthHops);
+		OutMetrics.MaxNonGapPlateComponentCount = FMath::Max(OutMetrics.MaxNonGapPlateComponentCount, CurrentPlateComponentCount);
+		OutMetrics.MaxDetachedPlateFragmentSampleCount = FMath::Max(OutMetrics.MaxDetachedPlateFragmentSampleCount, CurrentDetachedPlateFragmentSampleCount);
+		OutMetrics.MaxLargestDetachedPlateFragmentSize = FMath::Max(OutMetrics.MaxLargestDetachedPlateFragmentSize, CurrentLargestDetachedPlateFragmentSize);
+		OutMetrics.MaximumContinentalComponentCount = FMath::Max(OutMetrics.MaximumContinentalComponentCount, CurrentContinentalComponentCount);
+		OutMetrics.MinObservedProtectedPlateSampleCount = FMath::Min(OutMetrics.MinObservedProtectedPlateSampleCount, CurrentProtectedPlateSampleCount);
+		OutMetrics.MaxEmptyProtectedPlateCount = FMath::Max(OutMetrics.MaxEmptyProtectedPlateCount, CurrentEmptyProtectedPlateCount);
 		OutMetrics.FinalCollisionEventCount = Planet.GetCollisionEventCount();
+		if (CurrentGapFraction > MaxAcceptableGapFraction)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("gap_fraction"),
+				StepNumber,
+				FString::Printf(TEXT("value=%.6f limit=%.6f"), CurrentGapFraction, MaxAcceptableGapFraction));
+		}
+		if (CurrentOverlapFraction > MaxAcceptableOverlapFraction)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("overlap_fraction"),
+				StepNumber,
+				FString::Printf(TEXT("value=%.6f limit=%.6f"), CurrentOverlapFraction, MaxAcceptableOverlapFraction));
+		}
+		if (CurrentBoundaryMeanDepthHops > MaxAcceptableBoundaryMeanDepthHops)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("boundary_mean_depth"),
+				StepNumber,
+				FString::Printf(
+					TEXT("value=%.3f limit=%.3f"),
+					CurrentBoundaryMeanDepthHops,
+					MaxAcceptableBoundaryMeanDepthHops));
+		}
+		if (CurrentBoundaryMaxDepthHops > MaxAcceptableBoundaryMaxDepthHops)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("boundary_max_depth"),
+				StepNumber,
+				FString::Printf(TEXT("value=%d limit=%d"), CurrentBoundaryMaxDepthHops, MaxAcceptableBoundaryMaxDepthHops));
+		}
+		if (CurrentPlateComponentCount != 1)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("plate_connectivity"),
+				StepNumber,
+				FString::Printf(TEXT("value=%d expected=1"), CurrentPlateComponentCount));
+		}
+		if (CurrentDetachedPlateFragmentSampleCount != 0)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("detached_fragment_samples"),
+				StepNumber,
+				FString::Printf(TEXT("value=%d expected=0"), CurrentDetachedPlateFragmentSampleCount));
+		}
+		if (CurrentLargestDetachedPlateFragmentSize != 0)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("detached_fragment_size"),
+				StepNumber,
+				FString::Printf(TEXT("value=%d expected=0"), CurrentLargestDetachedPlateFragmentSize));
+		}
+		if (CurrentEmptyProtectedPlateCount != 0)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("empty_protected_plate"),
+				StepNumber,
+				FString::Printf(TEXT("value=%d expected=0"), CurrentEmptyProtectedPlateCount));
+		}
+		if (CurrentProtectedPlateSampleCount < OutMetrics.MinExpectedProtectedPlateFloor)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("protected_plate_floor"),
+				StepNumber,
+				FString::Printf(
+					TEXT("value=%d floor=%d"),
+					CurrentProtectedPlateSampleCount,
+					OutMetrics.MinExpectedProtectedPlateFloor));
+		}
 
 		const double CurrentContinentalAreaFraction = Planet.GetContinentalAreaFraction();
 		OutMetrics.MinimumRuntimeContinentalAreaFraction = FMath::Min(OutMetrics.MinimumRuntimeContinentalAreaFraction, CurrentContinentalAreaFraction);
 		OutMetrics.bRuntimeContinentalFractionIncreased |= (CurrentContinentalAreaFraction > PreviousContinentalAreaFraction + MaxContinentalFractionIncreaseEpsilon);
+		if (CurrentContinentalAreaFraction > PreviousContinentalAreaFraction + MaxContinentalFractionIncreaseEpsilon)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("runtime_continental_fraction_increase"),
+				StepNumber,
+				FString::Printf(
+					TEXT("previous=%.6f current=%.6f epsilon=%.6e"),
+					PreviousContinentalAreaFraction,
+					CurrentContinentalAreaFraction,
+					MaxContinentalFractionIncreaseEpsilon));
+		}
+		if (CurrentContinentalAreaFraction + UE_DOUBLE_SMALL_NUMBER < Bounds.MinimumRuntimeContinentalAreaFraction)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("minimum_runtime_continental_area_fraction"),
+				StepNumber,
+				FString::Printf(
+					TEXT("value=%.6f floor=%.6f"),
+					CurrentContinentalAreaFraction,
+					Bounds.MinimumRuntimeContinentalAreaFraction));
+		}
 		PreviousContinentalAreaFraction = CurrentContinentalAreaFraction;
 
 		const int32 ContinentalSampleCount = Planet.GetContinentalSampleCount();
@@ -223,6 +453,14 @@ bool CollectReferenceScenarioObservedMetrics(
 		{
 			const double LargestContinentalShare = static_cast<double>(Planet.GetLargestContinentalComponentSize()) / static_cast<double>(ContinentalSampleCount);
 			OutMetrics.MinLargestContinentalShare = FMath::Min(OutMetrics.MinLargestContinentalShare, LargestContinentalShare);
+		}
+		if (CurrentContinentalComponentCount > MaxContinentalComponentCount)
+		{
+			RecordFailureObservation(
+				OutMetrics,
+				TEXT("continental_component_count"),
+				StepNumber,
+				FString::Printf(TEXT("value=%d limit=%d"), CurrentContinentalComponentCount, MaxContinentalComponentCount));
 		}
 
 		bool bObservedContinentalOverridingFront = false;
@@ -240,6 +478,7 @@ bool CollectReferenceScenarioObservedMetrics(
 		OutMetrics.bObservedOceanicContinentalConvergence |=
 			bObservedContinentalOverridingFront && (Planet.GetSubductionFrontSampleCount() > 0);
 		OutMetrics.bObservedAndean |= (Planet.GetAndeanSampleCount() > 0);
+		OutMetrics.bObservedHimalayan |= (Planet.GetHimalayanSampleCount() > 0);
 	}
 
 	const double WatchCount = static_cast<double>(FMath::Max(1, WatchSampleIndices.Num() * FMath::Max(1, OutMetrics.ReconcileSteps)));
@@ -248,8 +487,64 @@ bool CollectReferenceScenarioObservedMetrics(
 	{
 		OutMetrics.MinObservedProtectedPlateSampleCount = 0;
 	}
+	if (OutMetrics.MaximumObservedElevationKm == -TNumericLimits<double>::Max())
+	{
+		OutMetrics.MaximumObservedElevationKm = 0.0;
+	}
+	if (OutMetrics.MaximumObservedContinentalElevationKm == -TNumericLimits<double>::Max())
+	{
+		OutMetrics.MaximumObservedContinentalElevationKm = 0.0;
+	}
 
 	FinalizeReferenceScenarioMetrics(OutMetrics, ScenarioStartSeconds);
+	if (OutMetrics.ReconcileSteps < 10)
+	{
+		RecordFailureObservation(
+			OutMetrics,
+			TEXT("reconcile_steps"),
+			Scenario.NumSteps,
+			FString::Printf(TEXT("value=%d minimum=10"), OutMetrics.ReconcileSteps));
+	}
+	if (OutMetrics.PingPongRate > 0.10)
+	{
+		RecordFailureObservation(
+			OutMetrics,
+			TEXT("ping_pong_rate"),
+			Scenario.NumSteps,
+			FString::Printf(TEXT("value=%.6f limit=0.100000"), OutMetrics.PingPongRate));
+	}
+	if (OutMetrics.FinalCollisionEventCount < Bounds.MinimumCollisionEventCount)
+	{
+		RecordFailureObservation(
+			OutMetrics,
+			TEXT("collision_event_count"),
+			Scenario.NumSteps,
+			FString::Printf(
+				TEXT("value=%d minimum=%d"),
+				OutMetrics.FinalCollisionEventCount,
+				Bounds.MinimumCollisionEventCount));
+	}
+	if (Bounds.bRequireAndeanWhenOceanicContinentalConvergenceExists &&
+		OutMetrics.bObservedOceanicContinentalConvergence &&
+		!OutMetrics.bObservedAndean)
+	{
+		RecordFailureObservation(
+			OutMetrics,
+			TEXT("andean_observation"),
+			Scenario.NumSteps,
+			TEXT("oceanic-continental convergence observed without Andean samples"));
+	}
+	if (Bounds.bRequireHimalayanWhenCollisionOccurs &&
+		OutMetrics.FinalCollisionEventCount > 0 &&
+		!OutMetrics.bObservedHimalayan)
+	{
+		RecordFailureObservation(
+			OutMetrics,
+			TEXT("himalayan_observation"),
+			Scenario.NumSteps,
+			TEXT("collision events observed without Himalayan samples"));
+	}
+
 	return true;
 }
 
@@ -259,8 +554,9 @@ FString FormatReferenceScenarioSummary(
 	bool bPass)
 {
 	return FString::Printf(
-		TEXT("Reference scenario [%s]: seed=%d steps=%d startup_to_main=%.1fms wall=%.1fms avg_reconcile=%.1fms max_reconcile=%.1fms avg_unaccounted=%.2f%% max_unaccounted=%.2f%% stabilizer_mismatches=%d unaccounted_budget_failures=%d init_continental_plate_count=%d init_continental_area_fraction=%.3f minimum_runtime_continental_fraction=%.3f maximum_continental_component_count=%d final_collision_event_count=%d pass=%s"),
+		TEXT("Reference scenario [%s]: samples=%d seed=%d steps=%d startup_to_main=%.1fms wall=%.1fms avg_reconcile=%.1fms max_reconcile=%.1fms avg_unaccounted=%.2f%% max_unaccounted=%.2f%% stabilizer_mismatches=%d unaccounted_budget_failures=%d init_continental_plate_count=%d init_continental_area_fraction=%.6f minimum_runtime_continental_fraction=%.6f maximum_continental_component_count=%d final_collision_event_count=%d max_elevation_km=%.3f max_continental_elevation_km=%.3f observed_himalayan=%s pass=%s"),
 		Scenario.Name,
+		Scenario.SampleCount,
 		Scenario.Seed,
 		Scenario.NumSteps,
 		Metrics.StartupToMainMs,
@@ -276,7 +572,161 @@ FString FormatReferenceScenarioSummary(
 		Metrics.MinimumRuntimeContinentalAreaFraction,
 		Metrics.MaximumContinentalComponentCount,
 		Metrics.FinalCollisionEventCount,
+		Metrics.MaximumObservedElevationKm,
+		Metrics.MaximumObservedContinentalElevationKm,
+		Metrics.bObservedHimalayan ? TEXT("true") : TEXT("false"),
 		bPass ? TEXT("true") : TEXT("false"));
+}
+
+FString DescribeReferenceScenarioFailureDetails(const FReferenceScenarioObservedMetrics& Metrics)
+{
+	if (Metrics.FailureObservations.Num() == 0)
+	{
+		return TEXT("none");
+	}
+
+	TArray<FString> Parts;
+	Parts.Reserve(Metrics.FailureObservations.Num());
+	for (const FReferenceScenarioFailureObservation& Observation : Metrics.FailureObservations)
+	{
+		if (Observation.Detail.IsEmpty())
+		{
+			Parts.Add(FString::Printf(TEXT("%s@step=%d"), *Observation.Label, Observation.StepIndex));
+			continue;
+		}
+
+		Parts.Add(FString::Printf(TEXT("%s@step=%d(%s)"), *Observation.Label, Observation.StepIndex, *Observation.Detail));
+	}
+
+	return FString::Join(Parts, TEXT("; "));
+}
+
+FString DescribeReferenceScenarioFailures(
+	const FReferenceScenarioDefinition& Scenario,
+	const FReferenceScenarioObservedMetrics& Metrics)
+{
+	const FReferenceScenarioBounds& Bounds = Scenario.Bounds;
+	TArray<FString> Failures;
+	auto AddFailure = [&Failures](const TCHAR* Label)
+	{
+		Failures.Add(Label);
+	};
+
+	if (Metrics.ReconcileSteps < 10)
+	{
+		AddFailure(TEXT("reconcile_steps"));
+	}
+	if (Metrics.InvalidPlateAssignments != 0)
+	{
+		AddFailure(TEXT("invalid_plate_assignments"));
+	}
+	if (Metrics.InvalidPreviousAssignments != 0)
+	{
+		AddFailure(TEXT("invalid_prev_plate_assignments"));
+	}
+	if (Metrics.InvalidTimingSnapshots != 0)
+	{
+		AddFailure(TEXT("invalid_timing_snapshots"));
+	}
+	if (Metrics.StabilizerShadowMismatchCount != 0)
+	{
+		AddFailure(TEXT("stabilizer_shadow_mismatch"));
+	}
+	if (Metrics.UnaccountedBudgetFailures != 0)
+	{
+		AddFailure(TEXT("unaccounted_budget"));
+	}
+	if (Metrics.PositionDriftCount != 0)
+	{
+		AddFailure(TEXT("position_drift"));
+	}
+	if (Metrics.GapOrphanMismatchCount != 0)
+	{
+		AddFailure(TEXT("gap_orphan_mismatch"));
+	}
+	if (Metrics.PingPongRate > 0.10)
+	{
+		AddFailure(TEXT("ping_pong_rate"));
+	}
+	if (Metrics.MaxGapFraction > MaxAcceptableGapFraction)
+	{
+		AddFailure(TEXT("gap_fraction"));
+	}
+	if (Metrics.MaxOverlapFraction > MaxAcceptableOverlapFraction)
+	{
+		AddFailure(TEXT("overlap_fraction"));
+	}
+	if (Metrics.MaxBoundaryMeanDepthHops > MaxAcceptableBoundaryMeanDepthHops)
+	{
+		AddFailure(TEXT("boundary_mean_depth"));
+	}
+	if (Metrics.MaxBoundaryMaxDepthHops > MaxAcceptableBoundaryMaxDepthHops)
+	{
+		AddFailure(TEXT("boundary_max_depth"));
+	}
+	if (Metrics.MaxNonGapPlateComponentCount != 1)
+	{
+		AddFailure(TEXT("plate_connectivity"));
+	}
+	if (Metrics.MaxDetachedPlateFragmentSampleCount != 0)
+	{
+		AddFailure(TEXT("detached_fragment_samples"));
+	}
+	if (Metrics.MaxLargestDetachedPlateFragmentSize != 0)
+	{
+		AddFailure(TEXT("detached_fragment_size"));
+	}
+	if (Metrics.MaxEmptyProtectedPlateCount != 0)
+	{
+		AddFailure(TEXT("empty_protected_plate"));
+	}
+	if (Metrics.MinObservedProtectedPlateSampleCount < Metrics.MinExpectedProtectedPlateFloor)
+	{
+		AddFailure(TEXT("protected_plate_floor"));
+	}
+	if (Metrics.InitialContinentalPlateCount != Bounds.ExpectedInitialContinentalPlateCount)
+	{
+		AddFailure(TEXT("initial_continental_plate_count"));
+	}
+	if (Metrics.InitialContinentalAreaFraction + UE_DOUBLE_SMALL_NUMBER < Bounds.InitialContinentalAreaFractionMin ||
+		Metrics.InitialContinentalAreaFraction - UE_DOUBLE_SMALL_NUMBER > Bounds.InitialContinentalAreaFractionMax)
+	{
+		AddFailure(TEXT("initial_continental_area_fraction"));
+	}
+	if (Metrics.bRuntimeContinentalFractionIncreased)
+	{
+		AddFailure(TEXT("runtime_continental_fraction_increase"));
+	}
+	if (Metrics.MinimumRuntimeContinentalAreaFraction + UE_DOUBLE_SMALL_NUMBER < Bounds.MinimumRuntimeContinentalAreaFraction)
+	{
+		AddFailure(TEXT("minimum_runtime_continental_area_fraction"));
+	}
+	if (Metrics.MaximumObservedElevationKm > MaxReferenceScenarioElevationCeilingKm + static_cast<double>(KINDA_SMALL_NUMBER))
+	{
+		AddFailure(TEXT("max_elevation"));
+	}
+	if (Metrics.MaximumContinentalComponentCount > GetExpectedMaximumContinentalComponentCount(Bounds))
+	{
+		AddFailure(TEXT("continental_component_count"));
+	}
+	if (Metrics.FinalCollisionEventCount < Bounds.MinimumCollisionEventCount)
+	{
+		AddFailure(TEXT("collision_event_count"));
+	}
+	if (Bounds.bRequireAndeanWhenOceanicContinentalConvergenceExists &&
+		Metrics.bObservedOceanicContinentalConvergence &&
+		!Metrics.bObservedAndean)
+	{
+		AddFailure(TEXT("andean_observation"));
+	}
+	if (Bounds.bRequireHimalayanWhenCollisionOccurs &&
+		Metrics.FinalCollisionEventCount > 0 &&
+		!Metrics.bObservedHimalayan)
+	{
+		AddFailure(TEXT("himalayan_observation"));
+	}
+
+	return Failures.Num() > 0 ? FString::Join(Failures, TEXT(", ")) : TEXT("none");
 }
 
 bool DoesReferenceScenarioObservedMetricsPass(
@@ -310,11 +760,15 @@ bool DoesReferenceScenarioObservedMetricsPass(
 		Metrics.InitialContinentalAreaFraction - UE_DOUBLE_SMALL_NUMBER <= Bounds.InitialContinentalAreaFractionMax &&
 		!Metrics.bRuntimeContinentalFractionIncreased &&
 		Metrics.MinimumRuntimeContinentalAreaFraction + UE_DOUBLE_SMALL_NUMBER >= Bounds.MinimumRuntimeContinentalAreaFraction &&
-		Metrics.MaximumContinentalComponentCount <= Bounds.MaximumContinentalComponentCount &&
+		Metrics.MaximumObservedElevationKm <= MaxReferenceScenarioElevationCeilingKm + static_cast<double>(KINDA_SMALL_NUMBER) &&
+		Metrics.MaximumContinentalComponentCount <= GetExpectedMaximumContinentalComponentCount(Bounds) &&
 		Metrics.FinalCollisionEventCount >= Bounds.MinimumCollisionEventCount &&
 		(!Bounds.bRequireAndeanWhenOceanicContinentalConvergenceExists ||
 			!Metrics.bObservedOceanicContinentalConvergence ||
-			Metrics.bObservedAndean);
+			Metrics.bObservedAndean) &&
+		(!Bounds.bRequireHimalayanWhenCollisionOccurs ||
+			Metrics.FinalCollisionEventCount <= 0 ||
+			Metrics.bObservedHimalayan);
 
 	return bBaseInvariantsPass && bStructuralGeologyPass;
 }
@@ -345,3 +799,6 @@ bool TryDiscoverLowestPassingReferenceScenarioSeed(
 
 	return false;
 }
+
+
+
