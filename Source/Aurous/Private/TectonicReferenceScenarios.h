@@ -18,9 +18,10 @@ struct FReferenceScenarioBounds
 	double InitialContinentalAreaFractionMax = 0.40;
 	double MinimumRuntimeContinentalAreaFraction = 0.25;
 	int32 MinimumCollisionEventCount = 0;
+	int32 MinimumRiftEventCount = 0;
+	int32 MinimumPeakActivePlateCount = 0;
 	bool bRequireAndeanWhenOceanicContinentalConvergenceExists = true;
 	bool bRequireHimalayanWhenCollisionOccurs = true;
-	bool bPreRiftingFloorExempt = false;
 };
 
 struct FReferenceScenarioDefinition
@@ -49,6 +50,9 @@ struct FReferenceScenarioObservedMetrics
 	double MaximumObservedContinentalElevationKm = -TNumericLimits<double>::Max();
 	int32 MaximumContinentalComponentCount = 0;
 	int32 FinalCollisionEventCount = 0;
+	int32 FinalRiftEventCount = 0;
+	int32 PeakActivePlateCount = 0;
+	int32 PeakAllocatedPlateCount = 0;
 	bool bObservedOceanicContinentalConvergence = false;
 	bool bObservedAndean = false;
 	bool bObservedHimalayan = false;
@@ -85,7 +89,6 @@ struct FReferenceScenarioObservedMetrics
 
 int32 ComputeExpectedInitialPlateFloorSamples(int32 TotalSampleCount, int32 PlateCount);
 int32 ComputeExpectedPersistentPlateFloorSamples(const FPlate& Plate);
-int32 GetExpectedMaximumContinentalComponentCount(const FReferenceScenarioBounds& Bounds);
 const TArray<FReferenceScenarioDefinition>& GetLockedReferenceScenarios();
 const FReferenceScenarioDefinition* FindLockedReferenceScenarioByName(const FString& ScenarioName);
 bool CollectReferenceScenarioObservedMetrics(
@@ -93,7 +96,7 @@ bool CollectReferenceScenarioObservedMetrics(
 	const FTectonicPlanet& BasePlanet,
 	FReferenceScenarioObservedMetrics& OutMetrics,
 	double StartupToMainMs = 0.0,
-	EContinentalStabilizerMode StabilizerMode = EContinentalStabilizerMode::Incremental);
+	EContinentalStabilizerMode StabilizerMode = EContinentalStabilizerMode::Disabled);
 FString FormatReferenceScenarioSummary(
 	const FReferenceScenarioDefinition& Scenario,
 	const FReferenceScenarioObservedMetrics& Metrics,

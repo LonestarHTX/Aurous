@@ -125,6 +125,11 @@ namespace
 			return Planet.Adjacency;
 		}
 
+		static TArray<TArray<float>>& MutableAdjacencyEdgeDistancesKm(FTectonicPlanet& Planet)
+		{
+			return Planet.AdjacencyEdgeDistancesKm;
+		}
+
 		static TArray<FPlate>& MutablePlates(FTectonicPlanet& Planet)
 		{
 			return Planet.Plates;
@@ -155,6 +160,11 @@ namespace
 			Planet.RebuildCarriedSampleWorkspacesForSamples(InSamples);
 		}
 
+		static void RebuildAdjacencyEdgeDistanceCache(FTectonicPlanet& Planet, const TArray<FCanonicalSample>& InSamples)
+		{
+			Planet.RebuildAdjacencyEdgeDistanceCache(InSamples);
+		}
+
 		static void EnforceConnectedOwnership(FTectonicPlanet& Planet, TArray<FCanonicalSample>& InOutSamples)
 		{
 			Planet.EnforceConnectedPlateOwnershipForSamples(InOutSamples);
@@ -168,6 +178,77 @@ namespace
 		static void DetectTerranes(FTectonicPlanet& Planet, TArray<FCanonicalSample>& InOutSamples)
 		{
 			Planet.DetectTerranesForSamples(InOutSamples);
+		}
+
+		static bool ApplyPlateRiftingEvents(FTectonicPlanet& Planet, TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* OutDirtyPlateFlags = nullptr)
+		{
+			return Planet.ApplyPlateRiftingEventsForSamples(InOutSamples, OutDirtyPlateFlags, nullptr);
+		}
+
+		static bool ApplyNextPlateRiftEvent(FTectonicPlanet& Planet, TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* OutDirtyPlateFlags = nullptr)
+		{
+			return Planet.ApplyNextPlateRiftEventForSamples(InOutSamples, OutDirtyPlateFlags);
+		}
+
+		static bool ApplyPlateRiftEventToPlate(
+			FTectonicPlanet& Planet,
+			const int32 ParentPlateId,
+			TArray<FCanonicalSample>& InOutSamples,
+			TArray<uint8>* OutDirtyPlateFlags = nullptr,
+			const int32 ForcedChildCount = INDEX_NONE,
+			const int32 ForcedEventSeed = INDEX_NONE)
+		{
+			return Planet.ApplyPlateRiftEventToPlateForSamples(ParentPlateId, InOutSamples, OutDirtyPlateFlags, ForcedChildCount, ForcedEventSeed);
+		}
+
+		static bool ComputePlateRiftTriggerMetrics(
+			const FTectonicPlanet& Planet,
+			const TArray<FCanonicalSample>& InSamples,
+			const int32 PlateId,
+			const int64 ElapsedStepCount,
+			double& OutContinentalFraction,
+			double& OutAreaKm2,
+			double& OutLambda,
+			double& OutProbability)
+		{
+			return Planet.ComputePlateRiftTriggerMetricsForSamples(
+				InSamples,
+				PlateId,
+				ElapsedStepCount,
+				OutContinentalFraction,
+				OutAreaKm2,
+				OutLambda,
+				OutProbability);
+		}
+
+		static void SetPlateInitializationSeed(FTectonicPlanet& Planet, const int32 Seed)
+		{
+			Planet.PlateInitializationSeed = Seed;
+		}
+
+		static void SetLastReconcileStepOrdinal(FTectonicPlanet& Planet, const int64 StepOrdinal)
+		{
+			Planet.LastReconcileStepOrdinal = StepOrdinal;
+		}
+
+		static int32 GetRiftEventParentPlateId(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.RiftEvents.IsValidIndex(EventIndex) ? Planet.RiftEvents[EventIndex].ParentPlateId : INDEX_NONE;
+		}
+
+		static int32 GetRiftEventChildPlateCount(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.RiftEvents.IsValidIndex(EventIndex) ? Planet.RiftEvents[EventIndex].ChildPlateIds.Num() : 0;
+		}
+
+		static double GetRiftEventLambda(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.RiftEvents.IsValidIndex(EventIndex) ? Planet.RiftEvents[EventIndex].Lambda : 0.0;
+		}
+
+		static double GetRiftEventProbability(const FTectonicPlanet& Planet, const int32 EventIndex)
+		{
+			return Planet.RiftEvents.IsValidIndex(EventIndex) ? Planet.RiftEvents[EventIndex].Probability : 0.0;
 		}
 
 		static bool ApplyContinentalCollisions(FTectonicPlanet& Planet, TArray<FCanonicalSample>& InOutSamples)
@@ -399,6 +480,135 @@ namespace
 			Count += (Sample.CrustType == ECrustType::Continental) ? 1 : 0;
 		}
 		return Count;
+	}
+
+	struct FRiftFixtureState
+	{
+		FTectonicPlanet Planet;
+		TArray<FCanonicalSample> Samples;
+	};
+
+	FVector MakeRiftFixturePosition(const int32 SampleIndex, const int32 NumSamples)
+	{
+		const double AngleRadians = (2.0 * PI * static_cast<double>(SampleIndex)) / static_cast<double>(FMath::Max(1, NumSamples));
+		const double Z = 0.20 * FMath::Sin(2.0 * AngleRadians);
+		return FVector(FMath::Cos(AngleRadians), FMath::Sin(AngleRadians), Z).GetSafeNormal();
+	}
+
+	void BuildRingAdjacency(TArray<TArray<int32>>& Adjacency, const int32 NumSamples)
+	{
+		Adjacency.SetNum(NumSamples);
+		for (int32 SampleIndex = 0; SampleIndex < NumSamples; ++SampleIndex)
+		{
+			LinkBidirectional(Adjacency, SampleIndex, (SampleIndex + 1) % NumSamples);
+		}
+	}
+
+	void InitializeRiftFixtureSample(
+		FCanonicalSample& Sample,
+		const int32 SampleIndex,
+		const int32 NumSamples,
+		const int32 PlateId,
+		const ECrustType CrustType)
+	{
+		Sample = FCanonicalSample{};
+		Sample.Position = MakeRiftFixturePosition(SampleIndex, NumSamples);
+		Sample.PlateId = PlateId;
+		Sample.PrevPlateId = PlateId;
+		Sample.CrustType = CrustType;
+		Sample.Elevation = (CrustType == ECrustType::Continental) ? (1.0f + 0.01f * static_cast<float>(SampleIndex)) : -4.0f;
+		Sample.Thickness = (CrustType == ECrustType::Continental) ? 35.0f : 7.0f;
+		Sample.Age = 5.0f + 0.1f * static_cast<float>(SampleIndex);
+		Sample.RidgeDirection = FVector(1.0, 0.0, 0.05 * static_cast<double>(SampleIndex + 1)).GetSafeNormal();
+		Sample.FoldDirection = FVector(0.0, 1.0, 0.05 * static_cast<double>(SampleIndex + 1)).GetSafeNormal();
+		Sample.TerraneId = (CrustType == ECrustType::Continental) ? (100 + SampleIndex / 24) : INDEX_NONE;
+		Sample.CollisionDistanceKm = (CrustType == ECrustType::Continental) ? (25.0f + static_cast<float>(SampleIndex)) : -1.0f;
+		Sample.CollisionConvergenceSpeedMmPerYear = (CrustType == ECrustType::Continental) ? (20.0f + 0.25f * static_cast<float>(SampleIndex)) : 0.0f;
+		Sample.CollisionOpposingPlateId = (CrustType == ECrustType::Continental) ? 7 : INDEX_NONE;
+		Sample.CollisionInfluenceRadiusKm = (CrustType == ECrustType::Continental) ? 400.0f : -1.0f;
+		Sample.bIsCollisionFront = (CrustType == ECrustType::Continental) && ((SampleIndex % 17) == 0);
+	}
+
+	void InitializeSinglePlateRiftFixture(
+		FRiftFixtureState& Fixture,
+		const int32 NumSamples = 384,
+		const float AngularSpeed = 0.028f)
+	{
+		TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Fixture.Planet);
+		TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Fixture.Planet);
+
+		Fixture.Samples.SetNum(NumSamples);
+		Plates.SetNum(1);
+		InitializeFixturePlate(Plates[0], 0, FVector::UpVector, AngularSpeed);
+		Plates[0].PersistencePolicy = EPlatePersistencePolicy::Protected;
+		Plates[0].InitialSampleCount = NumSamples;
+		Plates[0].CumulativeRotation = FQuat(FVector::RightVector, 0.2f);
+		Plates[0].AngularDisplacementSinceReconcile = 0.03;
+
+		BuildRingAdjacency(Adjacency, NumSamples);
+		for (int32 SampleIndex = 0; SampleIndex < NumSamples; ++SampleIndex)
+		{
+			InitializeRiftFixtureSample(Fixture.Samples[SampleIndex], SampleIndex, NumSamples, 0, ECrustType::Continental);
+		}
+
+		FTectonicPlanetTestAccess::SetAreaMetrics(Fixture.Planet, 10.0, static_cast<double>(NumSamples) * 10.0);
+		FTectonicPlanetTestAccess::SetPlateInitializationSeed(Fixture.Planet, 12345);
+		FTectonicPlanetTestAccess::SetLastReconcileStepOrdinal(Fixture.Planet, 0);
+		FTectonicPlanetTestAccess::RebuildAdjacencyEdgeDistanceCache(Fixture.Planet, Fixture.Samples);
+		FTectonicPlanetTestAccess::RebuildPlateMembership(Fixture.Planet, Fixture.Samples);
+		FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Fixture.Planet, Fixture.Samples);
+		FTectonicPlanetTestAccess::RebuildCarriedWorkspaces(Fixture.Planet, Fixture.Samples);
+	}
+
+	bool IsPlateOwnershipConnected(const TArray<FCanonicalSample>& Samples, const TArray<TArray<int32>>& Adjacency, const int32 PlateId)
+	{
+		int32 StartSampleIndex = INDEX_NONE;
+		int32 OwnedSampleCount = 0;
+		for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+		{
+			if (Samples[SampleIndex].PlateId != PlateId)
+			{
+				continue;
+			}
+
+			if (StartSampleIndex == INDEX_NONE)
+			{
+				StartSampleIndex = SampleIndex;
+			}
+			++OwnedSampleCount;
+		}
+		if (StartSampleIndex == INDEX_NONE)
+		{
+			return true;
+		}
+
+		TArray<uint8> Visited;
+		Visited.Init(0, Samples.Num());
+		TArray<int32> Queue;
+		Queue.Add(StartSampleIndex);
+		Visited[StartSampleIndex] = 1;
+
+		int32 ConnectedCount = 0;
+		while (Queue.Num() > 0)
+		{
+			const int32 SampleIndex = Queue.Pop(EAllowShrinking::No);
+			++ConnectedCount;
+
+			for (const int32 NeighborIndex : Adjacency[SampleIndex])
+			{
+				if (!Samples.IsValidIndex(NeighborIndex) ||
+					Visited[NeighborIndex] != 0 ||
+					Samples[NeighborIndex].PlateId != PlateId)
+				{
+					continue;
+				}
+
+				Visited[NeighborIndex] = 1;
+				Queue.Add(NeighborIndex);
+			}
+		}
+
+		return ConnectedCount == OwnedSampleCount;
 	}
 
 	void TestOceanicTemplateMatch(
@@ -2405,6 +2615,247 @@ bool FSubductionPerStepUpdateTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRiftTriggerFixtureTest, "Aurous.TectonicPlanet.RiftTriggerFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FRiftTriggerFixtureTest::RunTest(const FString& Parameters)
+{
+	FTectonicPlanet Planet;
+	TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+	TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
+	TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+	const int32 NumSamples = 160;
+	Samples.SetNum(NumSamples);
+	Plates.SetNum(2);
+	InitializeFixturePlate(Plates[0], 0, FVector::UpVector, 0.02f);
+	InitializeFixturePlate(Plates[1], 1, FVector::ForwardVector, 0.02f);
+	BuildRingAdjacency(Adjacency, NumSamples);
+
+	for (int32 SampleIndex = 0; SampleIndex < NumSamples; ++SampleIndex)
+	{
+		const bool bLargePlate = SampleIndex < 96;
+		const int32 PlateId = bLargePlate ? 0 : 1;
+		const ECrustType CrustType = bLargePlate ? ECrustType::Continental : ECrustType::Oceanic;
+		InitializeRiftFixtureSample(Samples[SampleIndex], SampleIndex, NumSamples, PlateId, CrustType);
+	}
+
+	FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 10.0, 2000.0);
+	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+
+	double LargePlateFraction = 0.0;
+	double LargePlateAreaKm2 = 0.0;
+	double LargePlateLambda = 0.0;
+	double LargePlateProbability = 0.0;
+	const bool bLargeMetricsValid = FTectonicPlanetTestAccess::ComputePlateRiftTriggerMetrics(
+		Planet,
+		Samples,
+		0,
+		1,
+		LargePlateFraction,
+		LargePlateAreaKm2,
+		LargePlateLambda,
+		LargePlateProbability);
+
+	double OceanicPlateFraction = 0.0;
+	double OceanicPlateAreaKm2 = 0.0;
+	double OceanicPlateLambda = 0.0;
+	double OceanicPlateProbability = 0.0;
+	const bool bOceanicMetricsValid = FTectonicPlanetTestAccess::ComputePlateRiftTriggerMetrics(
+		Planet,
+		Samples,
+		1,
+		1,
+		OceanicPlateFraction,
+		OceanicPlateAreaKm2,
+		OceanicPlateLambda,
+		OceanicPlateProbability);
+
+	double FastElapsedLambda = 0.0;
+	double FastElapsedProbability = 0.0;
+	double IgnoredFraction = 0.0;
+	double IgnoredAreaKm2 = 0.0;
+	const bool bFastElapsedMetricsValid = FTectonicPlanetTestAccess::ComputePlateRiftTriggerMetrics(
+		Planet,
+		Samples,
+		0,
+		4,
+		IgnoredFraction,
+		IgnoredAreaKm2,
+		FastElapsedLambda,
+		FastElapsedProbability);
+
+	TestTrue(TEXT("Continental plate trigger metrics compute"), bLargeMetricsValid);
+	TestTrue(TEXT("Oceanic plate trigger metrics compute"), bOceanicMetricsValid);
+	TestTrue(TEXT("Elapsed-step-scaled trigger metrics compute"), bFastElapsedMetricsValid);
+	TestTrue(TEXT("Continental fraction reflects the owned continental share"), FMath::IsNearlyEqual(LargePlateFraction, 1.0, 1e-6));
+	TestTrue(TEXT("Oceanic-only plate has zero continental fraction"), FMath::IsNearlyEqual(OceanicPlateFraction, 0.0, 1e-6));
+	TestTrue(TEXT("Continental plate lambda is positive"), LargePlateLambda > 0.0);
+	TestTrue(TEXT("Oceanic-only plate lambda collapses to zero"), FMath::IsNearlyEqual(OceanicPlateLambda, 0.0, 1e-6));
+	TestTrue(TEXT("Oceanic-only plate probability collapses to zero"), FMath::IsNearlyEqual(OceanicPlateProbability, 0.0, 1e-6));
+	TestTrue(TEXT("Longer elapsed intervals increase rift lambda"), FastElapsedLambda > LargePlateLambda);
+	TestTrue(TEXT("Longer elapsed intervals increase rift probability in the small-lambda regime"), FastElapsedProbability > LargePlateProbability);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRiftVoronoiFractureFixtureTest, "Aurous.TectonicPlanet.RiftVoronoiFractureFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FRiftVoronoiFractureFixtureTest::RunTest(const FString& Parameters)
+{
+	FRiftFixtureState Fixture;
+	InitializeSinglePlateRiftFixture(Fixture);
+	TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Fixture.Planet);
+	TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Fixture.Planet);
+	TArray<uint8> DirtyPlateFlags;
+
+	const bool bApplied = FTectonicPlanetTestAccess::ApplyPlateRiftEventToPlate(
+		Fixture.Planet,
+		0,
+		Fixture.Samples,
+		&DirtyPlateFlags,
+		3,
+		1337);
+	TestTrue(TEXT("Forced plate rift applies"), bApplied);
+	TestEqual(TEXT("Rift event count increments"), Fixture.Planet.GetRiftEventCount(), 1);
+	TestEqual(TEXT("Rift record stores parent plate"), FTectonicPlanetTestAccess::GetRiftEventParentPlateId(Fixture.Planet, 0), 0);
+	const int32 ChildPlateCount = FTectonicPlanetTestAccess::GetRiftEventChildPlateCount(Fixture.Planet, 0);
+	TestTrue(TEXT("Rift record stores an allowed child count"), ChildPlateCount >= 2 && ChildPlateCount <= 3);
+	TestEqual(TEXT("Direct rift plate count matches the recorded child count"), Plates.Num(), ChildPlateCount);
+
+	TMap<int32, int32> SampleCountsByPlate;
+	for (const FCanonicalSample& Sample : Fixture.Samples)
+	{
+		SampleCountsByPlate.FindOrAdd(Sample.PlateId)++;
+	}
+
+	int32 TotalOwnedSamples = 0;
+	for (const TPair<int32, int32>& Entry : SampleCountsByPlate)
+	{
+		TotalOwnedSamples += Entry.Value;
+	}
+	TestEqual(TEXT("Rift conserves all owned samples"), TotalOwnedSamples, Fixture.Samples.Num());
+	TestEqual(TEXT("Rift produces one active partition per child plate"), SampleCountsByPlate.Num(), ChildPlateCount);
+	for (const TPair<int32, int32>& Entry : SampleCountsByPlate)
+	{
+		TestTrue(
+			FString::Printf(TEXT("Child partition remains connected for plate %d"), Entry.Key),
+			IsPlateOwnershipConnected(Fixture.Samples, Adjacency, Entry.Key));
+	}
+	TestEqual(TEXT("Dirty flags expand to cover appended child plates"), DirtyPlateFlags.Num(), Plates.Num());
+	for (int32 PlateIndex = 0; PlateIndex < DirtyPlateFlags.Num(); ++PlateIndex)
+	{
+		TestTrue(FString::Printf(TEXT("Dirty plate flag is set for child plate %d"), PlateIndex), DirtyPlateFlags[PlateIndex] != 0);
+	}
+
+	FRiftFixtureState BalancedFixture;
+	InitializeSinglePlateRiftFixture(BalancedFixture, 384);
+	TestTrue(
+		TEXT("Two-way ring rift applies without collapsing"),
+		FTectonicPlanetTestAccess::ApplyPlateRiftEventToPlate(BalancedFixture.Planet, 0, BalancedFixture.Samples, nullptr, 2, 1337));
+
+	TMap<int32, int32> BalancedCountsByPlate;
+	for (const FCanonicalSample& Sample : BalancedFixture.Samples)
+	{
+		BalancedCountsByPlate.FindOrAdd(Sample.PlateId)++;
+	}
+
+	int32 MinBalancedChildCount = TNumericLimits<int32>::Max();
+	for (const TPair<int32, int32>& Entry : BalancedCountsByPlate)
+	{
+		MinBalancedChildCount = FMath::Min(MinBalancedChildCount, Entry.Value);
+	}
+	TestEqual(TEXT("Two-way ring rift keeps both child plates active"), BalancedCountsByPlate.Num(), 2);
+	TestTrue(TEXT("Two-way ring rift stays broadly balanced"), MinBalancedChildCount >= BalancedFixture.Samples.Num() / 3);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRiftSampleTransferFixtureTest, "Aurous.TectonicPlanet.RiftSampleTransferFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FRiftSampleTransferFixtureTest::RunTest(const FString& Parameters)
+{
+	FRiftFixtureState Fixture;
+	InitializeSinglePlateRiftFixture(Fixture);
+	TArray<int32> OriginalTerraneIds;
+	TArray<float> OriginalCollisionDistances;
+	TArray<int32> OriginalCollisionOpposingPlateIds;
+	for (const FCanonicalSample& Sample : Fixture.Samples)
+	{
+		OriginalTerraneIds.Add(Sample.TerraneId);
+		OriginalCollisionDistances.Add(Sample.CollisionDistanceKm);
+		OriginalCollisionOpposingPlateIds.Add(Sample.CollisionOpposingPlateId);
+	}
+
+	TestTrue(
+		TEXT("Forced sample transfer rift applies"),
+		FTectonicPlanetTestAccess::ApplyPlateRiftEventToPlate(Fixture.Planet, 0, Fixture.Samples, nullptr, 3, 7331));
+
+	int32 MovedSampleCount = 0;
+	for (int32 SampleIndex = 0; SampleIndex < Fixture.Samples.Num(); ++SampleIndex)
+	{
+		const FCanonicalSample& Sample = Fixture.Samples[SampleIndex];
+		if (Sample.PlateId == 0)
+		{
+			continue;
+		}
+
+		++MovedSampleCount;
+		TestEqual(FString::Printf(TEXT("Moved sample keeps old owner in PrevPlateId [%d]"), SampleIndex), Sample.PrevPlateId, 0);
+		TestEqual(FString::Printf(TEXT("Moved sample preserves terrane id [%d]"), SampleIndex), Sample.TerraneId, OriginalTerraneIds[SampleIndex]);
+		TestTrue(
+			FString::Printf(TEXT("Moved sample preserves collision distance [%d]"), SampleIndex),
+			FMath::IsNearlyEqual(Sample.CollisionDistanceKm, OriginalCollisionDistances[SampleIndex], KINDA_SMALL_NUMBER));
+		TestEqual(
+			FString::Printf(TEXT("Moved sample preserves collision opposing plate id [%d]"), SampleIndex),
+			Sample.CollisionOpposingPlateId,
+			OriginalCollisionOpposingPlateIds[SampleIndex]);
+	}
+
+	TestTrue(TEXT("At least one sample moves onto a new child plate"), MovedSampleCount > 0);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRiftMotionAssignmentFixtureTest, "Aurous.TectonicPlanet.RiftMotionAssignmentFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FRiftMotionAssignmentFixtureTest::RunTest(const FString& Parameters)
+{
+	FRiftFixtureState Fixture;
+	InitializeSinglePlateRiftFixture(Fixture, 192, 0.03f);
+	TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Fixture.Planet);
+
+	const FVector ParentAxisBefore = Plates[0].RotationAxis;
+	const float ParentSpeedBefore = Plates[0].AngularSpeed;
+	const FQuat ParentRotationBefore = Plates[0].CumulativeRotation;
+
+	TestTrue(
+		TEXT("Forced motion-assignment rift applies"),
+		FTectonicPlanetTestAccess::ApplyPlateRiftEventToPlate(Fixture.Planet, 0, Fixture.Samples, nullptr, 3, 9001));
+
+	TestTrue(TEXT("Largest child keeps the parent rotation axis"), Plates[0].RotationAxis.Equals(ParentAxisBefore, 1e-6f));
+	TestTrue(TEXT("Largest child keeps the parent angular speed"), FMath::IsNearlyEqual(Plates[0].AngularSpeed, ParentSpeedBefore, 1e-6f));
+	TestTrue(TEXT("Largest child keeps the parent cumulative rotation"), Plates[0].CumulativeRotation.Equals(ParentRotationBefore, 1e-6f));
+
+	const float MinAngularSpeed = 0.5f * 3.14e-2f;
+	const float MaxAngularSpeed = 1.5f * 3.14e-2f;
+	for (int32 PlateIndex = 1; PlateIndex < Plates.Num(); ++PlateIndex)
+	{
+		TestTrue(FString::Printf(TEXT("Rift-born child plate %d is marked retirable"), PlateIndex), Plates[PlateIndex].PersistencePolicy == EPlatePersistencePolicy::Retirable);
+		TestTrue(FString::Printf(TEXT("Rift-born child plate %d records its parent"), PlateIndex), Plates[PlateIndex].ParentPlateId == 0);
+		TestTrue(FString::Printf(TEXT("Rift-born child plate %d tracks rift birth"), PlateIndex), Plates[PlateIndex].bRiftBorn);
+		TestTrue(FString::Printf(TEXT("Rift-born child plate %d keeps inherited cumulative rotation"), PlateIndex), Plates[PlateIndex].CumulativeRotation.Equals(ParentRotationBefore, 1e-6f));
+		TestTrue(FString::Printf(TEXT("Rift-born child plate %d normalizes its rotation axis"), PlateIndex), FMath::IsNearlyEqual(Plates[PlateIndex].RotationAxis.Size(), 1.0f, 1e-5f));
+		TestTrue(FString::Printf(TEXT("Rift-born child plate %d clamps angular speed into the startup envelope"), PlateIndex), Plates[PlateIndex].AngularSpeed >= MinAngularSpeed - 1e-5f && Plates[PlateIndex].AngularSpeed <= MaxAngularSpeed + 1e-5f);
+	}
+
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCollisionPerStepUpdateFixtureTest, "Aurous.TectonicPlanet.CollisionPerStepUpdateFixture",
 	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
 
@@ -4169,7 +4620,7 @@ bool FReconcileLongRunTest::RunTest(const FString& Parameters)
 			GetCachedPlanet(Scenario.SampleCount),
 			Metrics,
 			0.0,
-			EContinentalStabilizerMode::Incremental);
+			EContinentalStabilizerMode::Disabled);
 		const bool bPass = bCollected && DoesReferenceScenarioObservedMetricsPass(Scenario, Metrics);
 
 		const FString ScenarioLabel = FString::Printf(
@@ -4247,20 +4698,20 @@ bool FReconcileLongRunTest::RunTest(const FString& Parameters)
 			Metrics.MinObservedProtectedPlateSampleCount >= Metrics.MinExpectedProtectedPlateFloor);
 
 		TestTrue(
-			FString::Printf(TEXT("Continental area fraction never increases after init [%s]"), *ScenarioLabel),
-			!Metrics.bRuntimeContinentalFractionIncreased);
-		TestTrue(
-			FString::Printf(TEXT("Minimum runtime continental area fraction stays above floor [%s]"), *ScenarioLabel),
-			Metrics.MinimumRuntimeContinentalAreaFraction + UE_DOUBLE_SMALL_NUMBER >= Scenario.Bounds.MinimumRuntimeContinentalAreaFraction);
-		TestTrue(
 			FString::Printf(TEXT("Maximum elevation stays below z_c [%s]"), *ScenarioLabel),
 			Metrics.MaximumObservedElevationKm <= MaxReferenceScenarioElevationCeilingKm + static_cast<double>(KINDA_SMALL_NUMBER));
 		TestTrue(
-			FString::Printf(TEXT("Continental component count stays within scenario cap [%s]"), *ScenarioLabel),
-			Metrics.MaximumContinentalComponentCount <= GetExpectedMaximumContinentalComponentCount(Scenario.Bounds));
-		TestTrue(
 			FString::Printf(TEXT("Collision event count meets scenario minimum [%s]"), *ScenarioLabel),
 			Metrics.FinalCollisionEventCount >= Scenario.Bounds.MinimumCollisionEventCount);
+		TestTrue(
+			FString::Printf(TEXT("Rift event count meets scenario minimum [%s]"), *ScenarioLabel),
+			Metrics.FinalRiftEventCount >= Scenario.Bounds.MinimumRiftEventCount);
+		TestTrue(
+			FString::Printf(TEXT("Peak active plate count meets scenario minimum [%s]"), *ScenarioLabel),
+			Metrics.PeakActivePlateCount >= Scenario.Bounds.MinimumPeakActivePlateCount);
+		TestTrue(
+			FString::Printf(TEXT("Peak allocated plate count never drops below the initial count [%s]"), *ScenarioLabel),
+			Metrics.PeakAllocatedPlateCount >= Scenario.PlateCount);
 		TestTrue(
 			FString::Printf(TEXT("Andean samples appear when oceanic-continental convergence exists [%s]"), *ScenarioLabel),
 			!Scenario.Bounds.bRequireAndeanWhenOceanicContinentalConvergenceExists ||

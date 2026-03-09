@@ -29,6 +29,12 @@ namespace
 
 	bool TryParseContinentalStabilizerMode(const FString& Value, EContinentalStabilizerMode& OutMode)
 	{
+		if (Value.Equals(TEXT("Disabled"), ESearchCase::IgnoreCase))
+		{
+			OutMode = EContinentalStabilizerMode::Disabled;
+			return true;
+		}
+
 		if (Value.Equals(TEXT("Legacy"), ESearchCase::IgnoreCase) ||
 			Value.Equals(TEXT("Incremental"), ESearchCase::IgnoreCase) ||
 			Value.Equals(TEXT("Shadow"), ESearchCase::IgnoreCase))
@@ -44,6 +50,8 @@ namespace
 	{
 		switch (Mode)
 		{
+		case EContinentalStabilizerMode::Disabled:
+			return TEXT("Disabled");
 		case EContinentalStabilizerMode::Incremental:
 		case EContinentalStabilizerMode::Legacy:
 		case EContinentalStabilizerMode::Shadow:
@@ -89,11 +97,11 @@ int32 UTectonicInitCommandlet::Main(const FString& Params)
 	FString ScenarioName;
 	FParse::Value(*Params, TEXT("Scenario="), ScenarioName);
 
-	EContinentalStabilizerMode StabilizerMode = EContinentalStabilizerMode::Incremental;
+	EContinentalStabilizerMode StabilizerMode = EContinentalStabilizerMode::Disabled;
 	FString StabilizerModeValue;
 	if (FParse::Value(*Params, TEXT("StabilizerMode="), StabilizerModeValue) && !TryParseContinentalStabilizerMode(StabilizerModeValue, StabilizerMode))
 	{
-		UE_LOG(LogTemp, Error, TEXT("Unknown stabilizer mode '%s'. Expected Incremental (Legacy and Shadow remain accepted aliases)."), *StabilizerModeValue);
+		UE_LOG(LogTemp, Error, TEXT("Unknown stabilizer mode '%s'. Expected Disabled or Incremental (Legacy and Shadow remain accepted aliases)."), *StabilizerModeValue);
 		return 1;
 	}
 
@@ -168,7 +176,7 @@ int32 UTectonicInitCommandlet::Main(const FString& Params)
 					Display,
 					TEXT("%s stabilizer_mode=%s sweep=true"),
 					*FormatReferenceScenarioSummary(SummaryScenario, Metrics, bPass),
-					ContinentalStabilizerModeToString(EContinentalStabilizerMode::Incremental));
+					ContinentalStabilizerModeToString(EContinentalStabilizerMode::Disabled));
 				continue;
 			}
 

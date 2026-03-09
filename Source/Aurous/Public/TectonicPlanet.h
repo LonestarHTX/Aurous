@@ -45,6 +45,7 @@ enum class EPlatePersistencePolicy : uint8
 UENUM()
 enum class EContinentalStabilizerMode : uint8
 {
+	Disabled,
 	Legacy,
 	Incremental,
 	Shadow
@@ -158,6 +159,8 @@ struct FReconcilePhaseTimings
 	double Phase7TerraneMs = 0.0;
 	double Phase8CollisionMs = 0.0;
 	double Phase8PostCollisionRefreshMs = 0.0;
+	double Phase10RiftingMs = 0.0;
+	double Phase10PostRiftRefreshMs = 0.0;
 	double ContinentalStabilizerMs = 0.0;
 	double StabilizerPromoteToMinimumMs = 0.0;
 	double StabilizerBuildComponentsMs = 0.0;
@@ -200,6 +203,9 @@ struct FPlate
 	TArray<int32> InteriorTriangles;
 	TArray<int32> BoundaryTriangles;
 	EPlatePersistencePolicy PersistencePolicy = EPlatePersistencePolicy::Protected;
+	int32 ParentPlateId = INDEX_NONE;
+	int32 BirthReconcileOrdinal = 0;
+	bool bRiftBorn = false;
 	FVector IdentityAnchorDirection = FVector::ForwardVector;
 	int32 InitialSampleCount = 0;
 	FVector CanonicalCenterDirection = FVector::ForwardVector;
@@ -276,6 +282,8 @@ public:
 	int32 GetActiveTerraneCount() const { return ActiveTerraneCount; }
 	int32 GetMergedTerraneCount() const { return MergedTerraneCount; }
 	int32 GetCollisionEventCount() const { return CollisionEventCount; }
+	int32 GetRiftEventCount() const { return RiftEventCount; }
+	int32 GetActivePlateCount() const;
 	int32 GetHimalayanSampleCount() const { return HimalayanSampleCount; }
 	int32 GetPendingCollisionSampleCount() const { return PendingCollisionSampleCount; }
 	float GetMaxSubductionDistanceKm() const { return MaxSubductionDistanceKm; }
@@ -291,7 +299,7 @@ public:
 	void SetBoundaryConfidenceThreshold(float InValue) { BoundaryConfidenceThreshold = FMath::Max(0.0f, InValue); }
 	int32 GetLastGapSampleCount() const { return LastGapSampleCount; }
 	EContinentalStabilizerMode GetContinentalStabilizerMode() const { return ContinentalStabilizerMode; }
-	void SetContinentalStabilizerMode(const EContinentalStabilizerMode InMode) { ContinentalStabilizerMode = (InMode == EContinentalStabilizerMode::Incremental) ? InMode : EContinentalStabilizerMode::Incremental; }
+	void SetContinentalStabilizerMode(const EContinentalStabilizerMode InMode) { ContinentalStabilizerMode = InMode; }
 	int32 GetLastOverlapSampleCount() const { return LastOverlapSampleCount; }
 	double GetTimestepDurationYears() const { return TimestepDurationYears; }
 	double GetTimestepDurationMy() const { return TimestepDurationMy; }
@@ -338,6 +346,17 @@ private:
 		double CollisionAreaKm2 = 0.0;
 		float CollisionRadiusKm = 0.0f;
 		float MeanConvergenceSpeedMmPerYear = 0.0f;
+	};
+	struct FRiftEventRecord
+	{
+		int32 ParentPlateId = INDEX_NONE;
+		TArray<int32> ChildPlateIds;
+		int32 ReconcileOrdinal = -1;
+		int32 NumChildren = 0;
+		double ParentAreaKm2 = 0.0;
+		double ContinentalFraction = 0.0;
+		double Lambda = 0.0;
+		double Probability = 0.0;
 	};
 
 	void GenerateFibonacciSphere(int32 N);
@@ -410,6 +429,26 @@ private:
 		TArray<uint8>* InOutDirtyPlateFlags = nullptr);
 	void RefreshCanonicalStateAfterCollision(TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* InOutDirtyPlateFlags);
 	void RefreshCanonicalStateAfterCollision(TArray<FCanonicalSample>& InOutSamples);
+	bool ApplyPlateRiftingEventsForSamples(
+		TArray<FCanonicalSample>& InOutSamples,
+		TArray<uint8>* OutDirtyPlateFlags = nullptr,
+		double* OutRefreshSeconds = nullptr);
+	bool ApplyNextPlateRiftEventForSamples(TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* OutDirtyPlateFlags = nullptr);
+	bool ApplyPlateRiftEventToPlateForSamples(
+		int32 ParentPlateId,
+		TArray<FCanonicalSample>& InOutSamples,
+		TArray<uint8>* OutDirtyPlateFlags = nullptr,
+		int32 ForcedChildCount = INDEX_NONE,
+		int32 ForcedEventSeed = INDEX_NONE);
+	bool ComputePlateRiftTriggerMetricsForSamples(
+		const TArray<FCanonicalSample>& InSamples,
+		int32 PlateId,
+		int64 ElapsedStepCount,
+		double& OutContinentalFraction,
+		double& OutAreaKm2,
+		double& OutLambda,
+		double& OutProbability) const;
+	void ClearSubductionFieldsForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr);
 	void UpdateSubductionFieldsForSamples(TArray<FCanonicalSample>& InOutSamples);
 	void RefreshSubductionMetricsFromCarriedSamples();
 	void RefreshTerraneMetrics();
@@ -442,6 +481,7 @@ private:
 	TArray<FPlate> Plates;
 	TArray<FTerraneRecord> TerraneRecords;
 	TArray<FCollisionEventRecord> CollisionEvents;
+	TArray<FRiftEventRecord> RiftEvents;
 	TSet<uint64> CollisionHistoryKeys;
 	mutable TUniquePtr<FSpatialQueryData> SpatialQueryData;
 
@@ -451,8 +491,10 @@ private:
 	double ReconcileDisplacementThreshold = 0.0;
 	double MaxAngularDisplacementSinceReconcile = 0.0;
 	int64 TimestepCounter = 0;
+	int64 LastReconcileStepOrdinal = 0;
 	int32 ReconcileCount = 0;
 	int32 NextTerraneId = 0;
+	int32 PlateInitializationSeed = 42;
 	bool bReconcileTriggeredLastStep = false;
 	int32 BoundarySampleCount = 0;
 	double BoundaryMeanDepthHops = 0.0;
@@ -473,6 +515,7 @@ private:
 	int32 ActiveTerraneCount = 0;
 	int32 MergedTerraneCount = 0;
 	int32 CollisionEventCount = 0;
+	int32 RiftEventCount = 0;
 	int32 HimalayanSampleCount = 0;
 	int32 PendingCollisionSampleCount = 0;
 	float MaxSubductionDistanceKm = 0.0f;
@@ -490,7 +533,7 @@ private:
 	double MinContinentalAreaFraction = 0.25;
 	double MaxContinentalAreaFraction = 0.40;
 	double MinContinentalPlateFraction = 0.15;
-	EContinentalStabilizerMode ContinentalStabilizerMode = EContinentalStabilizerMode::Incremental;
+	EContinentalStabilizerMode ContinentalStabilizerMode = EContinentalStabilizerMode::Disabled;
 	FReconcilePhaseTimings LastReconcileTimings;
 
 	static constexpr float OceanicDampeningRateMmPerYear = 0.04f;
@@ -510,6 +553,10 @@ private:
 	static constexpr float MaxContinentalElevationKm = 10.0f;
 	static constexpr float FoldBlendAtMaxSpeed = 0.2f;
 	static constexpr float SlabPullAxisMaxDegreesPerStep = 0.25f;
+	static constexpr float BaseRiftLambdaPerTimestep = 0.35f;
+	static constexpr float RiftWarpAmplitude = 0.15f;
+	static constexpr float RiftNoiseFrequency = 3.0f;
+	static constexpr float RiftDivergenceSpeedScale = 0.25f;
 
 #if WITH_DEV_AUTOMATION_TESTS
 	friend struct FTectonicPlanetTestAccess;
