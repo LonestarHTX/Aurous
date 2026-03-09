@@ -51,6 +51,14 @@ enum class EContinentalStabilizerMode : uint8
 	Shadow
 };
 
+UENUM()
+enum class ETectonicBenchmarkMode : uint8
+{
+	Full,
+	ScenarioCore,
+	PaperCore
+};
+
 // One sample point on the canonical sphere.
 struct FCanonicalSample
 {
@@ -151,6 +159,10 @@ struct FReconcilePhaseTimings
 	double Phase6MembershipMs = 0.0;
 	double Phase6SanitizeOwnershipMs = 0.0;
 	double Phase6PersistenceMs = 0.0;
+	double Phase6InvalidPlateRepairMs = 0.0;
+	double Phase6SanitizePassMs = 0.0;
+	double Phase6ConnectivityOnlyMs = 0.0;
+	double Phase6ProtectedRescueMs = 0.0;
 	double Phase6RebuildMembershipMs = 0.0;
 	double Phase6RebuildCarriedMs = 0.0;
 	double Phase6ClassifyTrianglesMs = 0.0;
@@ -186,9 +198,30 @@ struct FReconcilePhaseTimings
 	int32 DivergentGapSamples = 0;
 	int32 OverlapSamples = 0;
 	int32 Phase2FastPathResolvedSamples = 0;
+	int32 Phase2FastPathAttemptSamples = 0;
 	int32 Phase2FullQuerySamples = 0;
+	int64 Phase2TotalCapCandidates = 0;
+	int32 Phase2MaxCapCandidates = 0;
+	int32 Phase6InvalidPlateRepairSampleCount = 0;
+	int32 Phase6SanitizeMutationCount = 0;
+	int32 Phase6ConnectivityMutationCount = 0;
+	int32 Phase6ProtectedRescueMutationCount = 0;
 	int32 Phase6SpatialDirtyPlateCount = 0;
 	int32 Phase6SpatialRebuiltPlateCount = 0;
+	int32 Phase9OverridingSeedCount = 0;
+	int32 Phase9SubductingSeedCount = 0;
+	int32 Phase9SeedPlateCount = 0;
+	int32 Phase9TouchedSampleCount = 0;
+	int32 RefreshEventScanCallCount = 0;
+	int32 RefreshFinalizeCallCount = 0;
+	int32 RefreshLocalizedCallCount = 0;
+	int32 RefreshFullFallbackCallCount = 0;
+	int32 RefreshMaxDirtyPlateCount = 0;
+	int32 RefreshMaxDirtySampleCount = 0;
+	int32 RefreshMaxDirtyTriangleCount = 0;
+	int32 RefreshMaxJournalDirtySampleCount = 0;
+	int32 RefreshMaxHaloSampleCount = 0;
+	int32 RefreshMaxDirtyFrontierSampleCount = 0;
 };
 
 struct FPlate
@@ -252,6 +285,8 @@ public:
 
 	// Spatial query infrastructure (rebuilt at reconciliation start; lazily rebuilt on demand if dirty).
 	void RebuildSpatialQueryData();
+	int32 GetLastSpatialDirtyPlateCount() const;
+	int32 GetLastSpatialRebuiltPlateCount() const;
 	FContainmentQueryResult QueryContainment(const FVector& Position) const;
 	bool GetPlateSoupTriangleAndVertexCounts(int32 PlateId, int32& OutTriangleCount, int32& OutVertexCount) const;
 	bool GetPlateSoupRotatedVertex(int32 PlateId, int32 CanonicalSampleIndex, FVector& OutRotatedPosition) const;
@@ -300,6 +335,33 @@ public:
 	int32 GetLastGapSampleCount() const { return LastGapSampleCount; }
 	EContinentalStabilizerMode GetContinentalStabilizerMode() const { return ContinentalStabilizerMode; }
 	void SetContinentalStabilizerMode(const EContinentalStabilizerMode InMode) { ContinentalStabilizerMode = InMode; }
+	ETectonicBenchmarkMode GetBenchmarkMode() const { return BenchmarkMode; }
+	void SetBenchmarkMode(const ETectonicBenchmarkMode InMode) { BenchmarkMode = InMode; }
+	bool GetEnableConnectivityEnforcement() const { return bEnableConnectivityEnforcement; }
+	void SetEnableConnectivityEnforcement(const bool bInEnable) { bEnableConnectivityEnforcement = bInEnable; }
+	bool GetEnablePhase6OwnershipRepair() const { return bEnablePhase6OwnershipRepair; }
+	void SetEnablePhase6OwnershipRepair(const bool bInEnable) { bEnablePhase6OwnershipRepair = bInEnable; }
+	bool GetValidateScopedP6Scans() const { return bValidateScopedP6Scans; }
+	void SetValidateScopedP6Scans(const bool bInEnable) { bValidateScopedP6Scans = bInEnable; }
+	bool GetLogP6MutationDiagnostics() const { return bLogP6MutationDiagnostics; }
+	void SetLogP6MutationDiagnostics(const bool bInEnable) { bLogP6MutationDiagnostics = bInEnable; }
+	bool GetTrackP6DisabledFragments() const { return bTrackP6DisabledFragments; }
+	void SetTrackP6DisabledFragments(const bool bInEnable)
+	{
+		bTrackP6DisabledFragments = bInEnable;
+		if (!bInEnable)
+		{
+			PreviousP6FragmentDiagnostics.Reset();
+		}
+	}
+	bool GetLogP6FragmentMembers() const { return bLogP6FragmentMembers; }
+	void SetLogP6FragmentMembers(const bool bInEnable) { bLogP6FragmentMembers = bInEnable; }
+	bool GetRequireP3ContenderSupport() const { return bRequireP3ContenderSupport; }
+	void SetRequireP3ContenderSupport(const bool bInEnable) { bRequireP3ContenderSupport = bInEnable; }
+	bool GetPaperSimpleOwnership() const { return bPaperSimpleOwnership; }
+	void SetPaperSimpleOwnership(const bool bInEnable) { bPaperSimpleOwnership = bInEnable; }
+	void SetP3P5TraceSampleIndices(const TArray<int32>& InSampleIndices) { P3P5TraceSampleIndices = InSampleIndices; }
+	void SetP3P5TraceReferenceDirections(const TArray<FVector>& InDirections) { P3P5TraceReferenceDirections = InDirections; }
 	int32 GetLastOverlapSampleCount() const { return LastOverlapSampleCount; }
 	double GetTimestepDurationYears() const { return TimestepDurationYears; }
 	double GetTimestepDurationMy() const { return TimestepDurationMy; }
@@ -359,6 +421,37 @@ private:
 		double Probability = 0.0;
 	};
 
+	struct FCollisionPairCandidate
+	{
+		int32 TerraneIdA = INDEX_NONE;
+		int32 TerraneIdB = INDEX_NONE;
+		int32 DonorTerraneId = INDEX_NONE;
+		int32 ReceiverTerraneId = INDEX_NONE;
+		int32 DonorPlateId = INDEX_NONE;
+		int32 ReceiverPlateId = INDEX_NONE;
+		TArray<int32> DonorSampleIndices;
+		TArray<int32> FrontSampleIndices;
+		TArray<int32> TouchedPlateIds;
+		int32 ContactSampleCount = 0;
+		double ConvergenceSpeedSum = 0.0;
+		float MeanConvergenceSpeedMmPerYear = 0.0f;
+	};
+
+	struct FRefreshCanonicalStateOptions
+	{
+		enum class EMode : uint8
+		{
+			EventScan,
+			Finalize
+		};
+
+		EMode Mode = EMode::Finalize;
+		bool bRebuildCarriedWorkspaces = true;
+		bool bTopologyAlreadyFresh = false;
+		FReconcilePhaseTimings* InOutTimings = nullptr;
+		const TArray<int32>* InitialDirtySampleIndices = nullptr;
+	};
+
 	void GenerateFibonacciSphere(int32 N);
 	void BuildDelaunayTriangulation();
 	void BuildAdjacencyGraph();
@@ -366,6 +459,7 @@ private:
 	void RebuildCarriedSampleWorkspaces();
 	void RebuildCarriedSampleWorkspacesForSamples(const TArray<FCanonicalSample>& InSamples, const TArray<uint8>* DirtyPlateFlags = nullptr);
 	void InvalidateSpatialQueryData();
+	void ResizeSpatialPlateStateStorage(int32 NumPlates) const;
 	void BuildSpatialQueryDataInternal() const;
 	double UpdateSpatialCapsForCurrentRotationsInternal() const;
 	void EnsureSpatialQueryDataBuilt() const;
@@ -389,14 +483,78 @@ private:
 		const TArray<uint8>& GapFlags,
 		TArray<FCanonicalSample>& InOutSamples,
 		bool& bOutDivergentGapCreated) const;
+	struct FSanitizeMutationDiagnostics
+	{
+		int32 OverlapTriggerMutationCount = 0;
+		int32 GapTriggerMutationCount = 0;
+		int32 LowMarginTriggerMutationCount = 0;
+	};
+	struct FConnectivityMutationDiagnostics
+	{
+		int32 FragmentCount = 0;
+		int32 MaxFragmentSize = 0;
+		int32 SingletonFragmentCount = 0;
+		int32 TinyFragmentCount = 0;
+		int32 SmallFragmentCount = 0;
+		int32 MediumFragmentCount = 0;
+		int32 LargeFragmentCount = 0;
+	};
+	struct FP6MutationDiagnosticContext
+	{
+		const TArray<int32>* BaselinePlateIds = nullptr;
+		const TArray<uint8>* BaselineBoundaryFlags = nullptr;
+		const TArray<int32>* BaselineBoundaryHops = nullptr;
+		const TArray<FPhase2SampleState>* Phase2States = nullptr;
+		const TCHAR* Substage = nullptr;
+	};
+	struct FP6FragmentPersistenceRecord
+	{
+		int32 PlateId = INDEX_NONE;
+		uint64 Signature = 0;
+		int32 Size = 0;
+		int32 PersistenceSteps = 0;
+	};
+	struct FP3P5TraceResult
+	{
+		int32 SampleIndex = INDEX_NONE;
+		FVector Position = FVector::ZeroVector;
+		int32 PrevPlateId = INDEX_NONE;
+		int32 InputPlateId = INDEX_NONE;
+		float OwnershipMargin = 0.0f;
+		bool bBoundaryLike = false;
+		bool bUsedFastPath = false;
+		bool bFastPathResolved = false;
+		bool bFullQueryUsed = false;
+		bool bGapFallbackToCurrentOwner = false;
+		bool bPreviousOwnerStillContains = false;
+		bool bHysteresisRetainedPreviousOwner = false;
+		bool bContenderSupportRetainedPreviousOwner = false;
+		int32 CandidatePlateId = INDEX_NONE;
+		int32 AssignedAfterP3 = INDEX_NONE;
+		int32 AssignedAfterP5 = INDEX_NONE;
+		int32 NumCapCandidates = 0;
+		int32 NumContainingPlates = 0;
+		int32 PreviousStepPrevOwnerSupportCount = 0;
+		int32 PreviousStepContenderSupportCount = 0;
+		FString PreviousStepNeighborSummary;
+		FString CandidateSummary;
+		FString AssignmentPath;
+	};
 	void RunBoundaryLikeLocalOwnershipSanitizePass(
 		const TArray<FPhase2SampleState>& Phase2States,
 		TArray<FCanonicalSample>& InOutSamples,
 		int32 NumIterations,
-		const TArray<uint8>* SeedSampleFlags = nullptr) const;
+		const TArray<uint8>* SeedSampleFlags = nullptr,
+		int32* OutMutatedSampleCount = nullptr,
+		FSanitizeMutationDiagnostics* OutDiagnostics = nullptr,
+		TArray<uint8>* OutDirtyPlateFlags = nullptr,
+		TArray<uint8>* OutProtectedPlateLossFlags = nullptr,
+		TArray<int32>* InOutNonGapCountsByPlate = nullptr,
+		TArray<TArray<int32>>* InOutSampleIndicesByPlate = nullptr,
+		const FP6MutationDiagnosticContext* MutationDiagnostics = nullptr) const;
 	// Pre-M5 invariant: non-gap ownership for each plate must remain connected until rifting exists.
-	void EnforceConnectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr) const;
-	bool RescueProtectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr);
+	void EnforceConnectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr, int32* OutMutatedSampleCount = nullptr, FConnectivityMutationDiagnostics* OutDiagnostics = nullptr, TArray<uint8>* OutDirtyPlateFlags = nullptr, TArray<uint8>* OutProtectedPlateLossFlags = nullptr, TArray<int32>* InOutNonGapCountsByPlate = nullptr, TArray<TArray<int32>>* InOutSampleIndicesByPlate = nullptr, const FP6MutationDiagnosticContext* MutationDiagnostics = nullptr) const;
+	bool RescueProtectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr, int32* OutMutatedSampleCount = nullptr, TArray<uint8>* OutDirtyPlateFlags = nullptr, TArray<uint8>* OutProtectedPlateLossFlags = nullptr, TArray<int32>* InOutNonGapCountsByPlate = nullptr, TArray<TArray<int32>>* InOutSampleIndicesByPlate = nullptr, const FP6MutationDiagnosticContext* MutationDiagnostics = nullptr);
 	void RebuildPlateMembershipFromSamples(const TArray<FCanonicalSample>& InSamples, const TArray<uint8>* DirtyPlateFlags = nullptr);
 	void UpdatePlateCanonicalCentersFromSamples(const TArray<FCanonicalSample>& InSamples, const TArray<uint8>* DirtyPlateFlags = nullptr);
 	bool IsPlateActive(int32 PlateId) const;
@@ -405,6 +563,11 @@ private:
 	int32 GetPersistentPlateFloorSamples(int32 PlateId) const;
 	int32 FindNearestPlateByCap(const FVector& Direction) const;
 	float ComputeOwnershipMarginFromCaps(const FVector& Direction) const;
+	void ComputeP6BoundaryDiagnosticsForSamples(const TArray<FCanonicalSample>& InSamples, TArray<uint8>& OutBoundaryFlags, TArray<int32>& OutBoundaryHops) const;
+	void LogP6MutationDiagnosticEvent(const FP6MutationDiagnosticContext& Context, int32 SampleIndex, int32 OldPlateId, int32 NewPlateId) const;
+	void UpdateP6DisabledFragmentDiagnostics(const TArray<FCanonicalSample>& InSamples);
+	void LogP3P5TraceSelection(const TArray<FCanonicalSample>& InSamples, const TArray<int32>& TraceSampleIndices, const TArray<int32>* SourceReferenceIndices = nullptr) const;
+	void LogP3P5PostPhase5Trace(const TArray<FCanonicalSample>& ReadSamples, const TArray<FCanonicalSample>& InSamples, const TArray<FP3P5TraceResult>& TraceResults) const;
 	bool ResolveDominantConvergentInteractionForSample(
 		const TArray<FCanonicalSample>& InSamples,
 		int32 SampleIndex,
@@ -417,29 +580,55 @@ private:
 		const TArray<FPhase2SampleState>& Phase2States,
 		TArray<FCanonicalSample>& InOutSamples,
 		TArray<uint8>* OutDirtyPlateFlags,
-		double* OutRefreshSeconds = nullptr);
+		double* OutRefreshSeconds = nullptr,
+		FReconcilePhaseTimings* InOutTimings = nullptr);
 	bool ApplyNextContinentalCollisionEventForSamples(
 		TArray<FCanonicalSample>& InOutSamples,
 		TSet<int32>* InOutTerranesUsedThisReconcile = nullptr,
 		TArray<uint8>* OutDirtyPlateFlags = nullptr,
 		TArray<int32>* InOutBestCollisionDonorTerraneIds = nullptr);
+	bool BuildCollisionPairCandidatesForSamples(
+		const TArray<FCanonicalSample>& InSamples,
+		const TSet<int32>* InTerranesUsedThisReconcile,
+		TArray<FCollisionPairCandidate>& OutPairCandidates) const;
+	bool ApplyCollisionPairCandidateForSamples(
+		const FCollisionPairCandidate& Pair,
+		TArray<FCanonicalSample>& InOutSamples,
+		TSet<int32>* InOutTerranesUsedThisReconcile,
+		TArray<uint8>* OutDirtyPlateFlags,
+		TArray<int32>* InOutBestCollisionDonorTerraneIds,
+		TArray<int32>* OutChangedSampleIndices = nullptr);
 	void RefreshCanonicalStateAfterCollision(
 		const TArray<FPhase2SampleState>& Phase2States,
 		TArray<FCanonicalSample>& InOutSamples,
 		TArray<uint8>* InOutDirtyPlateFlags = nullptr);
+	void RefreshCanonicalStateAfterCollision(
+		const TArray<FPhase2SampleState>& Phase2States,
+		TArray<FCanonicalSample>& InOutSamples,
+		TArray<uint8>* InOutDirtyPlateFlags,
+		const FRefreshCanonicalStateOptions& Options);
+	void RefreshCanonicalStateAfterCollision(
+		TArray<FCanonicalSample>& InOutSamples,
+		TArray<uint8>* InOutDirtyPlateFlags,
+		const FRefreshCanonicalStateOptions& Options);
 	void RefreshCanonicalStateAfterCollision(TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* InOutDirtyPlateFlags);
 	void RefreshCanonicalStateAfterCollision(TArray<FCanonicalSample>& InOutSamples);
 	bool ApplyPlateRiftingEventsForSamples(
 		TArray<FCanonicalSample>& InOutSamples,
 		TArray<uint8>* OutDirtyPlateFlags = nullptr,
-		double* OutRefreshSeconds = nullptr);
-	bool ApplyNextPlateRiftEventForSamples(TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* OutDirtyPlateFlags = nullptr);
+		double* OutRefreshSeconds = nullptr,
+		FReconcilePhaseTimings* InOutTimings = nullptr);
+	bool ApplyNextPlateRiftEventForSamples(
+		TArray<FCanonicalSample>& InOutSamples,
+		TArray<uint8>* OutDirtyPlateFlags = nullptr,
+		TArray<int32>* OutChangedSampleIndices = nullptr);
 	bool ApplyPlateRiftEventToPlateForSamples(
 		int32 ParentPlateId,
 		TArray<FCanonicalSample>& InOutSamples,
 		TArray<uint8>* OutDirtyPlateFlags = nullptr,
 		int32 ForcedChildCount = INDEX_NONE,
-		int32 ForcedEventSeed = INDEX_NONE);
+		int32 ForcedEventSeed = INDEX_NONE,
+		TArray<int32>* OutChangedSampleIndices = nullptr);
 	bool ComputePlateRiftTriggerMetricsForSamples(
 		const TArray<FCanonicalSample>& InSamples,
 		int32 PlateId,
@@ -449,7 +638,7 @@ private:
 		double& OutLambda,
 		double& OutProbability) const;
 	void ClearSubductionFieldsForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr);
-	void UpdateSubductionFieldsForSamples(TArray<FCanonicalSample>& InOutSamples);
+	void UpdateSubductionFieldsForSamples(TArray<FCanonicalSample>& InOutSamples, FReconcilePhaseTimings* InOutTimings = nullptr);
 	void RefreshSubductionMetricsFromCarriedSamples();
 	void RefreshTerraneMetrics();
 	FTerraneRecord* FindTerraneRecordById(int32 TerraneId);
@@ -534,7 +723,19 @@ private:
 	double MaxContinentalAreaFraction = 0.40;
 	double MinContinentalPlateFraction = 0.15;
 	EContinentalStabilizerMode ContinentalStabilizerMode = EContinentalStabilizerMode::Disabled;
+	ETectonicBenchmarkMode BenchmarkMode = ETectonicBenchmarkMode::Full;
+	bool bEnableConnectivityEnforcement = true;
+	bool bEnablePhase6OwnershipRepair = true;
+	bool bValidateScopedP6Scans = false;
+	bool bLogP6MutationDiagnostics = false;
+	bool bTrackP6DisabledFragments = false;
+	bool bLogP6FragmentMembers = false;
+	bool bRequireP3ContenderSupport = true;
+	bool bPaperSimpleOwnership = false;
 	FReconcilePhaseTimings LastReconcileTimings;
+	TArray<FP6FragmentPersistenceRecord> PreviousP6FragmentDiagnostics;
+	TArray<int32> P3P5TraceSampleIndices;
+	TArray<FVector> P3P5TraceReferenceDirections;
 
 	static constexpr float OceanicDampeningRateMmPerYear = 0.04f;
 	static constexpr float OceanicTrenchElevationKm = -10.0f;

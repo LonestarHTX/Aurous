@@ -160,6 +160,26 @@ namespace
 			Planet.RebuildCarriedSampleWorkspacesForSamples(InSamples);
 		}
 
+		static void ClassifyTriangles(FTectonicPlanet& Planet, TArray<FCanonicalSample>& InOutSamples)
+		{
+			Planet.ClassifyTrianglesForSamples(InOutSamples);
+		}
+
+		static void RebuildSpatialQuery(FTectonicPlanet& Planet)
+		{
+			Planet.RebuildSpatialQueryData();
+		}
+
+		static int32 GetSpatialDirtyPlateCount(const FTectonicPlanet& Planet)
+		{
+			return Planet.GetLastSpatialDirtyPlateCount();
+		}
+
+		static int32 GetSpatialRebuiltPlateCount(const FTectonicPlanet& Planet)
+		{
+			return Planet.GetLastSpatialRebuiltPlateCount();
+		}
+
 		static void RebuildAdjacencyEdgeDistanceCache(FTectonicPlanet& Planet, const TArray<FCanonicalSample>& InSamples)
 		{
 			Planet.RebuildAdjacencyEdgeDistanceCache(InSamples);
@@ -283,6 +303,44 @@ namespace
 			TArray<uint8>& InOutDirtyPlateFlags)
 		{
 			Planet.RefreshCanonicalStateAfterCollision(InOutSamples, &InOutDirtyPlateFlags);
+		}
+
+		static void RefreshCanonicalEventScan(
+			FTectonicPlanet& Planet,
+			TArray<FCanonicalSample>& InOutSamples,
+			TArray<uint8>* InOutDirtyPlateFlags = nullptr)
+		{
+			FTectonicPlanet::FRefreshCanonicalStateOptions Options;
+			Options.Mode = FTectonicPlanet::FRefreshCanonicalStateOptions::EMode::EventScan;
+			Options.bRebuildCarriedWorkspaces = false;
+			Planet.RefreshCanonicalStateAfterCollision(InOutSamples, InOutDirtyPlateFlags, Options);
+		}
+
+		static void RefreshCanonicalEventScan(
+			FTectonicPlanet& Planet,
+			TArray<FCanonicalSample>& InOutSamples,
+			TArray<uint8>* InOutDirtyPlateFlags,
+			const TArray<int32>* InitialDirtySampleIndices,
+			FReconcilePhaseTimings& OutTimings)
+		{
+			FTectonicPlanet::FRefreshCanonicalStateOptions Options;
+			Options.Mode = FTectonicPlanet::FRefreshCanonicalStateOptions::EMode::EventScan;
+			Options.bRebuildCarriedWorkspaces = false;
+			Options.InOutTimings = &OutTimings;
+			Options.InitialDirtySampleIndices = InitialDirtySampleIndices;
+			Planet.RefreshCanonicalStateAfterCollision(InOutSamples, InOutDirtyPlateFlags, Options);
+		}
+
+		static void FinalizeDeferredRefresh(
+			FTectonicPlanet& Planet,
+			TArray<FCanonicalSample>& InOutSamples,
+			TArray<uint8>* InOutDirtyPlateFlags = nullptr)
+		{
+			FTectonicPlanet::FRefreshCanonicalStateOptions Options;
+			Options.Mode = FTectonicPlanet::FRefreshCanonicalStateOptions::EMode::Finalize;
+			Options.bRebuildCarriedWorkspaces = true;
+			Options.bTopologyAlreadyFresh = true;
+			Planet.RefreshCanonicalStateAfterCollision(InOutSamples, InOutDirtyPlateFlags, Options);
 		}
 
 		static void SetAreaMetrics(FTectonicPlanet& Planet, const double InAverageCellAreaKm2, const double InInitialMeanPlateAreaKm2)
@@ -558,6 +616,34 @@ namespace
 		FTectonicPlanetTestAccess::RebuildPlateMembership(Fixture.Planet, Fixture.Samples);
 		FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Fixture.Planet, Fixture.Samples);
 		FTectonicPlanetTestAccess::RebuildCarriedWorkspaces(Fixture.Planet, Fixture.Samples);
+	}
+
+	int32 CountOwnedSamplesForPlate(const TArray<FCanonicalSample>& Samples, const int32 PlateId)
+	{
+		int32 OwnedSampleCount = 0;
+		for (const FCanonicalSample& Sample : Samples)
+		{
+			OwnedSampleCount += (Sample.PlateId == PlateId) ? 1 : 0;
+		}
+		return OwnedSampleCount;
+	}
+
+	bool DoCarriedWorkspacesMatchOwnership(const FTectonicPlanet& Planet, const TArray<FCanonicalSample>& Samples)
+	{
+		for (const FPlate& Plate : FTectonicPlanetTestAccess::MutablePlates(const_cast<FTectonicPlanet&>(Planet)))
+		{
+			if (Plate.SampleIndices.Num() <= 0)
+			{
+				continue;
+			}
+
+			if (Plate.CarriedSamples.Num() != CountOwnedSamplesForPlate(Samples, Plate.Id))
+			{
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	bool IsPlateOwnershipConnected(const TArray<FCanonicalSample>& Samples, const TArray<TArray<int32>>& Adjacency, const int32 PlateId)
@@ -2856,6 +2942,115 @@ bool FRiftMotionAssignmentFixtureTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRiftSpatialGrowthDirtyFixtureTest, "Aurous.TectonicPlanet.RiftSpatialGrowthDirtyFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FRiftSpatialGrowthDirtyFixtureTest::RunTest(const FString& Parameters)
+{
+	FTectonicPlanet Planet;
+	TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+	TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
+	TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+	const int32 SamplesPerPlate = 256;
+	const int32 InitialPlateCount = 3;
+	const int32 TotalSamples = SamplesPerPlate * InitialPlateCount;
+	Samples.SetNum(TotalSamples);
+	Adjacency.SetNum(TotalSamples);
+	Plates.SetNum(InitialPlateCount);
+	for (int32 PlateIndex = 0; PlateIndex < InitialPlateCount; ++PlateIndex)
+	{
+		InitializeFixturePlate(Plates[PlateIndex], PlateIndex, FVector(0.2 * PlateIndex + 1.0, 0.1 * PlateIndex, 1.0).GetSafeNormal(), 0.02f);
+		Plates[PlateIndex].PersistencePolicy = (PlateIndex == 0) ? EPlatePersistencePolicy::Protected : EPlatePersistencePolicy::Retirable;
+		Plates[PlateIndex].InitialSampleCount = SamplesPerPlate;
+	}
+
+	BuildRingAdjacency(Adjacency, TotalSamples);
+	for (int32 SampleIndex = 0; SampleIndex < TotalSamples; ++SampleIndex)
+	{
+		const int32 PlateId = SampleIndex / SamplesPerPlate;
+		InitializeRiftFixtureSample(Samples[SampleIndex], SampleIndex, TotalSamples, PlateId, ECrustType::Continental);
+	}
+
+	FTectonicPlanetTestAccess::SetAreaMetrics(Planet, 10.0, static_cast<double>(SamplesPerPlate) * 10.0);
+	FTectonicPlanetTestAccess::SetPlateInitializationSeed(Planet, 12345);
+	FTectonicPlanetTestAccess::SetLastReconcileStepOrdinal(Planet, 0);
+	FTectonicPlanetTestAccess::RebuildAdjacencyEdgeDistanceCache(Planet, Samples);
+	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+	FTectonicPlanetTestAccess::ClassifyTriangles(Planet, Samples);
+	FTectonicPlanetTestAccess::RebuildSpatialQuery(Planet);
+
+	TestEqual(TEXT("Initial spatial rebuild only touches the original plates"), FTectonicPlanetTestAccess::GetSpatialRebuiltPlateCount(Planet), InitialPlateCount);
+
+	TestTrue(
+		TEXT("Forced growth rift applies on the first plate"),
+		FTectonicPlanetTestAccess::ApplyPlateRiftEventToPlate(Planet, 0, Samples, nullptr, 2, 7331));
+	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+	FTectonicPlanetTestAccess::ClassifyTriangles(Planet, Samples);
+	FTectonicPlanetTestAccess::RebuildSpatialQuery(Planet);
+
+	TestTrue(TEXT("Rift appends at least one new child plate"), Plates.Num() > InitialPlateCount);
+	TestTrue(
+		TEXT("Spatial rebuild after plate growth stays below all-plate rebuild"),
+		FTectonicPlanetTestAccess::GetSpatialRebuiltPlateCount(Planet) < Plates.Num());
+	TestTrue(
+		TEXT("Spatial dirty count after plate growth stays below all plates"),
+		FTectonicPlanetTestAccess::GetSpatialDirtyPlateCount(Planet) < Plates.Num());
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRiftDeferredFinalizeFixtureTest, "Aurous.TectonicPlanet.RiftDeferredFinalizeFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FRiftDeferredFinalizeFixtureTest::RunTest(const FString& Parameters)
+{
+	FRiftFixtureState Fixture;
+	InitializeSinglePlateRiftFixture(Fixture, 192);
+	TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Fixture.Planet);
+
+	TestTrue(TEXT("Initial carried workspaces match ownership"), DoCarriedWorkspacesMatchOwnership(Fixture.Planet, Fixture.Samples));
+
+	TArray<uint8> DirtyPlateFlags;
+	TestTrue(
+		TEXT("Forced rift event applies"),
+		FTectonicPlanetTestAccess::ApplyPlateRiftEventToPlate(Fixture.Planet, 0, Fixture.Samples, &DirtyPlateFlags, 3, 7331));
+	FTectonicPlanetTestAccess::RebuildPlateMembership(Fixture.Planet, Fixture.Samples);
+
+	int32 RiftBornPlateCount = 0;
+	for (int32 PlateIndex = 1; PlateIndex < Plates.Num(); ++PlateIndex)
+	{
+		if (Plates[PlateIndex].bRiftBorn)
+		{
+			++RiftBornPlateCount;
+			TestEqual(
+				FString::Printf(TEXT("Rift-born plate %d still has deferred carried samples"), PlateIndex),
+				Plates[PlateIndex].CarriedSamples.Num(),
+				0);
+		}
+	}
+
+	TestTrue(TEXT("Forced rift creates at least one child plate with deferred carried data"), RiftBornPlateCount > 0);
+
+	FTectonicPlanetTestAccess::FinalizeDeferredRefresh(Fixture.Planet, Fixture.Samples);
+
+	for (int32 PlateIndex = 1; PlateIndex < Plates.Num(); ++PlateIndex)
+	{
+		if (!Plates[PlateIndex].bRiftBorn)
+		{
+			continue;
+		}
+
+		TestTrue(
+			FString::Printf(TEXT("Finalize refresh repopulates carried samples for child plate %d"), PlateIndex),
+			Plates[PlateIndex].CarriedSamples.Num() > 0);
+	}
+
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCollisionPerStepUpdateFixtureTest, "Aurous.TectonicPlanet.CollisionPerStepUpdateFixture",
 	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
 
@@ -3310,6 +3505,8 @@ bool FCollisionDisjointPairsFixtureTest::RunTest(const FString& Parameters)
 	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
 	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
 	FTectonicPlanetTestAccess::DetectTerranes(Planet, Samples);
+	FTectonicPlanet BatchedPlanet = Planet;
+	TArray<FCanonicalSample> BatchedSamples = Samples;
 	TSet<int32> TerranesUsedThisReconcile;
 	TArray<uint8> FirstDirtyPlateFlags;
 	const bool bAppliedFirst = FTectonicPlanetTestAccess::ApplyNextContinentalCollision(Planet, Samples, TerranesUsedThisReconcile, &FirstDirtyPlateFlags);
@@ -3334,6 +3531,10 @@ bool FCollisionDisjointPairsFixtureTest::RunTest(const FString& Parameters)
 		}
 	}
 
+	TArray<uint8> BatchedDirtyPlateFlags;
+	const bool bAppliedBatched = FTectonicPlanetTestAccess::ApplyContinentalCollisions(BatchedPlanet, BatchedSamples, BatchedDirtyPlateFlags);
+	TestTrue(TEXT("Batched collision path applies the disjoint events"), bAppliedBatched);
+
 	TestEqual(TEXT("Two disjoint terrane pairs can both collide in one reconcile"), Planet.GetCollisionEventCount(), 2);
 	TestEqual(TEXT("Lower terrane id donor of first pair transfers to receiver plate"), Samples[0].PlateId, 1);
 	TestEqual(TEXT("Lower terrane id donor of second pair transfers to receiver plate"), Samples[2].PlateId, 3);
@@ -3341,6 +3542,24 @@ bool FCollisionDisjointPairsFixtureTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Sequential refresh rebuilds the first receiver plate before the second event"), Planet.GetPlates()[1].SampleIndices.Num() >= 2);
 	TestTrue(TEXT("Sequential refresh rebuilds the second receiver plate before reconcile ends"), Planet.GetPlates()[3].SampleIndices.Num() >= 2);
 	TestTrue(TEXT("Dirty set covers every plate touched by the sequential events"), DirtyPlateFlags[0] != 0 && DirtyPlateFlags[1] != 0 && DirtyPlateFlags[2] != 0 && DirtyPlateFlags[3] != 0);
+	TestEqual(TEXT("Batched disjoint collisions record both pair histories"), FTectonicPlanetTestAccess::GetCollisionHistoryKeyCount(BatchedPlanet), 2);
+	TestEqual(TEXT("Batched path records the same number of collision events"), BatchedPlanet.GetCollisionEventCount(), Planet.GetCollisionEventCount());
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		TestEqual(FString::Printf(TEXT("Batched collision preserves final owner [%d]"), SampleIndex), BatchedSamples[SampleIndex].PlateId, Samples[SampleIndex].PlateId);
+		TestEqual(FString::Printf(TEXT("Batched collision preserves previous owner [%d]"), SampleIndex), BatchedSamples[SampleIndex].PrevPlateId, Samples[SampleIndex].PrevPlateId);
+		TestTrue(
+			FString::Printf(TEXT("Batched collision preserves uplift [%d]"), SampleIndex),
+			FMath::IsNearlyEqual(BatchedSamples[SampleIndex].Elevation, Samples[SampleIndex].Elevation, KINDA_SMALL_NUMBER));
+		TestTrue(
+			FString::Printf(TEXT("Batched collision preserves collision distance [%d]"), SampleIndex),
+			FMath::IsNearlyEqual(BatchedSamples[SampleIndex].CollisionDistanceKm, Samples[SampleIndex].CollisionDistanceKm, KINDA_SMALL_NUMBER));
+		TestEqual(
+			FString::Printf(TEXT("Batched collision preserves collision opposing plate [%d]"), SampleIndex),
+			BatchedSamples[SampleIndex].CollisionOpposingPlateId,
+			Samples[SampleIndex].CollisionOpposingPlateId);
+	}
+	TestTrue(TEXT("Batched dirty set covers every touched plate"), BatchedDirtyPlateFlags[0] != 0 && BatchedDirtyPlateFlags[1] != 0 && BatchedDirtyPlateFlags[2] != 0 && BatchedDirtyPlateFlags[3] != 0);
 
 	return true;
 }
@@ -3477,6 +3696,88 @@ bool FCollisionRefreshFixtureTest::RunTest(const FString& Parameters)
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCollisionFrontAndRadiusFixtureTest, "Aurous.TectonicPlanet.CollisionFrontAndRadiusFixture",
 	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCollisionLocalizedRefreshJournalFixtureTest, "Aurous.TectonicPlanet.CollisionLocalizedRefreshJournalFixture",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FCollisionLocalizedRefreshJournalFixtureTest::RunTest(const FString& Parameters)
+{
+	FTectonicPlanet Planet;
+	TArray<FCanonicalSample>& Samples = FTectonicPlanetTestAccess::MutableSamples(Planet);
+	TArray<TArray<int32>>& Adjacency = FTectonicPlanetTestAccess::MutableAdjacency(Planet);
+	TArray<FPlate>& Plates = FTectonicPlanetTestAccess::MutablePlates(Planet);
+
+	Samples.SetNum(8);
+	Adjacency.SetNum(8);
+	Plates.SetNum(6);
+	InitializeFixturePlate(Plates[0], 0, FVector::UpVector);
+	InitializeFixturePlate(Plates[1], 1, FVector::RightVector);
+	InitializeFixturePlate(Plates[2], 2, -FVector::UpVector);
+	InitializeFixturePlate(Plates[3], 3, FVector::ForwardVector);
+	InitializeFixturePlate(Plates[4], 4, -FVector::RightVector);
+	InitializeFixturePlate(Plates[5], 5, -FVector::ForwardVector);
+	Plates[1].PersistencePolicy = EPlatePersistencePolicy::Retirable;
+	Plates[2].PersistencePolicy = EPlatePersistencePolicy::Retirable;
+	Plates[3].PersistencePolicy = EPlatePersistencePolicy::Retirable;
+	Plates[4].PersistencePolicy = EPlatePersistencePolicy::Retirable;
+	Plates[5].PersistencePolicy = EPlatePersistencePolicy::Retirable;
+
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		Samples[SampleIndex].Position = FVector(1.0, 0.15 * static_cast<double>(SampleIndex), 0.0).GetSafeNormal();
+		Samples[SampleIndex].CrustType = ECrustType::Continental;
+		Samples[SampleIndex].PrevPlateId = INDEX_NONE;
+		Samples[SampleIndex].Age = 10.0f + SampleIndex;
+	}
+
+	Samples[0].PlateId = 0;
+	Samples[1].PlateId = 0;
+	Samples[2].PlateId = 1;
+	Samples[3].PlateId = 0;
+	Samples[4].PlateId = 2;
+	Samples[5].PlateId = 3;
+	Samples[6].PlateId = 4;
+	Samples[7].PlateId = 5;
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		Samples[SampleIndex].PrevPlateId = Samples[SampleIndex].PlateId;
+	}
+
+	LinkBidirectional(Adjacency, 0, 1);
+	LinkBidirectional(Adjacency, 3, 4);
+
+	FTectonicPlanetTestAccess::RebuildPlateMembership(Planet, Samples);
+	FTectonicPlanetTestAccess::UpdatePlateCanonicalCenters(Planet, Samples);
+
+	// Simulate an event transfer: sample 3 moves from plate 0 to plate 1, then
+	// connectivity repair should push it onto neighboring plate 2.
+	Samples[3].PrevPlateId = 0;
+	Samples[3].PlateId = 1;
+
+	TArray<uint8> DirtyPlateFlags;
+	DirtyPlateFlags.Init(0, Plates.Num());
+	DirtyPlateFlags[0] = 1;
+	DirtyPlateFlags[1] = 1;
+	TArray<int32> InitialDirtySampleIndices;
+	InitialDirtySampleIndices.Add(3);
+	FReconcilePhaseTimings Timings;
+	FTectonicPlanetTestAccess::RefreshCanonicalEventScan(
+		Planet,
+		Samples,
+		&DirtyPlateFlags,
+		&InitialDirtySampleIndices,
+		Timings);
+
+	TestEqual(TEXT("Localized journal refresh carries the transferred sample through a net A->B->C ownership change"), Samples[3].PlateId, 2);
+	TestTrue(TEXT("Localized journal refresh widens the dirty plate set to the final owner"), DirtyPlateFlags[2] != 0);
+	TestEqual(TEXT("Localized journal refresh stays on the localized path"), Timings.RefreshLocalizedCallCount, 1);
+	TestEqual(TEXT("Localized journal refresh avoids the full fallback"), Timings.RefreshFullFallbackCallCount, 0);
+	TestEqual(TEXT("Net journal keeps one changed sample after cascading ownership changes"), Timings.RefreshMaxJournalDirtySampleCount, 1);
+	TestTrue(TEXT("Halo expansion stays local"), Timings.RefreshMaxHaloSampleCount > 0 && Timings.RefreshMaxHaloSampleCount < Samples.Num());
+	TestTrue(TEXT("Dirty frontier stays smaller than the full sample set"), Timings.RefreshMaxDirtyFrontierSampleCount > 0 && Timings.RefreshMaxDirtyFrontierSampleCount < Samples.Num());
+
+	return true;
+}
 
 bool FCollisionFrontAndRadiusFixtureTest::RunTest(const FString& Parameters)
 {
