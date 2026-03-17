@@ -1,10 +1,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "TectonicPlanet.h"
-#include "Styling/SlateColor.h"
 
 #if WITH_EDITOR
+
+#include "TectonicPlanetVisualization.h"
 #include "Widgets/SCompoundWidget.h"
 
 class ATectonicPlanetActor;
@@ -23,72 +23,39 @@ private:
 	ATectonicPlanetActor* FindActorInEditorSelection() const;
 	void SetSelectedActor(ATectonicPlanetActor* InActor);
 	void SyncPendingSettingsFromActor();
-	void ApplyPendingSettingsToActor(bool bApplyDebugModeOnly = false) const;
+	void RefreshMetrics();
+	ETectonicMapExportMode GetSelectedVisualizationMode() const;
+	void SelectVisualizationMode(ETectonicMapExportMode Mode);
+	bool EnsureSelectedActor(const TCHAR* ActionName) const;
 
-	FReply OnUseSelectedActorClicked();
-	FReply OnClearSelectedActorClicked();
+	FReply OnUseSelectedClicked();
+	FReply OnClearClicked();
 	FReply OnGenerateClicked();
-	FReply OnStartClicked();
-	FReply OnStopClicked();
 	FReply OnStep1Clicked();
 	FReply OnStep10Clicked();
-	FReply OnForceReconcileClicked();
-	FReply OnUpdateColorsClicked();
+	FReply OnStep50Clicked();
 	FReply OnExportMapsClicked();
-	EActiveTimerReturnType HandleMetricsActiveTimer(double CurrentTime, float DeltaTime);
+	FReply OnRefreshMetricsClicked();
+	void OnVisualizationModeChanged(TSharedPtr<FString> NewSelection, ESelectInfo::Type SelectInfo);
 
 	FText GetSelectedActorText() const;
+	FText GetCurrentStepText() const;
+	FText GetTimingText() const;
 	FText GetMetricsText() const;
-	FText GetExportHeightText() const;
-	FText GetSimulationStatusText() const;
-	FSlateColor GetSimulationStatusColor() const;
-
-	int32 DebugModeToIndex(uint8 InDebugModeValue) const;
-	uint8 IndexToDebugModeValue(int32 InIndex) const;
-	void InvalidateExportCache();
-	void UpdateMetricsActiveTimerRegistration();
-	bool BuildExportPixelCache(
-		int32 Width,
-		int32 Height,
-		const TArray<FCanonicalSample>& Samples,
-		const TArray<FDelaunayTriangle>& Triangles);
-	bool ExportMapsToDirectory(
-		const FString& OutputDirectory,
-		int32 Width,
-		int32 Height,
-		const TArray<FCanonicalSample>& Samples,
-		const TArray<FDelaunayTriangle>& Triangles) const;
-
-	struct FExportPixelSample
-	{
-		int32 TriangleIndex = INDEX_NONE;
-		FVector Barycentric = FVector::ZeroVector;
-		uint8 NearestVertexCorner = 0;
-		bool bValid = false;
-	};
 
 private:
 	TWeakObjectPtr<ATectonicPlanetActor> SelectedActor;
-
-	int32 PendingNumSamples = 500000;
-	int32 PendingNumPlates = 7;
+	int32 PendingSampleCount = 60000;
+	int32 PendingPlateCount = 7;
 	int32 PendingRandomSeed = 42;
-	float PendingSimulationRate = 10.0f;
-	int32 PendingDebugModeIndex = 0;
-	int32 PendingExportWidth = 2048;
-
-	TArray<FExportPixelSample> CachedExportPixelSamples;
-	int32 CachedExportWidth = 0;
-	int32 CachedExportHeight = 0;
-	int32 CachedExportSampleCount = 0;
-	int32 CachedExportTriangleCount = 0;
-	int32 CachedValidPixelCount = 0;
-	double LastStepCommandTime = -1.0;
-	TWeakPtr<FActiveTimerHandle> MetricsActiveTimerHandle;
-	TSharedPtr<STextBlock> MetricsTextBlock;
-
-	TArray<TSharedPtr<FString>> DebugModeOptions;
-	TSharedPtr<STextComboBox> DebugModeComboBox;
+	float PendingBoundaryWarpAmplitude = 0.2f;
+	float PendingContinentalFraction = 0.30f;
+	int32 PendingExportWidth = 4096;
+	int32 CachedCurrentStep = 0;
+	double CachedLastAdvanceStepMs = 0.0;
+	FText CachedMetricsText = FText::FromString(TEXT("No actor selected."));
+	TArray<TSharedPtr<FString>> VisualizationOptions;
+	TSharedPtr<STextComboBox> VisualizationComboBox;
 };
 
-#endif // WITH_EDITOR
+#endif

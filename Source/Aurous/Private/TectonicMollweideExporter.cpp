@@ -1,15 +1,14 @@
 #include "TectonicMollweideExporter.h"
 
-#include "Async/ParallelFor.h"
-#include "HAL/PlatformTime.h"
+#include "HAL/PlatformFileManager.h"
+#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "TectonicPlanet.h"
+#include "TectonicPlanetVisualization.h"
 
 #if WITH_EDITOR
-#include "HAL/PlatformFileManager.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
-#include "Misc/FileHelper.h"
 #include "Modules/ModuleManager.h"
 #endif
 
@@ -18,772 +17,548 @@ namespace
 	constexpr double MollweideSqrtTwo = 1.4142135623730950488;
 	constexpr double MollweideHalfWidth = 2.0 * MollweideSqrtTwo;
 	constexpr double MollweideHalfHeight = MollweideSqrtTwo;
-	constexpr double MollweideInverseEpsilon = 1e-12;
-	constexpr double MollweideEllipseTolerance = 1e-9;
-	const FColor ProjectionBackgroundColor(12, 12, 16);
-	const FColor UnresolvedFallbackColor(255, 0, 255);
-	const FColor OceanicCrustColor(0, 105, 148);
-	const FColor ContinentalCrustColor(139, 90, 43);
+	constexpr double RasterEpsilon = 1.0e-8;
 
-	struct FResolvedPixelSample
+	struct FProjectedSample
 	{
-		bool bResolved = false;
-		bool bFromNeighborProbe = false;
-		int32 TriangleIndex = INDEX_NONE;
-		int32 PlateId = INDEX_NONE;
-		FVector Barycentric = FVector::ZeroVector;
+		FVector2d Pixel = FVector2d::ZeroVector;
 	};
 
-	struct FRowExportStats
+	struct FRasterBuffers
 	{
-		int64 InsideEllipsePixelCount = 0;
-		int64 ContainmentFailureCount = 0;
-		int64 NeighborProbeFallbackCount = 0;
-		int64 ClearFallbackCount = 0;
+		TArray<float> Elevation;
+		TArray<float> ContinentalWeight;
+		TArray<float> SubductionDistanceKm;
+		TArray<int32> PlateId;
+		TArray<uint8> BoundaryMask;
+		TArray<uint8> Coverage;
 	};
 
-	uint32 MixDeterministicUint32(uint32 Value)
+	bool ShouldExportMode(const ETectonicMapExportMode RequestedMode, const ETectonicMapExportMode CandidateMode)
 	{
-		Value ^= Value >> 16;
-		Value *= 0x7feb352dU;
-		Value ^= Value >> 15;
-		Value *= 0x846ca68bU;
-		Value ^= Value >> 16;
-		return Value;
+		return RequestedMode == ETectonicMapExportMode::All || RequestedMode == CandidateMode;
 	}
 
-	uint8 LerpByte(const uint8 A, const uint8 B, const double Alpha)
+	double SolveMollweideTheta(const double Latitude)
 	{
-		return static_cast<uint8>(FMath::Clamp(
-			FMath::RoundToInt(FMath::Lerp(static_cast<double>(A), static_cast<double>(B), Alpha)),
-			0,
-			255));
-	}
-
-	FColor LerpColor(const FColor& A, const FColor& B, const double Alpha)
-	{
-		const double ClampedAlpha = FMath::Clamp(Alpha, 0.0, 1.0);
-		return FColor(
-			LerpByte(A.R, B.R, ClampedAlpha),
-			LerpByte(A.G, B.G, ClampedAlpha),
-			LerpByte(A.B, B.B, ClampedAlpha),
-			255);
-	}
-
-	FColor GetPlateColor(const int32 PlateId)
-	{
-		static const FColor BasePalette[] = {
-			FColor(230, 25, 75),
-			FColor(60, 180, 75),
-			FColor(255, 225, 25),
-			FColor(0, 130, 200),
-			FColor(245, 130, 48),
-			FColor(145, 30, 180),
-			FColor(70, 240, 240),
-			FColor(240, 50, 230),
-			FColor(210, 245, 60),
-			FColor(250, 190, 212),
-			FColor(0, 128, 128),
-			FColor(220, 190, 255)
-		};
-
-		if (PlateId < 0)
+		if (FMath::Abs(FMath::Abs(Latitude) - HALF_PI) < 1.0e-10)
 		{
-			return FColor::Black;
+			return Latitude;
 		}
 
-		if (PlateId < UE_ARRAY_COUNT(BasePalette))
+		double Theta = Latitude;
+		for (int32 Iteration = 0; Iteration < 8; ++Iteration)
 		{
-			return BasePalette[PlateId];
-		}
-
-		const uint32 Hash = MixDeterministicUint32(static_cast<uint32>(PlateId));
-		const uint8 Hue = static_cast<uint8>(Hash & 0xffU);
-		const uint8 Saturation = static_cast<uint8>(180 + ((Hash >> 8) % 48U));
-		const uint8 Value = static_cast<uint8>(210 + ((Hash >> 16) % 36U));
-		return FLinearColor::MakeFromHSV8(Hue, Saturation, Value).ToFColor(true);
-	}
-
-	FColor GetElevationColor(const double Elevation, const double MinElevation, const double MaxElevation)
-	{
-		const FColor DeepOcean(9, 24, 79);
-		const FColor MidOcean(24, 92, 173);
-		const FColor ShallowOcean(86, 168, 199);
-		const FColor LowLand(68, 120, 54);
-		const FColor MidLand(186, 168, 120);
-		const FColor HighLand(248, 248, 248);
-
-		if (MaxElevation <= MinElevation + UE_DOUBLE_SMALL_NUMBER)
-		{
-			return LowLand;
-		}
-
-		if (MaxElevation <= 0.0)
-		{
-			const double Alpha = FMath::Clamp((Elevation - MinElevation) / FMath::Max(MaxElevation - MinElevation, 1e-9), 0.0, 1.0);
-			return (Alpha < 0.65)
-				? LerpColor(DeepOcean, MidOcean, Alpha / 0.65)
-				: LerpColor(MidOcean, ShallowOcean, (Alpha - 0.65) / 0.35);
-		}
-
-		if (MinElevation >= 0.0)
-		{
-			const double Alpha = FMath::Clamp((Elevation - MinElevation) / FMath::Max(MaxElevation - MinElevation, 1e-9), 0.0, 1.0);
-			return (Alpha < 0.55)
-				? LerpColor(LowLand, MidLand, Alpha / 0.55)
-				: LerpColor(MidLand, HighLand, (Alpha - 0.55) / 0.45);
-		}
-
-		if (Elevation <= 0.0)
-		{
-			const double Alpha = FMath::Clamp((Elevation - MinElevation) / FMath::Max(-MinElevation, 1e-9), 0.0, 1.0);
-			return (Alpha < 0.65)
-				? LerpColor(DeepOcean, MidOcean, Alpha / 0.65)
-				: LerpColor(MidOcean, ShallowOcean, (Alpha - 0.65) / 0.35);
-		}
-
-		const double Alpha = FMath::Clamp(Elevation / FMath::Max(MaxElevation, 1e-9), 0.0, 1.0);
-		return (Alpha < 0.55)
-			? LerpColor(LowLand, MidLand, Alpha / 0.55)
-			: LerpColor(MidLand, HighLand, (Alpha - 0.55) / 0.45);
-	}
-
-	int32 GetDominantCorner(const FVector& Barycentric)
-	{
-		if (Barycentric.X >= Barycentric.Y && Barycentric.X >= Barycentric.Z)
-		{
-			return 0;
-		}
-
-		if (Barycentric.Y >= Barycentric.X && Barycentric.Y >= Barycentric.Z)
-		{
-			return 1;
-		}
-
-		return 2;
-	}
-
-	bool TriangleHasMixedCrustType(
-		const FCanonicalSample& Sample0,
-		const FCanonicalSample& Sample1,
-		const FCanonicalSample& Sample2)
-	{
-		return Sample0.CrustType != Sample1.CrustType ||
-			Sample0.CrustType != Sample2.CrustType ||
-			Sample1.CrustType != Sample2.CrustType;
-	}
-
-	const FCanonicalSample& GetDominantVertexSample(
-		const FCanonicalSample& Sample0,
-		const FCanonicalSample& Sample1,
-		const FCanonicalSample& Sample2,
-		const FVector& Barycentric)
-	{
-		switch (GetDominantCorner(Barycentric))
-		{
-		case 0:
-			return Sample0;
-		case 1:
-			return Sample1;
-		case 2:
-		default:
-			return Sample2;
-		}
-	}
-
-	double WrapHorizontalPixelSample(const double PixelSampleX, const int32 Width)
-	{
-		const double WidthAsDouble = static_cast<double>(Width);
-		double WrappedSample = FMath::Fmod(PixelSampleX, WidthAsDouble);
-		if (WrappedSample < 0.0)
-		{
-			WrappedSample += WidthAsDouble;
-		}
-		return WrappedSample;
-	}
-
-	bool TryInverseProjectMollweide(
-		const double PixelSampleX,
-		const double PixelSampleY,
-		const int32 Width,
-		const int32 Height,
-		FVector& OutDirection)
-	{
-		const double WrappedPixelSampleX = WrapHorizontalPixelSample(PixelSampleX, Width);
-		const double NormalizedX = (2.0 * (WrappedPixelSampleX / static_cast<double>(Width))) - 1.0;
-		const double NormalizedY = 1.0 - (2.0 * (PixelSampleY / static_cast<double>(Height)));
-		const double ProjectionX = NormalizedX * MollweideHalfWidth;
-		const double ProjectionY = NormalizedY * MollweideHalfHeight;
-		const double EllipseValue = (ProjectionX * ProjectionX) / 8.0 + (ProjectionY * ProjectionY) / 2.0;
-		if (EllipseValue > 1.0 + MollweideEllipseTolerance)
-		{
-			return false;
-		}
-
-		const double Theta = FMath::Asin(FMath::Clamp(ProjectionY / MollweideHalfHeight, -1.0, 1.0));
-		const double CosTheta = FMath::Cos(Theta);
-		double Longitude = 0.0;
-		if (FMath::Abs(CosTheta) > MollweideInverseEpsilon)
-		{
-			Longitude = (PI * ProjectionX) / (2.0 * MollweideSqrtTwo * CosTheta);
-		}
-		Longitude = FMath::Clamp(Longitude, -PI, PI);
-
-		const double LatitudeTerm = (2.0 * Theta + FMath::Sin(2.0 * Theta)) / PI;
-		const double Latitude = FMath::Asin(FMath::Clamp(LatitudeTerm, -1.0, 1.0));
-		const double CosLatitude = FMath::Cos(Latitude);
-		OutDirection = FVector(
-			CosLatitude * FMath::Cos(Longitude),
-			CosLatitude * FMath::Sin(Longitude),
-			FMath::Sin(Latitude)).GetSafeNormal();
-		return !OutDirection.IsNearlyZero();
-	}
-
-	bool TryResolveContainmentSample(
-		const TArray<FCanonicalSample>& Samples,
-		const TArray<FDelaunayTriangle>& Triangles,
-		const FContainmentQueryResult& Containment,
-		FResolvedPixelSample& OutResolved)
-	{
-		if (!Containment.bFoundContainingPlate || !Triangles.IsValidIndex(Containment.TriangleIndex))
-		{
-			return false;
-		}
-
-		const FDelaunayTriangle& Triangle = Triangles[Containment.TriangleIndex];
-		if (!Samples.IsValidIndex(Triangle.V[0]) || !Samples.IsValidIndex(Triangle.V[1]) || !Samples.IsValidIndex(Triangle.V[2]))
-		{
-			return false;
-		}
-
-		OutResolved.bResolved = true;
-		OutResolved.TriangleIndex = Containment.TriangleIndex;
-		OutResolved.PlateId = Containment.PlateId;
-		OutResolved.Barycentric = Containment.Barycentric;
-		return true;
-	}
-
-	bool TryResolvePixelSample(
-		const FTectonicPlanet& Planet,
-		const TArray<FCanonicalSample>& Samples,
-		const TArray<FDelaunayTriangle>& Triangles,
-		const int32 PixelX,
-		const int32 PixelY,
-		const int32 Width,
-		const int32 Height,
-		FResolvedPixelSample& OutResolved,
-		FRowExportStats& OutRowStats)
-	{
-		static const FVector2d ProbeOffsets[] = {
-			FVector2d(0.0, 0.0),
-			FVector2d(-0.35, 0.0),
-			FVector2d(0.35, 0.0),
-			FVector2d(0.0, -0.35),
-			FVector2d(0.0, 0.35),
-			FVector2d(-0.25, -0.25),
-			FVector2d(0.25, -0.25),
-			FVector2d(-0.25, 0.25),
-			FVector2d(0.25, 0.25)
-		};
-
-		for (int32 ProbeIndex = 0; ProbeIndex < UE_ARRAY_COUNT(ProbeOffsets); ++ProbeIndex)
-		{
-			const FVector2d& ProbeOffset = ProbeOffsets[ProbeIndex];
-			FVector QueryDirection;
-			if (!TryInverseProjectMollweide(
-				static_cast<double>(PixelX) + 0.5 + ProbeOffset.X,
-				static_cast<double>(PixelY) + 0.5 + ProbeOffset.Y,
-				Width,
-				Height,
-				QueryDirection))
+			const double TwoTheta = 2.0 * Theta;
+			const double Function = TwoTheta + FMath::Sin(TwoTheta) - PI * FMath::Sin(Latitude);
+			const double Derivative = 2.0 + 2.0 * FMath::Cos(TwoTheta);
+			if (FMath::Abs(Derivative) < UE_DOUBLE_SMALL_NUMBER)
 			{
-				continue;
+				break;
 			}
 
-			FResolvedPixelSample Candidate;
-			Candidate.bFromNeighborProbe = ProbeIndex > 0;
-			if (!TryResolveContainmentSample(Samples, Triangles, Planet.QueryContainment(QueryDirection), Candidate))
+			Theta -= Function / Derivative;
+		}
+
+		return FMath::Clamp(Theta, -HALF_PI, HALF_PI);
+	}
+
+	FVector2d ProjectMollweidePixel(const FVector3d& UnitDirection, const int32 Width, const int32 Height)
+	{
+		const double Longitude = FMath::Atan2(UnitDirection.Y, UnitDirection.X);
+		const double Latitude = FMath::Asin(FMath::Clamp(UnitDirection.Z, -1.0, 1.0));
+		const double Theta = SolveMollweideTheta(Latitude);
+		const double ProjectionX = (2.0 * MollweideSqrtTwo / PI) * Longitude * FMath::Cos(Theta);
+		const double ProjectionY = MollweideSqrtTwo * FMath::Sin(Theta);
+		double U = (ProjectionX + MollweideHalfWidth) / (2.0 * MollweideHalfWidth);
+		if (U >= 1.0)
+		{
+			U -= 1.0;
+		}
+		else if (U < 0.0)
+		{
+			U += 1.0;
+		}
+
+		const double V = (MollweideHalfHeight - ProjectionY) / (2.0 * MollweideHalfHeight);
+		return FVector2d(U * static_cast<double>(Width), V * static_cast<double>(Height));
+	}
+
+	double EdgeFunction(const FVector2d& A, const FVector2d& B, const FVector2d& P)
+	{
+		return (P.X - A.X) * (B.Y - A.Y) - (P.Y - A.Y) * (B.X - A.X);
+	}
+
+	void UnwrapTriangleX(FVector2d& A, FVector2d& B, FVector2d& C, const double Width)
+	{
+		double MinX = FMath::Min3(A.X, B.X, C.X);
+		double MaxX = FMath::Max3(A.X, B.X, C.X);
+		if ((MaxX - MinX) <= (Width * 0.5))
+		{
+			return;
+		}
+
+		auto ShiftIfNeeded = [Width](FVector2d& Point)
+		{
+			if (Point.X < Width * 0.5)
 			{
-				if (ProbeIndex == 0)
+				Point.X += Width;
+			}
+		};
+
+		ShiftIfNeeded(A);
+		ShiftIfNeeded(B);
+		ShiftIfNeeded(C);
+	}
+
+	int32 WrapPixelX(const int32 X, const int32 Width)
+	{
+		int32 WrappedX = X % Width;
+		if (WrappedX < 0)
+		{
+			WrappedX += Width;
+		}
+		return WrappedX;
+	}
+
+	bool IsInsideMollweideEllipse(const int32 PixelX, const int32 PixelY, const int32 Width, const int32 Height)
+	{
+		const double ProjectionX =
+			((static_cast<double>(PixelX) + 0.5) / static_cast<double>(Width)) * (2.0 * MollweideHalfWidth) - MollweideHalfWidth;
+		const double ProjectionY =
+			MollweideHalfHeight - ((static_cast<double>(PixelY) + 0.5) / static_cast<double>(Height)) * (2.0 * MollweideHalfHeight);
+		const double NormalizedX = ProjectionX / MollweideHalfWidth;
+		const double NormalizedY = ProjectionY / MollweideHalfHeight;
+		return (NormalizedX * NormalizedX + NormalizedY * NormalizedY) <= (1.0 + RasterEpsilon);
+	}
+
+	int32 CountUncoveredInteriorPixels(const FRasterBuffers& Buffers, const int32 Width, const int32 Height)
+	{
+		int32 UncoveredInteriorCount = 0;
+		for (int32 PixelY = 0; PixelY < Height; ++PixelY)
+		{
+			for (int32 PixelX = 0; PixelX < Width; ++PixelX)
+			{
+				if (!IsInsideMollweideEllipse(PixelX, PixelY, Width, Height))
 				{
-					++OutRowStats.ContainmentFailureCount;
+					continue;
 				}
-				continue;
-			}
 
-			if (Candidate.bFromNeighborProbe)
-			{
-				++OutRowStats.NeighborProbeFallbackCount;
-			}
-
-			OutResolved = Candidate;
-			return true;
-		}
-
-		++OutRowStats.ClearFallbackCount;
-		return false;
-	}
-
-	bool SaveColorPng(const FString& FilePath, const int32 Width, const int32 Height, const TArray<FColor>& Pixels)
-	{
-#if !WITH_EDITOR
-		return false;
-#else
-		if (Pixels.Num() != Width * Height)
-		{
-			return false;
-		}
-
-		IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
-		const TSharedPtr<IImageWrapper> Wrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
-		if (!Wrapper.IsValid())
-		{
-			return false;
-		}
-
-		if (!Wrapper->SetRaw(Pixels.GetData(), Pixels.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
-		{
-			return false;
-		}
-
-		const FString Directory = FPaths::GetPath(FilePath);
-		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-		if (!Directory.IsEmpty() && !PlatformFile.CreateDirectoryTree(*Directory))
-		{
-			return false;
-		}
-
-		const TArray64<uint8>& CompressedData = Wrapper->GetCompressed();
-		return FFileHelper::SaveArrayToFile(CompressedData, *FilePath);
-#endif
-	}
-
-	int32 FindNearestSampleByDelaunayWalk(
-		const TArray<FCanonicalSample>& Samples,
-		const TArray<TArray<int32>>& Adjacency,
-		const FVector& QueryDirection,
-		const int32 StartSampleIndex)
-	{
-		if (!Samples.IsValidIndex(StartSampleIndex))
-		{
-			return 0;
-		}
-
-		int32 CurrentIndex = StartSampleIndex;
-		double CurrentDot = FVector::DotProduct(QueryDirection, Samples[CurrentIndex].Position);
-
-		for (int32 Iteration = 0; Iteration < Samples.Num(); ++Iteration)
-		{
-			bool bImproved = false;
-			if (Adjacency.IsValidIndex(CurrentIndex))
-			{
-				for (const int32 NeighborIndex : Adjacency[CurrentIndex])
+				const int32 PixelIndex = PixelY * Width + PixelX;
+				if (Buffers.Coverage[PixelIndex] == 0)
 				{
-					if (!Samples.IsValidIndex(NeighborIndex))
+					++UncoveredInteriorCount;
+				}
+			}
+		}
+
+		return UncoveredInteriorCount;
+	}
+
+	void FillRasterGaps(const FTectonicMollweideExportOptions& Options, FRasterBuffers& Buffers)
+	{
+		constexpr int32 MaxGapFillIterations = 16;
+		int32 PreviousUncoveredInteriorCount = CountUncoveredInteriorPixels(Buffers, Options.Width, Options.Height);
+
+		for (int32 Iteration = 0; Iteration < MaxGapFillIterations; ++Iteration)
+		{
+			FRasterBuffers PreviousBuffers = Buffers;
+			int32 FilledPixelCountThisIteration = 0;
+
+			for (int32 PixelY = 0; PixelY < Options.Height; ++PixelY)
+			{
+				for (int32 PixelX = 0; PixelX < Options.Width; ++PixelX)
+				{
+					if (!IsInsideMollweideEllipse(PixelX, PixelY, Options.Width, Options.Height))
 					{
 						continue;
 					}
 
-					const double NeighborDot = FVector::DotProduct(QueryDirection, Samples[NeighborIndex].Position);
-					if (NeighborDot > CurrentDot)
+					const int32 PixelIndex = PixelY * Options.Width + PixelX;
+					if (PreviousBuffers.Coverage[PixelIndex] != 0)
 					{
-						CurrentDot = NeighborDot;
-						CurrentIndex = NeighborIndex;
-						bImproved = true;
+						continue;
 					}
+
+					int32 BestNeighborIndex = INDEX_NONE;
+					for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY)
+					{
+						const int32 NeighborY = PixelY + OffsetY;
+						if (NeighborY < 0 || NeighborY >= Options.Height)
+						{
+							continue;
+						}
+
+						for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX)
+						{
+							if (OffsetX == 0 && OffsetY == 0)
+							{
+								continue;
+							}
+
+							const int32 NeighborX = WrapPixelX(PixelX + OffsetX, Options.Width);
+							const int32 NeighborIndex = NeighborY * Options.Width + NeighborX;
+							if (PreviousBuffers.Coverage[NeighborIndex] == 0)
+							{
+								continue;
+							}
+
+							if (BestNeighborIndex == INDEX_NONE || NeighborIndex < BestNeighborIndex)
+							{
+								BestNeighborIndex = NeighborIndex;
+							}
+						}
+					}
+
+					if (BestNeighborIndex == INDEX_NONE)
+					{
+						continue;
+					}
+
+					Buffers.Elevation[PixelIndex] = PreviousBuffers.Elevation[BestNeighborIndex];
+					Buffers.ContinentalWeight[PixelIndex] = PreviousBuffers.ContinentalWeight[BestNeighborIndex];
+					Buffers.SubductionDistanceKm[PixelIndex] = PreviousBuffers.SubductionDistanceKm[BestNeighborIndex];
+					Buffers.PlateId[PixelIndex] = PreviousBuffers.PlateId[BestNeighborIndex];
+					Buffers.BoundaryMask[PixelIndex] = PreviousBuffers.BoundaryMask[BestNeighborIndex];
+					Buffers.Coverage[PixelIndex] = 1;
+					++FilledPixelCountThisIteration;
 				}
 			}
 
-			if (!bImproved)
+			if (FilledPixelCountThisIteration == 0)
 			{
 				break;
 			}
-		}
 
-		return CurrentIndex;
+			const int32 CurrentUncoveredInteriorCount = CountUncoveredInteriorPixels(Buffers, Options.Width, Options.Height);
+			if (CurrentUncoveredInteriorCount <= 0 || CurrentUncoveredInteriorCount >= PreviousUncoveredInteriorCount)
+			{
+				break;
+			}
+
+			PreviousUncoveredInteriorCount = CurrentUncoveredInteriorCount;
+		}
 	}
 
-	void ResolveUnresolvedPixelsViaNearestSample(
-		const TArray<FCanonicalSample>& Samples,
-		const TArray<TArray<int32>>& Adjacency,
-		const int32 Width,
-		const int32 Height,
-		TArray<uint8>& InOutPixelState,
-		TArray<FColor>* ElevationPixels,
-		TArray<FColor>* PlateIdPixels,
-		TArray<FColor>* CrustTypePixels,
-		const double MinElevation,
-		const double MaxElevation,
-		int64& OutFilledPixelCount)
+	bool WritePng(const FString& OutputPath, const TArray<FColor>& Pixels, const int32 Width, const int32 Height, FString& OutError)
 	{
-		for (int32 PixelIndex = 0; PixelIndex < InOutPixelState.Num(); ++PixelIndex)
+#if WITH_EDITOR
+		IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+		TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+		if (!ImageWrapper.IsValid())
 		{
-			if (InOutPixelState[PixelIndex] != 2)
+			OutError = TEXT("Failed to create PNG image wrapper.");
+			return false;
+		}
+
+		if (!ImageWrapper->SetRaw(Pixels.GetData(), Pixels.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
+		{
+			OutError = TEXT("Failed to populate PNG image wrapper.");
+			return false;
+		}
+
+		const TArray64<uint8>& Compressed = ImageWrapper->GetCompressed();
+		if (!FFileHelper::SaveArrayToFile(Compressed, *OutputPath))
+		{
+			OutError = FString::Printf(TEXT("Failed to write PNG file: %s"), *OutputPath);
+			return false;
+		}
+
+		return true;
+#else
+		OutError = TEXT("Mollweide export is only available in editor builds.");
+		return false;
+#endif
+	}
+
+	void BuildRasterBuffers(
+		const FTectonicPlanet& Planet,
+		const FTectonicMollweideExportOptions& Options,
+		FRasterBuffers& OutBuffers,
+		int32& OutPreGapFillUncoveredInteriorPixelCount,
+		int32& OutPostGapFillUncoveredInteriorPixelCount)
+	{
+		const int32 PixelCount = Options.Width * Options.Height;
+		OutBuffers.Elevation.Init(0.0f, PixelCount);
+		OutBuffers.ContinentalWeight.Init(0.0f, PixelCount);
+		OutBuffers.SubductionDistanceKm.Init(-1.0f, PixelCount);
+		OutBuffers.PlateId.Init(INDEX_NONE, PixelCount);
+		OutBuffers.BoundaryMask.Init(0, PixelCount);
+		OutBuffers.Coverage.Init(0, PixelCount);
+
+		TArray<FProjectedSample> ProjectedSamples;
+		ProjectedSamples.SetNum(Planet.Samples.Num());
+		for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+		{
+			ProjectedSamples[SampleIndex].Pixel = ProjectMollweidePixel(Planet.Samples[SampleIndex].Position, Options.Width, Options.Height);
+		}
+
+		for (const FIntVector& Triangle : Planet.TriangleIndices)
+		{
+			if (!Planet.Samples.IsValidIndex(Triangle.X) || !Planet.Samples.IsValidIndex(Triangle.Y) || !Planet.Samples.IsValidIndex(Triangle.Z))
 			{
 				continue;
 			}
 
-			const int32 PixelX = PixelIndex % Width;
-			const int32 PixelY = PixelIndex / Width;
+			FVector2d P0 = ProjectedSamples[Triangle.X].Pixel;
+			FVector2d P1 = ProjectedSamples[Triangle.Y].Pixel;
+			FVector2d P2 = ProjectedSamples[Triangle.Z].Pixel;
+			UnwrapTriangleX(P0, P1, P2, static_cast<double>(Options.Width));
 
-			FVector QueryDirection;
-			if (!TryInverseProjectMollweide(
-				static_cast<double>(PixelX) + 0.5,
-				static_cast<double>(PixelY) + 0.5,
-				Width,
-				Height,
-				QueryDirection))
+			const double TwiceArea = EdgeFunction(P0, P1, P2);
+			if (FMath::Abs(TwiceArea) <= RasterEpsilon)
 			{
 				continue;
 			}
 
-			const int32 NearestSampleIndex = FindNearestSampleByDelaunayWalk(Samples, Adjacency, QueryDirection, 0);
-			const FCanonicalSample& NearestSample = Samples[NearestSampleIndex];
-
-			if (ElevationPixels)
+			const int32 MinPixelX = FMath::FloorToInt(FMath::Min3(P0.X, P1.X, P2.X));
+			const int32 MaxPixelX = FMath::CeilToInt(FMath::Max3(P0.X, P1.X, P2.X));
+			const double ExpectedEdgePx = static_cast<double>(Options.Width) * FMath::Sqrt(4.0 * PI / FMath::Max(Planet.Samples.Num(), 1)) / PI;
+			const int32 MaxTriangleWidthPx = FMath::Max(FMath::CeilToInt(ExpectedEdgePx * 30.0), 50);
+			if ((MaxPixelX - MinPixelX) > MaxTriangleWidthPx)
 			{
-				(*ElevationPixels)[PixelIndex] = GetElevationColor(
-					static_cast<double>(NearestSample.Elevation), MinElevation, MaxElevation);
-			}
-			if (PlateIdPixels)
-			{
-				(*PlateIdPixels)[PixelIndex] = GetPlateColor(NearestSample.PlateId);
-			}
-			if (CrustTypePixels)
-			{
-				(*CrustTypePixels)[PixelIndex] = (NearestSample.CrustType == ECrustType::Continental)
-					? ContinentalCrustColor
-					: OceanicCrustColor;
+				continue;
 			}
 
-			InOutPixelState[PixelIndex] = 1;
-			++OutFilledPixelCount;
+			const int32 MinPixelY = FMath::Clamp(FMath::FloorToInt(FMath::Min3(P0.Y, P1.Y, P2.Y)), 0, Options.Height - 1);
+			const int32 MaxPixelY = FMath::Clamp(FMath::CeilToInt(FMath::Max3(P0.Y, P1.Y, P2.Y)), 0, Options.Height - 1);
+			if (MinPixelY > MaxPixelY)
+			{
+				continue;
+			}
+
+			const FSample& Sample0 = Planet.Samples[Triangle.X];
+			const FSample& Sample1 = Planet.Samples[Triangle.Y];
+			const FSample& Sample2 = Planet.Samples[Triangle.Z];
+
+			for (int32 PixelY = MinPixelY; PixelY <= MaxPixelY; ++PixelY)
+			{
+				for (int32 PixelX = MinPixelX; PixelX <= MaxPixelX; ++PixelX)
+				{
+					const FVector2d PixelCenter(static_cast<double>(PixelX) + 0.5, static_cast<double>(PixelY) + 0.5);
+					const double W0 = EdgeFunction(P1, P2, PixelCenter) / TwiceArea;
+					const double W1 = EdgeFunction(P2, P0, PixelCenter) / TwiceArea;
+					const double W2 = EdgeFunction(P0, P1, PixelCenter) / TwiceArea;
+					if (W0 < -RasterEpsilon || W1 < -RasterEpsilon || W2 < -RasterEpsilon)
+					{
+						continue;
+					}
+
+					const int32 WrappedX = WrapPixelX(PixelX, Options.Width);
+					const int32 BufferIndex = PixelY * Options.Width + WrappedX;
+					const double Elevation = W0 * Sample0.Elevation + W1 * Sample1.Elevation + W2 * Sample2.Elevation;
+					const double ContinentalWeight = W0 * Sample0.ContinentalWeight + W1 * Sample1.ContinentalWeight + W2 * Sample2.ContinentalWeight;
+					double SubductionDistanceWeightSum = 0.0;
+					double WeightedSubductionDistanceKm = 0.0;
+					if (Sample0.SubductionDistanceKm >= 0.0f)
+					{
+						WeightedSubductionDistanceKm += W0 * Sample0.SubductionDistanceKm;
+						SubductionDistanceWeightSum += W0;
+					}
+					if (Sample1.SubductionDistanceKm >= 0.0f)
+					{
+						WeightedSubductionDistanceKm += W1 * Sample1.SubductionDistanceKm;
+						SubductionDistanceWeightSum += W1;
+					}
+					if (Sample2.SubductionDistanceKm >= 0.0f)
+					{
+						WeightedSubductionDistanceKm += W2 * Sample2.SubductionDistanceKm;
+						SubductionDistanceWeightSum += W2;
+					}
+
+					OutBuffers.Elevation[BufferIndex] = static_cast<float>(Elevation);
+					OutBuffers.ContinentalWeight[BufferIndex] = static_cast<float>(ContinentalWeight);
+					OutBuffers.SubductionDistanceKm[BufferIndex] =
+						SubductionDistanceWeightSum > RasterEpsilon
+							? static_cast<float>(WeightedSubductionDistanceKm / SubductionDistanceWeightSum)
+							: -1.0f;
+
+					int32 DominantPlateId = Sample0.PlateId;
+					double DominantWeight = W0;
+					if (W1 > DominantWeight)
+					{
+						DominantWeight = W1;
+						DominantPlateId = Sample1.PlateId;
+					}
+					if (W2 > DominantWeight)
+					{
+						DominantPlateId = Sample2.PlateId;
+					}
+
+					OutBuffers.PlateId[BufferIndex] = DominantPlateId;
+					OutBuffers.BoundaryMask[BufferIndex] =
+						(Sample0.bIsBoundary && W0 >= W1 && W0 >= W2) ||
+						(Sample1.bIsBoundary && W1 >= W0 && W1 >= W2) ||
+						(Sample2.bIsBoundary && W2 >= W0 && W2 >= W1)
+						? 1
+						: 0;
+					OutBuffers.Coverage[BufferIndex] = 1;
+				}
+			}
 		}
+
+		OutPreGapFillUncoveredInteriorPixelCount = CountUncoveredInteriorPixels(OutBuffers, Options.Width, Options.Height);
+		FillRasterGaps(Options, OutBuffers);
+		OutPostGapFillUncoveredInteriorPixelCount = CountUncoveredInteriorPixels(OutBuffers, Options.Width, Options.Height);
 	}
 
-	FString ResolveOutputSpecifierToAbsolutePath(const FString& OutputSpecifier)
+	void BuildImageForMode(
+		const FRasterBuffers& Buffers,
+		const FTectonicMollweideExportOptions& Options,
+		const ETectonicMapExportMode Mode,
+		TArray<FColor>& OutPixels)
 	{
-		if (OutputSpecifier.IsEmpty())
-		{
-			return FPaths::ConvertRelativePathToFull(FPaths::Combine(
-				FPaths::ProjectSavedDir(),
-				TEXT("Mollweide"),
-				TEXT("TectonicMollweide.png")));
-		}
+		const int32 PixelCount = Options.Width * Options.Height;
+		OutPixels.SetNum(PixelCount);
 
-		if (FPaths::IsRelative(OutputSpecifier))
+		for (int32 PixelIndex = 0; PixelIndex < PixelCount; ++PixelIndex)
 		{
-			return FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectDir(), OutputSpecifier));
-		}
-
-		return FPaths::ConvertRelativePathToFull(OutputSpecifier);
-	}
-
-	FString MakeOutputFilePath(
-		const FString& OutputSpecifier,
-		const ETectonicMollweideExportMode RequestedMode,
-		const ETectonicMollweideExportMode FileMode)
-	{
-		if (OutputSpecifier.IsEmpty())
-		{
-			if (RequestedMode == ETectonicMollweideExportMode::All)
+			const int32 PixelX = PixelIndex % Options.Width;
+			const int32 PixelY = PixelIndex / Options.Width;
+			if (Buffers.Coverage[PixelIndex] == 0 || !IsInsideMollweideEllipse(PixelX, PixelY, Options.Width, Options.Height))
 			{
-				return MakeOutputFilePath(
-					FPaths::Combine(TEXT("Saved"), TEXT("Mollweide"), TEXT("TectonicMollweide.png")),
-					RequestedMode,
-					FileMode);
+				OutPixels[PixelIndex] = FColor::Black;
+				continue;
 			}
 
-			return MakeOutputFilePath(
-				FPaths::Combine(TEXT("Saved"), TEXT("Mollweide"), FString::Printf(TEXT("TectonicMollweide_%s.png"), TectonicMollweideExporter::GetModeName(FileMode))),
-				RequestedMode,
-				FileMode);
-		}
-
-		const FString AbsoluteOutputPath = ResolveOutputSpecifierToAbsolutePath(OutputSpecifier);
-		const FString Directory = FPaths::GetPath(AbsoluteOutputPath);
-		const FString Extension = FPaths::GetExtension(AbsoluteOutputPath, false);
-		const FString ModeSuffix = FString(TectonicMollweideExporter::GetModeName(FileMode));
-
-		if (RequestedMode != ETectonicMollweideExportMode::All)
-		{
-			if (Extension.IsEmpty())
+			switch (Mode)
 			{
-				return AbsoluteOutputPath + TEXT(".png");
+			case ETectonicMapExportMode::Elevation:
+				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetElevationColor(Buffers.Elevation[PixelIndex]);
+				break;
+
+			case ETectonicMapExportMode::PlateId:
+				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetPlateColor(Buffers.PlateId[PixelIndex]);
+				break;
+
+			case ETectonicMapExportMode::CrustType:
+				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetCrustTypeColor(Buffers.ContinentalWeight[PixelIndex]);
+				break;
+
+			case ETectonicMapExportMode::ContinentalWeight:
+				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetContinentalWeightColor(Buffers.ContinentalWeight[PixelIndex]);
+				break;
+
+			case ETectonicMapExportMode::SubductionDistance:
+				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetSubductionDistanceColor(Buffers.SubductionDistanceKm[PixelIndex]);
+				break;
+
+			case ETectonicMapExportMode::BoundaryMask:
+				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetBoundaryMaskColor(Buffers.BoundaryMask[PixelIndex] != 0);
+				break;
+
+			case ETectonicMapExportMode::GapMask:
+				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetGapMaskColor(false);
+				break;
+
+			case ETectonicMapExportMode::OverlapMask:
+				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetOverlapMaskColor(false);
+				break;
+
+			case ETectonicMapExportMode::All:
+			default:
+				OutPixels[PixelIndex] = FColor::Black;
+				break;
 			}
-
-			return AbsoluteOutputPath;
 		}
-
-		const FString Stem = FPaths::GetBaseFilename(AbsoluteOutputPath);
-		const FString SafeExtension = Extension.IsEmpty() ? TEXT("png") : Extension;
-		return FPaths::Combine(Directory, FString::Printf(TEXT("%s_%s.%s"), *Stem, *ModeSuffix, *SafeExtension));
 	}
 }
 
-namespace TectonicMollweideExporter
+bool TectonicMollweideExporter::ExportPlanet(
+	const FTectonicPlanet& Planet,
+	const FTectonicMollweideExportOptions& Options,
+	FTectonicMollweideExportStats& OutStats,
+	FString& OutError)
 {
-	bool TryParseMode(const FString& Value, ETectonicMollweideExportMode& OutMode)
+	OutStats = FTectonicMollweideExportStats{};
+	OutStats.Mode = Options.Mode;
+	OutStats.Width = Options.Width;
+	OutStats.Height = Options.Height;
+
+	if (Planet.Samples.IsEmpty() || Planet.TriangleIndices.IsEmpty())
 	{
-		if (Value.Equals(TEXT("Elevation"), ESearchCase::IgnoreCase))
-		{
-			OutMode = ETectonicMollweideExportMode::Elevation;
-			return true;
-		}
-
-		if (Value.Equals(TEXT("PlateId"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("Plate"), ESearchCase::IgnoreCase))
-		{
-			OutMode = ETectonicMollweideExportMode::PlateId;
-			return true;
-		}
-
-		if (Value.Equals(TEXT("CrustType"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("Crust"), ESearchCase::IgnoreCase))
-		{
-			OutMode = ETectonicMollweideExportMode::CrustType;
-			return true;
-		}
-
-		if (Value.Equals(TEXT("All"), ESearchCase::IgnoreCase))
-		{
-			OutMode = ETectonicMollweideExportMode::All;
-			return true;
-		}
-
+		OutError = TEXT("Planet has no canonical mesh data to export.");
 		return false;
 	}
 
-	const TCHAR* GetModeName(const ETectonicMollweideExportMode Mode)
+	if (Options.Width <= 0 || Options.Height <= 0)
 	{
-		switch (Mode)
-		{
-		case ETectonicMollweideExportMode::Elevation:
-			return TEXT("Elevation");
-		case ETectonicMollweideExportMode::PlateId:
-			return TEXT("PlateId");
-		case ETectonicMollweideExportMode::CrustType:
-			return TEXT("CrustType");
-		case ETectonicMollweideExportMode::All:
-		default:
-			return TEXT("All");
-		}
-	}
-
-	bool ExportPlanet(
-		FTectonicPlanet& Planet,
-		const FTectonicMollweideExportOptions& Options,
-		FTectonicMollweideExportStats& OutStats,
-		FString& OutError)
-	{
-#if !WITH_EDITOR
-		OutError = TEXT("Mollweide export requires an editor build.");
+		OutError = TEXT("Export dimensions must be positive.");
 		return false;
-#else
-		const double ExportStartSeconds = FPlatformTime::Seconds();
-		OutStats = FTectonicMollweideExportStats{};
-		OutStats.Mode = Options.Mode;
-		OutStats.Width = Options.Width;
-		OutStats.Height = Options.Height;
-
-		if (Options.Width <= 0 || Options.Height <= 0)
-		{
-			OutError = TEXT("Mollweide export resolution must be positive.");
-			return false;
-		}
-
-		if (Planet.GetPlates().Num() <= 0)
-		{
-			OutError = TEXT("Planet has no initialized plates to export.");
-			return false;
-		}
-
-		const TArray<FCanonicalSample>& Samples = Planet.GetSamples();
-		const TArray<FDelaunayTriangle>& Triangles = Planet.GetTriangles();
-		if (Samples.Num() <= 0 || Triangles.Num() <= 0)
-		{
-			OutError = TEXT("Planet has no sample or triangle data to export.");
-			return false;
-		}
-
-		Planet.RebuildSpatialQueryData();
-
-		double MinElevation = TNumericLimits<double>::Max();
-		double MaxElevation = -TNumericLimits<double>::Max();
-		for (const FCanonicalSample& Sample : Samples)
-		{
-			MinElevation = FMath::Min(MinElevation, static_cast<double>(Sample.Elevation));
-			MaxElevation = FMath::Max(MaxElevation, static_cast<double>(Sample.Elevation));
-		}
-
-		if (MinElevation > MaxElevation)
-		{
-			MinElevation = 0.0;
-			MaxElevation = 0.0;
-		}
-
-		OutStats.MinElevation = MinElevation;
-		OutStats.MaxElevation = MaxElevation;
-
-		const bool bExportElevation = Options.Mode == ETectonicMollweideExportMode::All || Options.Mode == ETectonicMollweideExportMode::Elevation;
-		const bool bExportPlateId = Options.Mode == ETectonicMollweideExportMode::All || Options.Mode == ETectonicMollweideExportMode::PlateId;
-		const bool bExportCrustType = Options.Mode == ETectonicMollweideExportMode::All || Options.Mode == ETectonicMollweideExportMode::CrustType;
-		const int32 NumPixels = Options.Width * Options.Height;
-		TArray<uint8> PixelState;
-		PixelState.Init(0, NumPixels);
-
-		TArray<FColor> ElevationPixels;
-		TArray<FColor> PlateIdPixels;
-		TArray<FColor> CrustTypePixels;
-		if (bExportElevation)
-		{
-			ElevationPixels.Init(ProjectionBackgroundColor, NumPixels);
-		}
-		if (bExportPlateId)
-		{
-			PlateIdPixels.Init(ProjectionBackgroundColor, NumPixels);
-		}
-		if (bExportCrustType)
-		{
-			CrustTypePixels.Init(ProjectionBackgroundColor, NumPixels);
-		}
-
-		TArray<FRowExportStats> RowStats;
-		RowStats.SetNum(Options.Height);
-
-		ParallelFor(Options.Height, [&](const int32 PixelY)
-		{
-			FRowExportStats& Stats = RowStats[PixelY];
-			for (int32 PixelX = 0; PixelX < Options.Width; ++PixelX)
-			{
-				const int32 PixelIndex = PixelY * Options.Width + PixelX;
-				FVector CenterDirection;
-				if (!TryInverseProjectMollweide(
-					static_cast<double>(PixelX) + 0.5,
-					static_cast<double>(PixelY) + 0.5,
-					Options.Width,
-					Options.Height,
-					CenterDirection))
-				{
-					continue;
-				}
-
-				++Stats.InsideEllipsePixelCount;
-
-				FResolvedPixelSample Resolved;
-				if (!TryResolvePixelSample(Planet, Samples, Triangles, PixelX, PixelY, Options.Width, Options.Height, Resolved, Stats))
-				{
-					PixelState[PixelIndex] = 2;
-					if (bExportElevation)
-					{
-						ElevationPixels[PixelIndex] = UnresolvedFallbackColor;
-					}
-					if (bExportPlateId)
-					{
-						PlateIdPixels[PixelIndex] = UnresolvedFallbackColor;
-					}
-					if (bExportCrustType)
-					{
-						CrustTypePixels[PixelIndex] = UnresolvedFallbackColor;
-					}
-					continue;
-				}
-
-				PixelState[PixelIndex] = 1;
-				const FDelaunayTriangle& Triangle = Triangles[Resolved.TriangleIndex];
-				const FCanonicalSample& Sample0 = Samples[Triangle.V[0]];
-				const FCanonicalSample& Sample1 = Samples[Triangle.V[1]];
-				const FCanonicalSample& Sample2 = Samples[Triangle.V[2]];
-				const bool bMixedCrustTriangle = TriangleHasMixedCrustType(Sample0, Sample1, Sample2);
-				const FCanonicalSample& DominantSample = GetDominantVertexSample(Sample0, Sample1, Sample2, Resolved.Barycentric);
-				const double W0 = Resolved.Barycentric.X;
-				const double W1 = Resolved.Barycentric.Y;
-				const double W2 = Resolved.Barycentric.Z;
-
-				if (bExportElevation)
-				{
-					const double Elevation = bMixedCrustTriangle
-						? static_cast<double>(DominantSample.Elevation)
-						: (W0 * static_cast<double>(Sample0.Elevation) +
-							W1 * static_cast<double>(Sample1.Elevation) +
-							W2 * static_cast<double>(Sample2.Elevation));
-					ElevationPixels[PixelIndex] = GetElevationColor(Elevation, MinElevation, MaxElevation);
-				}
-
-				if (bExportPlateId)
-				{
-					PlateIdPixels[PixelIndex] = GetPlateColor(Resolved.PlateId);
-				}
-
-				if (bExportCrustType)
-				{
-					const ECrustType CrustType = bMixedCrustTriangle
-						? DominantSample.CrustType
-						: Sample0.CrustType;
-					CrustTypePixels[PixelIndex] = (CrustType == ECrustType::Continental)
-						? ContinentalCrustColor
-						: OceanicCrustColor;
-				}
-			}
-		});
-
-		for (const FRowExportStats& Stats : RowStats)
-		{
-			OutStats.InsideEllipsePixelCount += Stats.InsideEllipsePixelCount;
-			OutStats.ContainmentFailureCount += Stats.ContainmentFailureCount;
-			OutStats.NeighborProbeFallbackCount += Stats.NeighborProbeFallbackCount;
-			OutStats.ClearFallbackCount += Stats.ClearFallbackCount;
-		}
-
-		ResolveUnresolvedPixelsViaNearestSample(
-			Samples,
-			Planet.GetAdjacency(),
-			Options.Width,
-			Options.Height,
-			PixelState,
-			bExportElevation ? &ElevationPixels : nullptr,
-			bExportPlateId ? &PlateIdPixels : nullptr,
-			bExportCrustType ? &CrustTypePixels : nullptr,
-			MinElevation,
-			MaxElevation,
-			OutStats.ImageFillFallbackCount);
-
-		if (bExportElevation)
-		{
-			const FString ElevationPath = MakeOutputFilePath(Options.OutputPath, Options.Mode, ETectonicMollweideExportMode::Elevation);
-			if (!SaveColorPng(ElevationPath, Options.Width, Options.Height, ElevationPixels))
-			{
-				OutError = FString::Printf(TEXT("Failed to write elevation PNG: %s"), *ElevationPath);
-				OutStats.ExportTimeMs = (FPlatformTime::Seconds() - ExportStartSeconds) * 1000.0;
-				return false;
-			}
-			OutStats.WrittenFiles.Add(ElevationPath);
-		}
-
-		if (bExportPlateId)
-		{
-			const FString PlateIdPath = MakeOutputFilePath(Options.OutputPath, Options.Mode, ETectonicMollweideExportMode::PlateId);
-			if (!SaveColorPng(PlateIdPath, Options.Width, Options.Height, PlateIdPixels))
-			{
-				OutError = FString::Printf(TEXT("Failed to write plate-id PNG: %s"), *PlateIdPath);
-				OutStats.ExportTimeMs = (FPlatformTime::Seconds() - ExportStartSeconds) * 1000.0;
-				return false;
-			}
-			OutStats.WrittenFiles.Add(PlateIdPath);
-		}
-
-		if (bExportCrustType)
-		{
-			const FString CrustTypePath = MakeOutputFilePath(Options.OutputPath, Options.Mode, ETectonicMollweideExportMode::CrustType);
-			if (!SaveColorPng(CrustTypePath, Options.Width, Options.Height, CrustTypePixels))
-			{
-				OutError = FString::Printf(TEXT("Failed to write crust-type PNG: %s"), *CrustTypePath);
-				OutStats.ExportTimeMs = (FPlatformTime::Seconds() - ExportStartSeconds) * 1000.0;
-				return false;
-			}
-			OutStats.WrittenFiles.Add(CrustTypePath);
-		}
-
-		OutStats.ExportTimeMs = (FPlatformTime::Seconds() - ExportStartSeconds) * 1000.0;
-		return true;
-#endif
 	}
+
+	if (Options.OutputDirectory.IsEmpty())
+	{
+		OutError = TEXT("Export output directory is empty.");
+		return false;
+	}
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	if (!PlatformFile.CreateDirectoryTree(*Options.OutputDirectory))
+	{
+		OutError = FString::Printf(TEXT("Failed to create export directory: %s"), *Options.OutputDirectory);
+		return false;
+	}
+
+	FRasterBuffers Buffers;
+	BuildRasterBuffers(
+		Planet,
+		Options,
+		Buffers,
+		OutStats.PreGapFillUncoveredInteriorPixelCount,
+		OutStats.UncoveredInteriorPixelCount);
+
+	int64 ContinentalPixelCount = 0;
+	for (const uint8 Covered : Buffers.Coverage)
+	{
+		OutStats.ResolvedPixelCount += Covered != 0 ? 1 : 0;
+	}
+	for (int32 PixelIndex = 0; PixelIndex < Buffers.Coverage.Num(); ++PixelIndex)
+	{
+		if (Buffers.Coverage[PixelIndex] != 0 && Buffers.ContinentalWeight[PixelIndex] >= 0.5f)
+		{
+			++ContinentalPixelCount;
+		}
+	}
+	if (OutStats.ResolvedPixelCount > 0)
+	{
+		OutStats.ContinentalPixelFraction =
+			static_cast<double>(ContinentalPixelCount) / static_cast<double>(OutStats.ResolvedPixelCount);
+	}
+
+	TArray<FColor> ImagePixels;
+	const ETectonicMapExportMode ModesToWrite[] = {
+		ETectonicMapExportMode::Elevation,
+		ETectonicMapExportMode::PlateId,
+		ETectonicMapExportMode::CrustType,
+		ETectonicMapExportMode::ContinentalWeight,
+		ETectonicMapExportMode::SubductionDistance,
+		ETectonicMapExportMode::BoundaryMask,
+		ETectonicMapExportMode::GapMask,
+		ETectonicMapExportMode::OverlapMask
+	};
+
+	for (const ETectonicMapExportMode Mode : ModesToWrite)
+	{
+		if (!ShouldExportMode(Options.Mode, Mode))
+		{
+			continue;
+		}
+
+		BuildImageForMode(Buffers, Options, Mode, ImagePixels);
+		const FString OutputPath = FPaths::Combine(
+			Options.OutputDirectory,
+			FString::Printf(TEXT("%s.png"), TectonicPlanetVisualization::GetExportModeName(Mode)));
+
+		FString WriteError;
+		if (!WritePng(OutputPath, ImagePixels, Options.Width, Options.Height, WriteError))
+		{
+			OutError = WriteError;
+			return false;
+		}
+
+		OutStats.WrittenFiles.Add(OutputPath);
+	}
+
+	return true;
 }

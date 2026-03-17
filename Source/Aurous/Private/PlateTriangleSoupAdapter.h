@@ -7,6 +7,7 @@ struct FPlateTriangleSoupData
 {
 	int32 PlateId = INDEX_NONE;
 	TArray<int32> GlobalTriangleIndices;
+	TMap<int32, int32> GlobalToLocalTriangle;
 	TArray<UE::Geometry::FIndex3i> LocalTriangles;
 	TArray<int32> LocalToCanonicalVertex;
 	TMap<int32, int32> CanonicalToLocalVertex;

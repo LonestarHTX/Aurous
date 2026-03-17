@@ -1,772 +1,528 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "TectonicPlanet.generated.h"
+#include "PlateTriangleSoupAdapter.h"
 
-UENUM()
-enum class ECrustType : uint8
-{
-	Oceanic,
-	Continental
-};
-
-UENUM()
 enum class EOrogenyType : uint8
 {
 	None,
 	Andean,
-	Himalayan
+	Himalayan,
 };
 
-UENUM()
-enum class ESubductionRole : uint8
+enum class EResampleTriggerReason : uint8
 {
 	None,
-	Overriding,
-	Subducting
+	Periodic,
+	CollisionFollowup,
+	RiftFollowup,
+	SafetyValve,
+	Manual,
 };
 
-UENUM()
-enum class EBoundaryType : uint8
+// Policy-level control over when periodic maintenance resamples run.
+// `PeriodicFull` remains the legacy baseline/default for regression comparison.
+// `EventDrivenOnly` and `HybridStablePeriodic` are retained for experiment coverage.
+// `PreserveOwnershipPeriodic` is the current preferred maintenance architecture.
+enum class EResamplingPolicy : uint8
 {
-	None,
-	Convergent,
-	Divergent,
-	Transform
+	PeriodicFull,
+	EventDrivenOnly,
+	HybridStablePeriodic,
+	PreserveOwnershipPeriodic,
 };
 
-UENUM()
-enum class EPlatePersistencePolicy : uint8
+// Internal ownership behavior used by a specific resample invocation.
+// `PreserveOwnership` is the preferred maintenance mode.
+enum class EResampleOwnershipMode : uint8
 {
-	Protected,
-	Retirable
+	FullResolution,
+	StableOverlaps,
+	PreserveOwnership,
 };
 
-UENUM()
-enum class EContinentalStabilizerMode : uint8
+struct FSample
 {
-	Disabled,
-	Legacy,
-	Incremental,
-	Shadow
-};
-
-UENUM()
-enum class ETectonicBenchmarkMode : uint8
-{
-	Full,
-	ScenarioCore,
-	PaperCore
-};
-
-// One sample point on the canonical sphere.
-struct FCanonicalSample
-{
-	FVector Position = FVector::ZeroVector;
-	int32 PlateId = -1;
-	int32 PrevPlateId = -1;
-	float OwnershipMargin = 0.0f;
-	bool bIsBoundary = false;
-	ECrustType CrustType = ECrustType::Continental;
+	FVector3d Position = FVector3d::ZeroVector;
+	int32 PlateId = INDEX_NONE;
+	float ContinentalWeight = 0.0f;
 	float Elevation = 0.0f;
 	float Thickness = 0.0f;
 	float Age = 0.0f;
-	FVector RidgeDirection = FVector::ZeroVector;
-	FVector FoldDirection = FVector::ZeroVector;
+	FVector3d RidgeDirection = FVector3d::ZeroVector;
+	FVector3d FoldDirection = FVector3d::ZeroVector;
 	EOrogenyType OrogenyType = EOrogenyType::None;
-	float OrogenyAge = 0.0f;
-	int32 TerraneId = -1;
-	FVector BoundaryNormal = FVector::ZeroVector;
-	EBoundaryType BoundaryType = EBoundaryType::None;
-	bool bGapDetected = false;
-	int32 FlankingPlateIdA = INDEX_NONE;
-	int32 FlankingPlateIdB = INDEX_NONE;
-	bool bOverlapDetected = false;
-	ESubductionRole SubductionRole = ESubductionRole::None;
-	int32 SubductionOpposingPlateId = INDEX_NONE;
+	int32 TerraneId = INDEX_NONE;
 	float SubductionDistanceKm = -1.0f;
-	float SubductionConvergenceSpeedMmPerYear = 0.0f;
-	bool bIsSubductionFront = false;
-	float CollisionDistanceKm = -1.0f;
-	float CollisionConvergenceSpeedMmPerYear = 0.0f;
-	int32 CollisionOpposingPlateId = INDEX_NONE;
-	float CollisionInfluenceRadiusKm = -1.0f;
-	bool bIsCollisionFront = false;
-	uint8 NumOverlapPlateIds = 0;
-	int32 OverlapPlateIds[4] = { INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE };
+	bool bIsBoundary = false;
 };
 
-// Triangle from the global SDT (indices into Samples array).
-struct FDelaunayTriangle
-{
-	int32 V[3] = { INDEX_NONE, INDEX_NONE, INDEX_NONE };
-};
-
-// Mutable crust attributes carried by a plate between reconciliations.
-// Positions are never stored here; they are computed on demand by rotating
-// the canonical sample position using the plate's cumulative rotation.
-struct FCarriedSampleData
+struct FCarriedSample
 {
 	int32 CanonicalSampleIndex = INDEX_NONE;
+	float ContinentalWeight = 0.0f;
 	float Elevation = 0.0f;
 	float Thickness = 0.0f;
 	float Age = 0.0f;
-	FVector RidgeDirection = FVector::ZeroVector;
-	FVector FoldDirection = FVector::ZeroVector;
+	FVector3d RidgeDirection = FVector3d::ZeroVector;
+	FVector3d FoldDirection = FVector3d::ZeroVector;
 	EOrogenyType OrogenyType = EOrogenyType::None;
-	float OrogenyAge = 0.0f;
-	ECrustType CrustType = ECrustType::Continental;
-	ESubductionRole SubductionRole = ESubductionRole::None;
-	int32 SubductionOpposingPlateId = INDEX_NONE;
+	int32 TerraneId = INDEX_NONE;
 	float SubductionDistanceKm = -1.0f;
-	float SubductionConvergenceSpeedMmPerYear = 0.0f;
-	bool bIsSubductionFront = false;
-	float CollisionDistanceKm = -1.0f;
-	float CollisionConvergenceSpeedMmPerYear = 0.0f;
-	int32 CollisionOpposingPlateId = INDEX_NONE;
-	float CollisionInfluenceRadiusKm = -1.0f;
-	bool bIsCollisionFront = false;
+	float SubductionSpeed = 0.0f;
 };
 
-// Result of a containment query against moved plate triangle soups.
-struct FContainmentQueryResult
+struct FSphericalBoundingCap
 {
-	bool bFoundContainingPlate = false;
-	bool bGap = true;
-	bool bOverlap = false;
+	FVector3d Center = FVector3d::ZeroVector;
+	double CosAngle = 1.0;
+};
+
+struct FTerrane
+{
+	int32 TerraneId = INDEX_NONE;
+	int32 AnchorSample = INDEX_NONE;
+	FVector3d Centroid = FVector3d::ZeroVector;
+	double AreaKm2 = 0.0;
 	int32 PlateId = INDEX_NONE;
-	int32 TriangleIndex = INDEX_NONE; // Global SDT triangle index
-	FVector Barycentric = FVector::ZeroVector;
-	int32 NumCapCandidates = 0;
-	int32 NumContainingPlates = 0;
-	int32 ContainingPlateIds[4] = { INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE };
 };
 
-struct FReconcilePhaseTimings
+struct FCollisionCandidate
 {
-	double SampleBufferCopyMs = 0.0;
-	double Phase1BuildSpatialMs = 0.0;
-	double Phase1SoupExtractTotalMs = 0.0;
-	double Phase1SoupExtractMaxMs = 0.0;
-	double Phase1CapBuildTotalMs = 0.0;
-	double Phase1CapBuildMaxMs = 0.0;
-	double Phase1BVHBuildTotalMs = 0.0;
-	double Phase1BVHBuildMaxMs = 0.0;
-	double Phase2OwnershipMs = 0.0;
-	double Phase3InterpolationMs = 0.0;
-	double Phase4GapMs = 0.0;
-	double Phase5OverlapMs = 0.0;
-	double Phase6MembershipMs = 0.0;
-	double Phase6SanitizeOwnershipMs = 0.0;
-	double Phase6PersistenceMs = 0.0;
-	double Phase6InvalidPlateRepairMs = 0.0;
-	double Phase6SanitizePassMs = 0.0;
-	double Phase6ConnectivityOnlyMs = 0.0;
-	double Phase6ProtectedRescueMs = 0.0;
-	double Phase6RebuildMembershipMs = 0.0;
-	double Phase6RebuildCarriedMs = 0.0;
-	double Phase6ClassifyTrianglesMs = 0.0;
-	double Phase6SpatialRebuildMs = 0.0;
-	double Phase7SubductionMs = 0.0;
-	double Phase7TerraneMs = 0.0;
-	double Phase8CollisionMs = 0.0;
-	double Phase8PostCollisionRefreshMs = 0.0;
-	double Phase10RiftingMs = 0.0;
-	double Phase10PostRiftRefreshMs = 0.0;
-	double ContinentalStabilizerMs = 0.0;
-	double StabilizerPromoteToMinimumMs = 0.0;
-	double StabilizerBuildComponentsMs = 0.0;
-	double StabilizerComponentPruneMs = 0.0;
-	double StabilizerPromoteToTargetMs = 0.0;
-	double StabilizerTrimMs = 0.0;
-	double PrevPlateWritebackMs = 0.0;
-	double Phase9SubductionMs = 0.0;
-	double PhaseSumMs = 0.0;
-	double UnaccountedMs = 0.0;
-	double UnaccountedPct = 0.0;
+	int32 SampleIndex = INDEX_NONE;
+	int32 OverridingPlateId = INDEX_NONE;
+	int32 SubductingPlateId = INDEX_NONE;
+};
+
+struct FCollisionEvent
+{
+	bool bDetected = false;
+	int32 TerraneId = INDEX_NONE;
+	int32 OverridingPlateId = INDEX_NONE;
+	int32 SubductingPlateId = INDEX_NONE;
+	FVector3d CollisionCenter = FVector3d::ZeroVector;
+	TArray<int32> CollisionSampleIndices;
+	TArray<int32> TerraneSampleIndices;
+};
+
+struct FBoundaryContactPersistence
+{
+	// Pair-level streak tracking for clean preserve-mode continental contact.
+	int32 PlateA = INDEX_NONE;
+	int32 PlateB = INDEX_NONE;
+	int32 ConsecutiveResamples = 0;
+	int32 LastObservedStep = INDEX_NONE;
+	int32 LastCandidateCount = 0;
+	int32 LastLargestZoneSize = 0;
+	int32 PeakLargestZoneSize = 0;
+};
+
+struct FPendingBoundaryContactCollisionEvent
+{
+	// Cached preserve-mode contact evidence consumed by same-step follow-up.
+	bool bValid = false;
+	int32 PlateA = INDEX_NONE;
+	int32 PlateB = INDEX_NONE;
+	TArray<int32> BoundarySeedSampleIndices;
+	FVector3d ContactCenter = FVector3d::ZeroVector;
+	int32 PeakZoneSize = 0;
+	int32 ConsecutiveResamples = 0;
+};
+
+struct FPendingRiftEvent
+{
+	bool bValid = false;
+	bool bAutomatic = false;
+	int32 ParentPlateId = INDEX_NONE;
+	int32 ChildCount = 0;
+	int32 ChildPlateA = INDEX_NONE;
+	int32 ChildPlateB = INDEX_NONE;
+	int32 ParentSampleCount = 0;
+	int32 ParentContinentalSampleCount = 0;
+	int32 ChildSampleCountA = 0;
+	int32 ChildSampleCountB = 0;
+	int32 EventSeed = 0;
+	TArray<int32> ChildPlateIds;
+	TArray<int32> ChildSampleCounts;
+	TArray<int32> FormerParentSampleIndices;
+	TArray<int32> FormerParentTerraneIds;
+	double ParentContinentalFraction = 0.0;
+	double TriggerProbability = 0.0;
+	double RiftMs = 0.0;
+};
+
+struct FResamplingStats
+{
+	int32 Step = 0;
+	int32 Interval = 0;
+	int32 ExactSingleHitCount = 0;
+	int32 ExactMultiHitCount = 0;
+	int32 RecoveryContainmentCount = 0;
+	int32 RecoveryContinentalCount = 0;
+	int32 TrueGapCount = 0;
+	int32 InteriorSoupTriangleCount = 0;
+	int32 BoundarySoupTriangleCount = 0;
+	int32 TotalSoupTriangleCount = 0;
+	int32 DroppedMixedTriangleCount = 0;
+	int32 DuplicatedSoupTriangleCount = 0;
+	int32 ForeignLocalVertexCount = 0;
+	int32 GapCount = 0;
+	int32 DivergentGapCount = 0;
+	int32 NonDivergentGapCount = 0;
+	int32 DivergentContinentalGapCount = 0;
+	int32 NonDivergentContinentalGapCount = 0;
+	int32 NonDivergentGapTriangleProjectionCount = 0;
+	int32 NonDivergentGapNearestCopyCount = 0;
+	int32 OverlapCount = 0;
+	int32 ValidContainmentCount = 0;
+	int32 MultiContainmentCount = 0;
+	int32 NoValidHitCount = 0;
+	int32 MissingLocalCarriedLookupCount = 0;
+	int32 OceanicOceanicOverlapCount = 0;
+	int32 OceanicContinentalOverlapCount = 0;
+	int32 ContinentalContinentalOverlapCount = 0;
+	int32 NonConvergentOverlapCount = 0;
+	int32 HysteresisRetainedCount = 0;
+	int32 HysteresisReassignedCount = 0;
+	int32 PreserveOwnershipSamePlateHitCount = 0;
+	int32 PreserveOwnershipSamePlateRecoveryCount = 0;
+	int32 PreserveOwnershipFallbackQueryCount = 0;
+	int32 PreserveOwnershipPlateChangedCount = 0;
+	int32 TerraneCount = 0;
+	int32 NewTerraneCount = 0;
+	int32 MergedTerraneCount = 0;
+	int32 SubductionFrontEdgeCount = 0;
+	int32 SubductionSeedSampleCount = 0;
+	int32 SubductionInfluencedCount = 0;
+	int32 SlabPullPlateCount = 0;
+	int32 SlabPullTotalFrontSamples = 0;
+	int32 CollisionCount = 0;
+	int32 CollisionDeferredCount = 0;
+	int32 CollisionTerraneId = INDEX_NONE;
+	int32 CollisionTerraneSampleCount = 0;
+	int32 CollisionOverridingPlateId = INDEX_NONE;
+	int32 CollisionSubductingPlateId = INDEX_NONE;
+	int32 CollisionSurgeAffectedCount = 0;
+	int32 RiftCount = 0;
+	int32 RiftParentPlateId = INDEX_NONE;
+	int32 RiftChildCount = 0;
+	int32 RiftChildPlateA = INDEX_NONE;
+	int32 RiftChildPlateB = INDEX_NONE;
+	int32 RiftParentSampleCount = 0;
+	int32 RiftChildSampleCountA = 0;
+	int32 RiftChildSampleCountB = 0;
+	int32 RiftMinChildSampleCount = 0;
+	int32 RiftMaxChildSampleCount = 0;
+	int32 RiftTotalChildBoundaryContactEdges = 0;
+	int32 RiftTerraneCountBefore = 0;
+	int32 RiftTerraneCountAfter = 0;
+	int32 RiftTerraneFragmentsOnChildA = 0;
+	int32 RiftTerraneFragmentsOnChildB = 0;
+	int32 RiftTerraneSplitCount = 0;
+	int32 RiftTerranePreservedCount = 0;
+	int32 RiftParentContinentalSampleCount = 0;
+	int32 RiftEventSeed = 0;
+	int32 RiftDivergentChildBoundaryEdgeCount = 0;
+	TArray<int32> RiftChildPlateIds;
+	TArray<int32> RiftChildSampleCounts;
+	TArray<int32> RiftChildTerraneFragmentCounts;
+	TArray<int32> RiftPreTerraneIds;
+	TArray<int32> RiftPreTerraneTouchedChildCounts;
+	bool bRiftWasAutomatic = false;
+	int32 BoundaryContactCollisionCandidateCount = 0;
+	int32 BoundaryContactCollisionPairCount = 0;
+	int32 BoundaryContactLargestZoneSize = 0;
+	int32 BoundaryContactTriggerPlateA = INDEX_NONE;
+	int32 BoundaryContactTriggerPlateB = INDEX_NONE;
+	int32 BoundaryContactPersistencePairA = INDEX_NONE;
+	int32 BoundaryContactPersistencePairB = INDEX_NONE;
+	int32 BoundaryContactPersistenceCount = 0;
+	int32 CachedBoundaryContactSeedCount = 0;
+	int32 CachedBoundaryContactTerraneSeedCount = 0;
+	int32 CachedBoundaryContactTerraneRecoveredCount = 0;
+	int32 CachedBoundaryContactPlateA = INDEX_NONE;
+	int32 CachedBoundaryContactPlateB = INDEX_NONE;
+	bool bBoundaryContactCollisionTriggered = false;
+	bool bBoundaryContactPersistenceTriggered = false;
+	bool bUsedCachedBoundaryContactCollision = false;
+	double RecoveryMeanDistance = 0.0;
+	double RecoveryP95Distance = 0.0;
+	double RecoveryMaxDistance = 0.0;
+	double SubductionMeanDistanceKm = 0.0;
+	double SubductionMaxDistanceKm = 0.0;
+	double SlabPullMaxAxisChangeRad = 0.0;
+	double CollisionSurgeRadiusRad = 0.0;
+	double CollisionSurgeMeanElevationDelta = 0.0;
+	double RiftMs = 0.0;
+	double RiftMeanChildSampleCount = 0.0;
+	double RiftParentContinentalFraction = 0.0;
+	double RiftTriggerProbability = 0.0;
+	double SoupBuildMs = 0.0;
+	double OwnershipQueryMs = 0.0;
+	double InterpolationMs = 0.0;
+	double GapResolutionMs = 0.0;
+	double OverlapClassificationMs = 0.0;
+	double RepartitionMs = 0.0;
+	double CollisionMs = 0.0;
+	double SubductionDistanceFieldMs = 0.0;
+	double SlabPullMs = 0.0;
+	double TerraneDetectionMs = 0.0;
 	double TotalMs = 0.0;
-	int32 StabilizerPromotionCount = 0;
-	int32 StabilizerComponentDemotionCount = 0;
-	int32 StabilizerTrimDemotionCount = 0;
-	int32 StabilizerHeapPushCount = 0;
-	int32 StabilizerHeapStalePopCount = 0;
-	bool bContinentalStabilizerShadowMatched = true;
-	int32 ContinentalStabilizerShadowMismatchSampleIndex = INDEX_NONE;
-	FString ContinentalStabilizerShadowMismatchField;
-	int32 GapSamples = 0;
-	int32 ArtifactGapResolvedSamples = 0;
-	int32 DivergentGapSamples = 0;
-	int32 OverlapSamples = 0;
-	int32 Phase2FastPathResolvedSamples = 0;
-	int32 Phase2FastPathAttemptSamples = 0;
-	int32 Phase2FullQuerySamples = 0;
-	int64 Phase2TotalCapCandidates = 0;
-	int32 Phase2MaxCapCandidates = 0;
-	int32 Phase6InvalidPlateRepairSampleCount = 0;
-	int32 Phase6SanitizeMutationCount = 0;
-	int32 Phase6ConnectivityMutationCount = 0;
-	int32 Phase6ProtectedRescueMutationCount = 0;
-	int32 Phase6SpatialDirtyPlateCount = 0;
-	int32 Phase6SpatialRebuiltPlateCount = 0;
-	int32 Phase9OverridingSeedCount = 0;
-	int32 Phase9SubductingSeedCount = 0;
-	int32 Phase9SeedPlateCount = 0;
-	int32 Phase9TouchedSampleCount = 0;
-	int32 RefreshEventScanCallCount = 0;
-	int32 RefreshFinalizeCallCount = 0;
-	int32 RefreshLocalizedCallCount = 0;
-	int32 RefreshFullFallbackCallCount = 0;
-	int32 RefreshMaxDirtyPlateCount = 0;
-	int32 RefreshMaxDirtySampleCount = 0;
-	int32 RefreshMaxDirtyTriangleCount = 0;
-	int32 RefreshMaxJournalDirtySampleCount = 0;
-	int32 RefreshMaxHaloSampleCount = 0;
-	int32 RefreshMaxDirtyFrontierSampleCount = 0;
 };
 
 struct FPlate
 {
-	int32 Id = -1;
-	FVector RotationAxis = FVector::UpVector;
-	float AngularSpeed = 0.0f;
-	FQuat CumulativeRotation = FQuat::Identity;
-	double AngularDisplacementSinceReconcile = 0.0;
-	TArray<int32> SampleIndices;
-	TArray<FCarriedSampleData> CarriedSamples;
+	FPlate()
+		: SoupAdapter(&SoupData)
+	{
+	}
+
+	FPlate(const FPlate& Other)
+		: Id(Other.Id)
+		, RotationAxis(Other.RotationAxis)
+		, AngularSpeed(Other.AngularSpeed)
+		, OverlapScore(Other.OverlapScore)
+		, SlabPullCorrectionAxis(Other.SlabPullCorrectionAxis)
+		, SlabPullFrontSampleCount(Other.SlabPullFrontSampleCount)
+		, LastRiftStep(Other.LastRiftStep)
+		, CumulativeRotation(Other.CumulativeRotation)
+		, MemberSamples(Other.MemberSamples)
+		, CarriedSamples(Other.CarriedSamples)
+		, CanonicalToCarriedIndex(Other.CanonicalToCarriedIndex)
+		, InteriorTriangles(Other.InteriorTriangles)
+		, BoundaryTriangles(Other.BoundaryTriangles)
+		, SoupTriangles(Other.SoupTriangles)
+		, BoundingCap(Other.BoundingCap)
+		, SoupData(Other.SoupData)
+		, SoupAdapter(&SoupData)
+	{
+	}
+
+	FPlate(FPlate&& Other) noexcept
+		: Id(Other.Id)
+		, RotationAxis(Other.RotationAxis)
+		, AngularSpeed(Other.AngularSpeed)
+		, OverlapScore(Other.OverlapScore)
+		, SlabPullCorrectionAxis(Other.SlabPullCorrectionAxis)
+		, SlabPullFrontSampleCount(Other.SlabPullFrontSampleCount)
+		, LastRiftStep(Other.LastRiftStep)
+		, CumulativeRotation(Other.CumulativeRotation)
+		, MemberSamples(MoveTemp(Other.MemberSamples))
+		, CarriedSamples(MoveTemp(Other.CarriedSamples))
+		, CanonicalToCarriedIndex(MoveTemp(Other.CanonicalToCarriedIndex))
+		, InteriorTriangles(MoveTemp(Other.InteriorTriangles))
+		, BoundaryTriangles(MoveTemp(Other.BoundaryTriangles))
+		, SoupTriangles(MoveTemp(Other.SoupTriangles))
+		, BoundingCap(Other.BoundingCap)
+		, SoupData(MoveTemp(Other.SoupData))
+		, SoupAdapter(&SoupData)
+	{
+	}
+
+	FPlate& operator=(const FPlate& Other)
+	{
+		if (this != &Other)
+		{
+			Id = Other.Id;
+			RotationAxis = Other.RotationAxis;
+			AngularSpeed = Other.AngularSpeed;
+			OverlapScore = Other.OverlapScore;
+			SlabPullCorrectionAxis = Other.SlabPullCorrectionAxis;
+			SlabPullFrontSampleCount = Other.SlabPullFrontSampleCount;
+			LastRiftStep = Other.LastRiftStep;
+			CumulativeRotation = Other.CumulativeRotation;
+			MemberSamples = Other.MemberSamples;
+			CarriedSamples = Other.CarriedSamples;
+			CanonicalToCarriedIndex = Other.CanonicalToCarriedIndex;
+			InteriorTriangles = Other.InteriorTriangles;
+			BoundaryTriangles = Other.BoundaryTriangles;
+			SoupTriangles = Other.SoupTriangles;
+			BoundingCap = Other.BoundingCap;
+			SoupData = Other.SoupData;
+			SoupAdapter = FPlateTriangleSoupAdapter(&SoupData);
+			SoupBVH = FPlateTriangleSoupBVH{};
+		}
+		return *this;
+	}
+
+	FPlate& operator=(FPlate&& Other) noexcept
+	{
+		if (this != &Other)
+		{
+			Id = Other.Id;
+			RotationAxis = Other.RotationAxis;
+			AngularSpeed = Other.AngularSpeed;
+			OverlapScore = Other.OverlapScore;
+			SlabPullCorrectionAxis = Other.SlabPullCorrectionAxis;
+			SlabPullFrontSampleCount = Other.SlabPullFrontSampleCount;
+			LastRiftStep = Other.LastRiftStep;
+			CumulativeRotation = Other.CumulativeRotation;
+			MemberSamples = MoveTemp(Other.MemberSamples);
+			CarriedSamples = MoveTemp(Other.CarriedSamples);
+			CanonicalToCarriedIndex = MoveTemp(Other.CanonicalToCarriedIndex);
+			InteriorTriangles = MoveTemp(Other.InteriorTriangles);
+			BoundaryTriangles = MoveTemp(Other.BoundaryTriangles);
+			SoupTriangles = MoveTemp(Other.SoupTriangles);
+			BoundingCap = Other.BoundingCap;
+			SoupData = MoveTemp(Other.SoupData);
+			SoupAdapter = FPlateTriangleSoupAdapter(&SoupData);
+			SoupBVH = FPlateTriangleSoupBVH{};
+		}
+		return *this;
+	}
+
+	int32 Id = INDEX_NONE;
+	FVector3d RotationAxis = FVector3d(0.0, 0.0, 1.0);
+	double AngularSpeed = 0.0;
+	int32 OverlapScore = 0;
+	FVector3d SlabPullCorrectionAxis = FVector3d::ZeroVector;
+	int32 SlabPullFrontSampleCount = 0;
+	int32 LastRiftStep = INDEX_NONE;
+	FQuat4d CumulativeRotation = FQuat4d::Identity;
+	TArray<int32> MemberSamples;
+	TArray<FCarriedSample> CarriedSamples;
+	TMap<int32, int32> CanonicalToCarriedIndex;
 	TArray<int32> InteriorTriangles;
 	TArray<int32> BoundaryTriangles;
-	EPlatePersistencePolicy PersistencePolicy = EPlatePersistencePolicy::Protected;
-	int32 ParentPlateId = INDEX_NONE;
-	int32 BirthReconcileOrdinal = 0;
-	bool bRiftBorn = false;
-	FVector IdentityAnchorDirection = FVector::ForwardVector;
-	int32 InitialSampleCount = 0;
-	FVector CanonicalCenterDirection = FVector::ForwardVector;
-
-	FVector GetRotatedCanonicalPosition(const FVector& CanonicalPosition) const
-	{
-		return CumulativeRotation.RotateVector(CanonicalPosition);
-	}
+	TArray<int32> SoupTriangles;
+	FSphericalBoundingCap BoundingCap;
+	FPlateTriangleSoupData SoupData;
+	FPlateTriangleSoupAdapter SoupAdapter;
+	FPlateTriangleSoupBVH SoupBVH;
 };
 
-class AUROUS_API FTectonicPlanet
+struct AUROUS_API FTectonicPlanet
 {
-public:
-	FTectonicPlanet();
-	~FTectonicPlanet();
-	FTectonicPlanet(const FTectonicPlanet& Other);
-	FTectonicPlanet& operator=(const FTectonicPlanet& Other);
-	FTectonicPlanet(FTectonicPlanet&& Other) noexcept;
-	FTectonicPlanet& operator=(FTectonicPlanet&& Other) noexcept;
-
-	void Initialize(int32 NumSamples = 500000);
-
-	const TArray<FCanonicalSample>& GetSamples() const;
-	const TArray<FDelaunayTriangle>& GetTriangles() const { return Triangles; }
-	const TArray<TArray<int32>>& GetAdjacency() const { return Adjacency; }
-	const TArray<FPlate>& GetPlates() const { return Plates; }
-	TArray<FPlate>& GetPlates() { return Plates; }
-	int32 GetNumSamples() const;
-
-	void InitializePlates(int32 NumPlates = 7, int32 RandomSeed = 42);
-	void ClassifyTriangles();
-	void UpdateBoundaryFlags();
-
-	// Motion / timestep simulation
-	void AdvancePlateMotionStep();
-	bool ShouldReconcile() const;
-	void ResetDisplacementTracking();
-	void StepSimulation();
-	void Reconcile();
-
-	// On-demand rotated position lookup (positions are never stored per-plate).
-	FVector GetRotatedSamplePosition(const FPlate& Plate, int32 CanonicalSampleIndex) const;
-	FVector ComputeSurfaceVelocity(int32 PlateId, const FVector& Position) const;
-
-	// Spatial query infrastructure (rebuilt at reconciliation start; lazily rebuilt on demand if dirty).
-	void RebuildSpatialQueryData();
-	int32 GetLastSpatialDirtyPlateCount() const;
-	int32 GetLastSpatialRebuiltPlateCount() const;
-	FContainmentQueryResult QueryContainment(const FVector& Position) const;
-	bool GetPlateSoupTriangleAndVertexCounts(int32 PlateId, int32& OutTriangleCount, int32& OutVertexCount) const;
-	bool GetPlateSoupRotatedVertex(int32 PlateId, int32 CanonicalSampleIndex, FVector& OutRotatedPosition) const;
-	bool GetPlateBoundingCap(int32 PlateId, FVector& OutCenterDirection, double& OutCosHalfAngle) const;
-
-	// Simulation state accessors
-	double GetAverageSampleSpacing() const { return AverageSampleSpacing; }
-	double GetReconcileDisplacementThreshold() const { return ReconcileDisplacementThreshold; }
-	double GetMaxAngularDisplacementSinceReconcile() const { return MaxAngularDisplacementSinceReconcile; }
-	int64 GetTimestepCounter() const { return TimestepCounter; }
-	int32 GetReconcileCount() const { return ReconcileCount; }
-	bool WasReconcileTriggeredLastStep() const { return bReconcileTriggeredLastStep; }
-	int32 GetBoundarySampleCount() const { return BoundarySampleCount; }
-	double GetBoundaryMeanDepthHops() const { return BoundaryMeanDepthHops; }
-	int32 GetBoundaryMaxDepthHops() const { return BoundaryMaxDepthHops; }
-	int32 GetBoundaryDeepSampleCount() const { return BoundaryDeepSampleCount; }
-	int32 GetContinentalSampleCount() const { return ContinentalSampleCount; }
-	int32 GetContinentalPlateCount() const { return ContinentalPlateCount; }
-	double GetContinentalAreaFraction() const { return ContinentalAreaFraction; }
-	int32 GetContinentalComponentCount() const { return ContinentalComponentCount; }
-	int32 GetLargestContinentalComponentSize() const { return LargestContinentalComponentSize; }
-	int32 GetMaxPlateComponentCount() const { return MaxPlateComponentCount; }
-	int32 GetDetachedPlateFragmentSampleCount() const { return DetachedPlateFragmentSampleCount; }
-	int32 GetLargestDetachedPlateFragmentSize() const { return LargestDetachedPlateFragmentSize; }
-	int32 GetSubductionFrontSampleCount() const { return SubductionFrontSampleCount; }
-	int32 GetAndeanSampleCount() const { return AndeanSampleCount; }
-	int32 GetTrackedTerraneCount() const { return TrackedTerraneCount; }
-	int32 GetActiveTerraneCount() const { return ActiveTerraneCount; }
-	int32 GetMergedTerraneCount() const { return MergedTerraneCount; }
-	int32 GetCollisionEventCount() const { return CollisionEventCount; }
-	int32 GetRiftEventCount() const { return RiftEventCount; }
-	int32 GetActivePlateCount() const;
-	int32 GetHimalayanSampleCount() const { return HimalayanSampleCount; }
-	int32 GetPendingCollisionSampleCount() const { return PendingCollisionSampleCount; }
-	float GetMaxSubductionDistanceKm() const { return MaxSubductionDistanceKm; }
-	int32 GetMinProtectedPlateSampleCount() const { return MinProtectedPlateSampleCount; }
-	int32 GetEmptyProtectedPlateCount() const { return EmptyProtectedPlateCount; }
-	int32 GetRescuedProtectedPlateCount() const { return RescuedProtectedPlateCount; }
-	int32 GetRescuedProtectedSampleCount() const { return RescuedProtectedSampleCount; }
-	int32 GetRepeatedlyRescuedProtectedSampleCount() const { return RepeatedlyRescuedProtectedSampleCount; }
-	const FReconcilePhaseTimings& GetLastReconcileTimings() const { return LastReconcileTimings; }
-	float GetHysteresisThreshold() const { return HysteresisThreshold; }
-	void SetHysteresisThreshold(float InValue) { HysteresisThreshold = FMath::Max(0.0f, InValue); }
-	float GetBoundaryConfidenceThreshold() const { return BoundaryConfidenceThreshold; }
-	void SetBoundaryConfidenceThreshold(float InValue) { BoundaryConfidenceThreshold = FMath::Max(0.0f, InValue); }
-	int32 GetLastGapSampleCount() const { return LastGapSampleCount; }
-	EContinentalStabilizerMode GetContinentalStabilizerMode() const { return ContinentalStabilizerMode; }
-	void SetContinentalStabilizerMode(const EContinentalStabilizerMode InMode) { ContinentalStabilizerMode = InMode; }
-	ETectonicBenchmarkMode GetBenchmarkMode() const { return BenchmarkMode; }
-	void SetBenchmarkMode(const ETectonicBenchmarkMode InMode) { BenchmarkMode = InMode; }
-	bool GetEnableConnectivityEnforcement() const { return bEnableConnectivityEnforcement; }
-	void SetEnableConnectivityEnforcement(const bool bInEnable) { bEnableConnectivityEnforcement = bInEnable; }
-	bool GetEnablePhase6OwnershipRepair() const { return bEnablePhase6OwnershipRepair; }
-	void SetEnablePhase6OwnershipRepair(const bool bInEnable) { bEnablePhase6OwnershipRepair = bInEnable; }
-	bool GetValidateScopedP6Scans() const { return bValidateScopedP6Scans; }
-	void SetValidateScopedP6Scans(const bool bInEnable) { bValidateScopedP6Scans = bInEnable; }
-	bool GetLogP6MutationDiagnostics() const { return bLogP6MutationDiagnostics; }
-	void SetLogP6MutationDiagnostics(const bool bInEnable) { bLogP6MutationDiagnostics = bInEnable; }
-	bool GetTrackP6DisabledFragments() const { return bTrackP6DisabledFragments; }
-	void SetTrackP6DisabledFragments(const bool bInEnable)
-	{
-		bTrackP6DisabledFragments = bInEnable;
-		if (!bInEnable)
-		{
-			PreviousP6FragmentDiagnostics.Reset();
-		}
-	}
-	bool GetLogP6FragmentMembers() const { return bLogP6FragmentMembers; }
-	void SetLogP6FragmentMembers(const bool bInEnable) { bLogP6FragmentMembers = bInEnable; }
-	bool GetRequireP3ContenderSupport() const { return bRequireP3ContenderSupport; }
-	void SetRequireP3ContenderSupport(const bool bInEnable) { bRequireP3ContenderSupport = bInEnable; }
-	bool GetPaperSimpleOwnership() const { return bPaperSimpleOwnership; }
-	void SetPaperSimpleOwnership(const bool bInEnable) { bPaperSimpleOwnership = bInEnable; }
-	void SetP3P5TraceSampleIndices(const TArray<int32>& InSampleIndices) { P3P5TraceSampleIndices = InSampleIndices; }
-	void SetP3P5TraceReferenceDirections(const TArray<FVector>& InDirections) { P3P5TraceReferenceDirections = InDirections; }
-	int32 GetLastOverlapSampleCount() const { return LastOverlapSampleCount; }
-	double GetTimestepDurationYears() const { return TimestepDurationYears; }
-	double GetTimestepDurationMy() const { return TimestepDurationMy; }
-	float GetOceanicDampeningRateMmPerYear() const { return OceanicDampeningRateMmPerYear; }
-	float GetOceanicTrenchElevation() const { return OceanicTrenchElevationKm; }
-	float GetRidgeElevation() const { return RidgeElevationKm; }
-	float GetAbyssalPlainElevation() const { return AbyssalPlainElevationKm; }
-	float GetSubductionPeakDistanceKm() const { return SubductionPeakDistanceKm; }
-	float GetSubductionTrenchRadiusKm() const { return SubductionTrenchRadiusKm; }
-	float GetFoldBlendAtMaxSpeed() const { return FoldBlendAtMaxSpeed; }
-	float GetSlabPullAxisMaxDegreesPerStep() const { return SlabPullAxisMaxDegreesPerStep; }
-	double GetTargetContinentalAreaFraction() const { return TargetContinentalAreaFraction; }
-	void SetTargetContinentalAreaFraction(const double InValue) { TargetContinentalAreaFraction = FMath::Clamp(InValue, 0.0, 1.0); }
-	double GetMinContinentalAreaFraction() const { return MinContinentalAreaFraction; }
-	void SetMinContinentalAreaFraction(const double InValue) { MinContinentalAreaFraction = FMath::Clamp(InValue, 0.0, 1.0); }
-	double GetMaxContinentalAreaFraction() const { return MaxContinentalAreaFraction; }
-	void SetMaxContinentalAreaFraction(const double InValue) { MaxContinentalAreaFraction = FMath::Clamp(InValue, 0.0, 1.0); }
-	double GetMinContinentalPlateFraction() const { return MinContinentalPlateFraction; }
-	void SetMinContinentalPlateFraction(const double InValue) { MinContinentalPlateFraction = FMath::Clamp(InValue, 0.0, 1.0); }
-
-private:
-	struct FSpatialQueryData;
-	struct FPhase2SampleState;
-	struct FTerraneRecord
-	{
-		int32 TerraneId = INDEX_NONE;
-		int32 PlateId = INDEX_NONE;
-		int32 AnchorSampleIndex = INDEX_NONE;
-		FVector CentroidDirection = FVector::ZeroVector;
-		double AreaKm2 = 0.0;
-		int32 SampleCount = 0;
-		int32 MergedIntoTerraneId = INDEX_NONE;
-		int32 LastSeenReconcile = -1;
-		bool bActive = false;
-	};
-	struct FCollisionEventRecord
-	{
-		int32 DonorTerraneId = INDEX_NONE;
-		int32 ReceiverTerraneId = INDEX_NONE;
-		int32 DonorPlateId = INDEX_NONE;
-		int32 ReceiverPlateId = INDEX_NONE;
-		int32 ReconcileOrdinal = -1;
-		int32 ContactSampleCount = 0;
-		double CollisionAreaKm2 = 0.0;
-		float CollisionRadiusKm = 0.0f;
-		float MeanConvergenceSpeedMmPerYear = 0.0f;
-	};
-	struct FRiftEventRecord
-	{
-		int32 ParentPlateId = INDEX_NONE;
-		TArray<int32> ChildPlateIds;
-		int32 ReconcileOrdinal = -1;
-		int32 NumChildren = 0;
-		double ParentAreaKm2 = 0.0;
-		double ContinentalFraction = 0.0;
-		double Lambda = 0.0;
-		double Probability = 0.0;
-	};
-
-	struct FCollisionPairCandidate
-	{
-		int32 TerraneIdA = INDEX_NONE;
-		int32 TerraneIdB = INDEX_NONE;
-		int32 DonorTerraneId = INDEX_NONE;
-		int32 ReceiverTerraneId = INDEX_NONE;
-		int32 DonorPlateId = INDEX_NONE;
-		int32 ReceiverPlateId = INDEX_NONE;
-		TArray<int32> DonorSampleIndices;
-		TArray<int32> FrontSampleIndices;
-		TArray<int32> TouchedPlateIds;
-		int32 ContactSampleCount = 0;
-		double ConvergenceSpeedSum = 0.0;
-		float MeanConvergenceSpeedMmPerYear = 0.0f;
-	};
-
-	struct FRefreshCanonicalStateOptions
-	{
-		enum class EMode : uint8
-		{
-			EventScan,
-			Finalize
-		};
-
-		EMode Mode = EMode::Finalize;
-		bool bRebuildCarriedWorkspaces = true;
-		bool bTopologyAlreadyFresh = false;
-		FReconcilePhaseTimings* InOutTimings = nullptr;
-		const TArray<int32>* InitialDirtySampleIndices = nullptr;
-	};
-
-	void GenerateFibonacciSphere(int32 N);
-	void BuildDelaunayTriangulation();
-	void BuildAdjacencyGraph();
-	void RebuildAdjacencyEdgeDistanceCache(const TArray<FCanonicalSample>& InSamples);
-	void RebuildCarriedSampleWorkspaces();
-	void RebuildCarriedSampleWorkspacesForSamples(const TArray<FCanonicalSample>& InSamples, const TArray<uint8>* DirtyPlateFlags = nullptr);
-	void InvalidateSpatialQueryData();
-	void ResizeSpatialPlateStateStorage(int32 NumPlates) const;
-	void BuildSpatialQueryDataInternal() const;
-	double UpdateSpatialCapsForCurrentRotationsInternal() const;
-	void EnsureSpatialQueryDataBuilt() const;
-	const TArray<FCanonicalSample>& GetReadableSamplesInternal() const;
-	TArray<FCanonicalSample>& GetWritableSamplesInternal(int32 WriteBufferIndex);
-	void UpdateBoundaryFlagsForSamples(TArray<FCanonicalSample>& InOutSamples);
-	void UpdateBoundaryClassificationForSamples(TArray<FCanonicalSample>& InOutSamples);
-	void UpdateGapFlankingPlatesForSamples(TArray<FCanonicalSample>& InOutSamples);
-	void ClassifyTrianglesForSamples(TArray<FCanonicalSample>& InOutSamples);
-	void UpdateBoundaryAndContinentDiagnosticsForSamples(const TArray<FCanonicalSample>& InSamples);
-	void StabilizeContinentalCrustForSamples(
-		const TArray<FCanonicalSample>& PreviousSamples,
-		TArray<FCanonicalSample>& InOutSamples,
-		FReconcilePhaseTimings* InOutTimings = nullptr) const;
-	void StabilizeContinentalCrustForSamplesIncremental(
-		const TArray<FCanonicalSample>& PreviousSamples,
-		TArray<FCanonicalSample>& InOutSamples,
-		FReconcilePhaseTimings* InOutTimings = nullptr) const;
-	bool ResolveGapSamplePhase4(
-		int32 SampleIndex,
-		const TArray<uint8>& GapFlags,
-		TArray<FCanonicalSample>& InOutSamples,
-		bool& bOutDivergentGapCreated) const;
-	struct FSanitizeMutationDiagnostics
-	{
-		int32 OverlapTriggerMutationCount = 0;
-		int32 GapTriggerMutationCount = 0;
-		int32 LowMarginTriggerMutationCount = 0;
-	};
-	struct FConnectivityMutationDiagnostics
-	{
-		int32 FragmentCount = 0;
-		int32 MaxFragmentSize = 0;
-		int32 SingletonFragmentCount = 0;
-		int32 TinyFragmentCount = 0;
-		int32 SmallFragmentCount = 0;
-		int32 MediumFragmentCount = 0;
-		int32 LargeFragmentCount = 0;
-	};
-	struct FP6MutationDiagnosticContext
-	{
-		const TArray<int32>* BaselinePlateIds = nullptr;
-		const TArray<uint8>* BaselineBoundaryFlags = nullptr;
-		const TArray<int32>* BaselineBoundaryHops = nullptr;
-		const TArray<FPhase2SampleState>* Phase2States = nullptr;
-		const TCHAR* Substage = nullptr;
-	};
-	struct FP6FragmentPersistenceRecord
-	{
-		int32 PlateId = INDEX_NONE;
-		uint64 Signature = 0;
-		int32 Size = 0;
-		int32 PersistenceSteps = 0;
-	};
-	struct FP3P5TraceResult
-	{
-		int32 SampleIndex = INDEX_NONE;
-		FVector Position = FVector::ZeroVector;
-		int32 PrevPlateId = INDEX_NONE;
-		int32 InputPlateId = INDEX_NONE;
-		float OwnershipMargin = 0.0f;
-		bool bBoundaryLike = false;
-		bool bUsedFastPath = false;
-		bool bFastPathResolved = false;
-		bool bFullQueryUsed = false;
-		bool bGapFallbackToCurrentOwner = false;
-		bool bPreviousOwnerStillContains = false;
-		bool bHysteresisRetainedPreviousOwner = false;
-		bool bContenderSupportRetainedPreviousOwner = false;
-		int32 CandidatePlateId = INDEX_NONE;
-		int32 AssignedAfterP3 = INDEX_NONE;
-		int32 AssignedAfterP5 = INDEX_NONE;
-		int32 NumCapCandidates = 0;
-		int32 NumContainingPlates = 0;
-		int32 PreviousStepPrevOwnerSupportCount = 0;
-		int32 PreviousStepContenderSupportCount = 0;
-		FString PreviousStepNeighborSummary;
-		FString CandidateSummary;
-		FString AssignmentPath;
-	};
-	void RunBoundaryLikeLocalOwnershipSanitizePass(
-		const TArray<FPhase2SampleState>& Phase2States,
-		TArray<FCanonicalSample>& InOutSamples,
-		int32 NumIterations,
-		const TArray<uint8>* SeedSampleFlags = nullptr,
-		int32* OutMutatedSampleCount = nullptr,
-		FSanitizeMutationDiagnostics* OutDiagnostics = nullptr,
-		TArray<uint8>* OutDirtyPlateFlags = nullptr,
-		TArray<uint8>* OutProtectedPlateLossFlags = nullptr,
-		TArray<int32>* InOutNonGapCountsByPlate = nullptr,
-		TArray<TArray<int32>>* InOutSampleIndicesByPlate = nullptr,
-		const FP6MutationDiagnosticContext* MutationDiagnostics = nullptr) const;
-	// Pre-M5 invariant: non-gap ownership for each plate must remain connected until rifting exists.
-	void EnforceConnectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr, int32* OutMutatedSampleCount = nullptr, FConnectivityMutationDiagnostics* OutDiagnostics = nullptr, TArray<uint8>* OutDirtyPlateFlags = nullptr, TArray<uint8>* OutProtectedPlateLossFlags = nullptr, TArray<int32>* InOutNonGapCountsByPlate = nullptr, TArray<TArray<int32>>* InOutSampleIndicesByPlate = nullptr, const FP6MutationDiagnosticContext* MutationDiagnostics = nullptr) const;
-	bool RescueProtectedPlateOwnershipForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr, int32* OutMutatedSampleCount = nullptr, TArray<uint8>* OutDirtyPlateFlags = nullptr, TArray<uint8>* OutProtectedPlateLossFlags = nullptr, TArray<int32>* InOutNonGapCountsByPlate = nullptr, TArray<TArray<int32>>* InOutSampleIndicesByPlate = nullptr, const FP6MutationDiagnosticContext* MutationDiagnostics = nullptr);
-	void RebuildPlateMembershipFromSamples(const TArray<FCanonicalSample>& InSamples, const TArray<uint8>* DirtyPlateFlags = nullptr);
-	void UpdatePlateCanonicalCentersFromSamples(const TArray<FCanonicalSample>& InSamples, const TArray<uint8>* DirtyPlateFlags = nullptr);
-	bool IsPlateActive(int32 PlateId) const;
-	bool IsPlateProtected(int32 PlateId) const;
-	int32 GetInitialPlateFloorSamples(int32 TotalSampleCount, int32 PlateCount) const;
-	int32 GetPersistentPlateFloorSamples(int32 PlateId) const;
-	int32 FindNearestPlateByCap(const FVector& Direction) const;
-	float ComputeOwnershipMarginFromCaps(const FVector& Direction) const;
-	void ComputeP6BoundaryDiagnosticsForSamples(const TArray<FCanonicalSample>& InSamples, TArray<uint8>& OutBoundaryFlags, TArray<int32>& OutBoundaryHops) const;
-	void LogP6MutationDiagnosticEvent(const FP6MutationDiagnosticContext& Context, int32 SampleIndex, int32 OldPlateId, int32 NewPlateId) const;
-	void UpdateP6DisabledFragmentDiagnostics(const TArray<FCanonicalSample>& InSamples);
-	void LogP3P5TraceSelection(const TArray<FCanonicalSample>& InSamples, const TArray<int32>& TraceSampleIndices, const TArray<int32>* SourceReferenceIndices = nullptr) const;
-	void LogP3P5PostPhase5Trace(const TArray<FCanonicalSample>& ReadSamples, const TArray<FCanonicalSample>& InSamples, const TArray<FP3P5TraceResult>& TraceResults) const;
-	bool ResolveDominantConvergentInteractionForSample(
-		const TArray<FCanonicalSample>& InSamples,
-		int32 SampleIndex,
-		int32& OutOpposingPlateId,
-		int32& OutRepresentativeNeighborIndex,
-		float& OutConvergenceSpeedMmPerYear) const;
-	void DetectTerranesForSamples(TArray<FCanonicalSample>& InOutSamples);
-	bool ApplyContinentalCollisionEventsForSamples(TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* OutDirtyPlateFlags = nullptr);
-	bool ApplyContinentalCollisionEventsForSamples(
-		const TArray<FPhase2SampleState>& Phase2States,
-		TArray<FCanonicalSample>& InOutSamples,
-		TArray<uint8>* OutDirtyPlateFlags,
-		double* OutRefreshSeconds = nullptr,
-		FReconcilePhaseTimings* InOutTimings = nullptr);
-	bool ApplyNextContinentalCollisionEventForSamples(
-		TArray<FCanonicalSample>& InOutSamples,
-		TSet<int32>* InOutTerranesUsedThisReconcile = nullptr,
-		TArray<uint8>* OutDirtyPlateFlags = nullptr,
-		TArray<int32>* InOutBestCollisionDonorTerraneIds = nullptr);
-	bool BuildCollisionPairCandidatesForSamples(
-		const TArray<FCanonicalSample>& InSamples,
-		const TSet<int32>* InTerranesUsedThisReconcile,
-		TArray<FCollisionPairCandidate>& OutPairCandidates) const;
-	bool ApplyCollisionPairCandidateForSamples(
-		const FCollisionPairCandidate& Pair,
-		TArray<FCanonicalSample>& InOutSamples,
-		TSet<int32>* InOutTerranesUsedThisReconcile,
-		TArray<uint8>* OutDirtyPlateFlags,
-		TArray<int32>* InOutBestCollisionDonorTerraneIds,
-		TArray<int32>* OutChangedSampleIndices = nullptr);
-	void RefreshCanonicalStateAfterCollision(
-		const TArray<FPhase2SampleState>& Phase2States,
-		TArray<FCanonicalSample>& InOutSamples,
-		TArray<uint8>* InOutDirtyPlateFlags = nullptr);
-	void RefreshCanonicalStateAfterCollision(
-		const TArray<FPhase2SampleState>& Phase2States,
-		TArray<FCanonicalSample>& InOutSamples,
-		TArray<uint8>* InOutDirtyPlateFlags,
-		const FRefreshCanonicalStateOptions& Options);
-	void RefreshCanonicalStateAfterCollision(
-		TArray<FCanonicalSample>& InOutSamples,
-		TArray<uint8>* InOutDirtyPlateFlags,
-		const FRefreshCanonicalStateOptions& Options);
-	void RefreshCanonicalStateAfterCollision(TArray<FCanonicalSample>& InOutSamples, TArray<uint8>* InOutDirtyPlateFlags);
-	void RefreshCanonicalStateAfterCollision(TArray<FCanonicalSample>& InOutSamples);
-	bool ApplyPlateRiftingEventsForSamples(
-		TArray<FCanonicalSample>& InOutSamples,
-		TArray<uint8>* OutDirtyPlateFlags = nullptr,
-		double* OutRefreshSeconds = nullptr,
-		FReconcilePhaseTimings* InOutTimings = nullptr);
-	bool ApplyNextPlateRiftEventForSamples(
-		TArray<FCanonicalSample>& InOutSamples,
-		TArray<uint8>* OutDirtyPlateFlags = nullptr,
-		TArray<int32>* OutChangedSampleIndices = nullptr);
-	bool ApplyPlateRiftEventToPlateForSamples(
-		int32 ParentPlateId,
-		TArray<FCanonicalSample>& InOutSamples,
-		TArray<uint8>* OutDirtyPlateFlags = nullptr,
-		int32 ForcedChildCount = INDEX_NONE,
-		int32 ForcedEventSeed = INDEX_NONE,
-		TArray<int32>* OutChangedSampleIndices = nullptr);
-	bool ComputePlateRiftTriggerMetricsForSamples(
-		const TArray<FCanonicalSample>& InSamples,
-		int32 PlateId,
-		int64 ElapsedStepCount,
-		double& OutContinentalFraction,
-		double& OutAreaKm2,
-		double& OutLambda,
-		double& OutProbability) const;
-	void ClearSubductionFieldsForSamples(TArray<FCanonicalSample>& InOutSamples, const TArray<uint8>* CandidatePlateFlags = nullptr);
-	void UpdateSubductionFieldsForSamples(TArray<FCanonicalSample>& InOutSamples, FReconcilePhaseTimings* InOutTimings = nullptr);
-	void RefreshSubductionMetricsFromCarriedSamples();
-	void RefreshTerraneMetrics();
-	FTerraneRecord* FindTerraneRecordById(int32 TerraneId);
-	const FTerraneRecord* FindTerraneRecordById(int32 TerraneId) const;
-	static uint64 MakeCollisionHistoryKey(int32 TerraneIdA, int32 TerraneIdB);
-	static FVector ResolveDirectionField(
-		const FVector& SamplePosition,
-		const FVector& V0,
-		const FVector& V1,
-		const FVector& V2,
-		const FVector& Barycentric);
-	static void InterpolateTriangleFields(
-		const TArray<FCanonicalSample>& ReadSamples,
-		const FDelaunayTriangle& Triangle,
-		const FCarriedSampleData& V0,
-		const FCarriedSampleData& V1,
-		const FCarriedSampleData& V2,
-		const FVector& Barycentric,
-		FCanonicalSample& InOutDestSample);
-	static ECrustType MajorityCrustType(ECrustType A, ECrustType B, ECrustType C);
-	static EOrogenyType MajorityOrogenyType(EOrogenyType A, EOrogenyType B, EOrogenyType C);
-	static FVector3d ComputePlanarBarycentric(const FVector3d& A, const FVector3d& B, const FVector3d& C, const FVector3d& P);
-
-	TArray<FCanonicalSample> SampleBuffers[2];
-	TAtomic<int32> ReadableSampleBufferIndex { 0 };
-	TArray<FDelaunayTriangle> Triangles;
-	TArray<TArray<int32>> Adjacency;
-	TArray<TArray<float>> AdjacencyEdgeDistancesKm;
+	TArray<FSample> Samples;
 	TArray<FPlate> Plates;
-	TArray<FTerraneRecord> TerraneRecords;
-	TArray<FCollisionEventRecord> CollisionEvents;
-	TArray<FRiftEventRecord> RiftEvents;
-	TSet<uint64> CollisionHistoryKeys;
-	mutable TUniquePtr<FSpatialQueryData> SpatialQueryData;
-
-	double AverageSampleSpacing = 0.0;
-	double AverageCellAreaKm2 = 0.0;
-	double InitialMeanPlateAreaKm2 = 0.0;
-	double ReconcileDisplacementThreshold = 0.0;
-	double MaxAngularDisplacementSinceReconcile = 0.0;
-	int64 TimestepCounter = 0;
-	int64 LastReconcileStepOrdinal = 0;
-	int32 ReconcileCount = 0;
+	TArray<FTerrane> Terranes;
+	TArray<FIntVector> TriangleIndices;
+	TArray<TArray<int32>> SampleAdjacency;
+	TArray<TArray<int32>> TriangleAdjacency;
+	double PlanetRadiusKm = 6371.0;
+	double ContainmentRecoveryTolerance = 0.003;
+	int32 SampleCountConfig = 0;
+	int32 PlateCountConfig = 0;
+	int32 SimulationSeed = 0;
+	int32 NextPlateId = 0;
 	int32 NextTerraneId = 0;
-	int32 PlateInitializationSeed = 42;
-	bool bReconcileTriggeredLastStep = false;
-	int32 BoundarySampleCount = 0;
-	double BoundaryMeanDepthHops = 0.0;
-	int32 BoundaryMaxDepthHops = 0;
-	int32 BoundaryDeepSampleCount = 0;
-	int32 ContinentalSampleCount = 0;
-	int32 ContinentalPlateCount = 0;
-	int32 InitialContinentalPlateCount = 0;
-	double ContinentalAreaFraction = 0.0;
-	int32 ContinentalComponentCount = 0;
-	int32 LargestContinentalComponentSize = 0;
-	int32 MaxPlateComponentCount = 0;
-	int32 DetachedPlateFragmentSampleCount = 0;
-	int32 LargestDetachedPlateFragmentSize = 0;
-	int32 SubductionFrontSampleCount = 0;
-	int32 AndeanSampleCount = 0;
-	int32 TrackedTerraneCount = 0;
-	int32 ActiveTerraneCount = 0;
-	int32 MergedTerraneCount = 0;
-	int32 CollisionEventCount = 0;
-	int32 RiftEventCount = 0;
-	int32 HimalayanSampleCount = 0;
-	int32 PendingCollisionSampleCount = 0;
-	float MaxSubductionDistanceKm = 0.0f;
-	int32 MinProtectedPlateSampleCount = 0;
-	int32 EmptyProtectedPlateCount = 0;
-	int32 RescuedProtectedPlateCount = 0;
-	int32 RescuedProtectedSampleCount = 0;
-	int32 RepeatedlyRescuedProtectedSampleCount = 0;
-	int32 LastGapSampleCount = 0;
-	int32 LastOverlapSampleCount = 0;
-	int32 PendingContinentalFloorDiagnosticPreStabilizerCount = INDEX_NONE;
-	float HysteresisThreshold = 0.15f;
-	float BoundaryConfidenceThreshold = 0.15f;
-	double TargetContinentalAreaFraction = 0.30;
-	double MinContinentalAreaFraction = 0.25;
-	double MaxContinentalAreaFraction = 0.40;
-	double MinContinentalPlateFraction = 0.15;
-	EContinentalStabilizerMode ContinentalStabilizerMode = EContinentalStabilizerMode::Disabled;
-	ETectonicBenchmarkMode BenchmarkMode = ETectonicBenchmarkMode::Full;
-	bool bEnableConnectivityEnforcement = true;
-	bool bEnablePhase6OwnershipRepair = true;
-	bool bValidateScopedP6Scans = false;
-	bool bLogP6MutationDiagnostics = false;
-	bool bTrackP6DisabledFragments = false;
-	bool bLogP6FragmentMembers = false;
-	bool bRequireP3ContenderSupport = true;
-	bool bPaperSimpleOwnership = false;
-	FReconcilePhaseTimings LastReconcileTimings;
-	TArray<FP6FragmentPersistenceRecord> PreviousP6FragmentDiagnostics;
-	TArray<int32> P3P5TraceSampleIndices;
-	TArray<FVector> P3P5TraceReferenceDirections;
+	int32 CurrentStep = 0;
+	int32 LastComputedResampleInterval = 0;
+	int32 MaxResampleCount = INDEX_NONE;      // Test harness only.
+	int32 MaxStepsWithoutResampling = INDEX_NONE; // Safety valve / experiments.
+	int32 AutomaticRiftMinParentSamples = 2048;
+	int32 AutomaticRiftMinContinentalSamples = 256;
+	int32 AutomaticRiftCooldownSteps = 20;
+	double AutomaticRiftBaseLambdaPerStep = 0.01;
+	double AutomaticRiftParentSizeExponent = 1.0;
+	double AutomaticRiftContinentalExponent = 1.0;
+	double AutomaticRiftMinContinentalFraction = 0.10;
+	bool bEnableSlabPull = true;
+	bool bEnableAndeanContinentalConversion = true;
+	bool bEnableOverlapHysteresis = false; // Legacy experiment path retained for tests.
+	bool bEnableContinentalCollision = true;
+	bool bEnableAutomaticRifting = true;
+	bool bEnableWarpedRiftBoundaries = true;
+	double RiftBoundaryWarpAmplitude = 0.18;
+	double RiftBoundaryWarpFrequency = 1.5;
+	EResamplingPolicy ResamplingPolicy = EResamplingPolicy::PeriodicFull;
+	EResampleTriggerReason LastResampleTriggerReason = EResampleTriggerReason::None;
+	EResampleOwnershipMode LastResampleOwnershipMode = EResampleOwnershipMode::FullResolution;
+	bool bPendingFullResolutionResample = false;
+	bool bPendingBoundaryContactPersistenceReset = false;
+	FResamplingStats LastResamplingStats;
+	TArray<int32> ResamplingSteps;
+	// Preserve-mode collision triggering state. Cleared after follow-up execution.
+	TMap<uint64, FBoundaryContactPersistence> BoundaryContactPersistenceByPair;
+	FPendingBoundaryContactCollisionEvent PendingBoundaryContactCollisionEvent;
+	FPendingRiftEvent PendingRiftEvent;
 
-	static constexpr float OceanicDampeningRateMmPerYear = 0.04f;
-	static constexpr float OceanicTrenchElevationKm = -10.0f;
-	static constexpr double TimestepDurationYears = 2000000.0;
-	static constexpr double TimestepDurationMy = 2.0;
-	static constexpr float RidgeElevationKm = -1.0f;
-	static constexpr float AbyssalPlainElevationKm = -6.0f;
-	static constexpr float OceanicCrustThicknessKm = 7.0f;
-	static constexpr float InitialOceanicPlateElevationKm = -4.0f;
-	static constexpr double PlanetRadius = 6370.0;
-	static constexpr float SubductionInfluenceRadiusKm = 1800.0f;
-	static constexpr float SubductionPeakDistanceKm = 350.0f;
-	static constexpr float SubductionTrenchRadiusKm = 400.0f;
-	static constexpr float BaseSubductionUpliftMmPerYear = 0.6f;
-	static constexpr float MaxSubductionSpeedMmPerYear = 100.0f;
-	static constexpr float MaxContinentalElevationKm = 10.0f;
-	static constexpr float FoldBlendAtMaxSpeed = 0.2f;
-	static constexpr float SlabPullAxisMaxDegreesPerStep = 0.25f;
-	static constexpr float BaseRiftLambdaPerTimestep = 0.35f;
-	static constexpr float RiftWarpAmplitude = 0.15f;
-	static constexpr float RiftNoiseFrequency = 3.0f;
-	static constexpr float RiftDivergenceSpeedScale = 0.25f;
-
-#if WITH_DEV_AUTOMATION_TESTS
-	friend struct FTectonicPlanetTestAccess;
-#endif
+	void Initialize(int32 InSampleCount, double InPlanetRadiusKm);
+	void InitializePlates(int32 InPlateCount, int32 InRandomSeed, float InBoundaryWarpAmplitude, float InContinentalFraction);
+	void AdvanceStep();
+	void TriggerEventResampling(EResampleTriggerReason Reason);
+	bool TriggerForcedRift(int32 ParentPlateId, int32 ChildCount, int32 Seed = 0);
+	int32 FindPlateArrayIndexById(int32 PlateId) const;
+	void ComputePlateScores();
+	void BuildContainmentSoups();
+	void QueryOwnership(
+		TArray<int32>& OutNewPlateIds,
+		TArray<int32>& OutContainingTriangles,
+		TArray<FVector3d>& OutBarycentricCoords,
+		TArray<uint8>& OutGapFlags,
+		TArray<uint8>& OutOverlapFlags,
+		int32& OutGapCount,
+		int32& OutOverlapCount,
+		TArray<TArray<int32>>* OutOverlapPlateIds = nullptr,
+		FResamplingStats* OutStats = nullptr,
+		EResampleOwnershipMode OwnershipMode = EResampleOwnershipMode::FullResolution) const;
+	void InterpolateFromCarried(
+		const TArray<int32>& NewPlateIds,
+		const TArray<int32>& ContainingTriangles,
+		const TArray<FVector3d>& BarycentricCoords,
+		TArray<float>& OutSubductionDistances,
+		TArray<float>& OutSubductionSpeeds,
+		int32* OutMissingLocalCarriedLookupCount = nullptr);
+	void ResolveGaps(
+		TArray<int32>& NewPlateIds,
+		const TArray<uint8>& GapFlags,
+		TArray<float>& InOutSubductionDistances,
+		TArray<float>& InOutSubductionSpeeds,
+		FResamplingStats* InOutStats = nullptr);
+	void RepartitionMembership(
+		const TArray<int32>& NewPlateIds,
+		const TArray<float>* InSubductionDistances = nullptr,
+		const TArray<float>* InSubductionSpeeds = nullptr);
+	void CollectCollisionCandidates(
+		const TArray<uint8>& OverlapFlags,
+		const TArray<TArray<int32>>& OverlapPlateIds,
+		TArray<FCollisionCandidate>& OutCandidates) const;
+	bool DetectBoundaryContactCollisionTrigger(
+		FResamplingStats* InOutStats = nullptr,
+		FPendingBoundaryContactCollisionEvent* OutPendingEvent = nullptr) const;
+	bool UpdateBoundaryContactCollisionPersistence(
+		FResamplingStats& InOutStats,
+		int32 ResampleInterval);
+	void ResetBoundaryContactCollisionPersistence();
+	bool DetectAndApplyCollision(
+		EResampleTriggerReason TriggerReason,
+		const TArray<uint8>& OverlapFlags,
+		const TArray<TArray<int32>>& OverlapPlateIds,
+		const TArray<int32>& PreviousPlateIds,
+		const TArray<float>& PreviousContinentalWeights,
+		const TArray<int32>& PreviousTerraneAssignments,
+		TArray<int32>& InOutNewPlateIds,
+		FCollisionEvent& OutEvent,
+		FResamplingStats* InOutStats = nullptr) const;
+	void ApplyCollisionElevationSurge(
+		const FCollisionEvent& CollisionEvent,
+		FResamplingStats* InOutStats = nullptr);
+	void ComputeSubductionDistanceField(FResamplingStats* InOutStats = nullptr);
+	void ComputeSlabPullCorrections(FResamplingStats* InOutStats = nullptr);
+	static double SubductionDistanceTransfer(double DistanceRad, double ControlDistanceRad, double MaxDistanceRad);
+	static double CollisionBiweightKernel(double DistanceRad, double RadiusRad);
+	void ClassifyOverlaps(
+		const TArray<uint8>& OverlapFlags,
+		const TArray<int32>& NewPlateIds,
+		FResamplingStats& Stats) const;
+	void DetectTerranes(const TArray<FTerrane>& PreviousTerranes);
+	void PerformResampling(
+		EResampleOwnershipMode OwnershipMode = EResampleOwnershipMode::FullResolution,
+		EResampleTriggerReason TriggerReason = EResampleTriggerReason::None);
+	int32 ComputeResampleInterval() const;
+	bool TryTriggerAutomaticRift();
+	bool TriggerForcedRiftInternal(
+		int32 ParentPlateId,
+		int32 ChildCount,
+		int32 Seed,
+		bool bAutomatic,
+		double TriggerProbability,
+		int32 ParentContinentalSampleCount,
+		double ParentContinentalFraction);
+	bool IsPlateEligibleForAutomaticRift(
+		const FPlate& Plate,
+		int32 ChildCount,
+		int32& OutContinentalSampleCount,
+		double& OutContinentalFraction) const;
+	double ComputeAutomaticRiftProbability(const FPlate& Plate, double ContinentalFraction) const;
 };
-
-
-
-
-
-
-

@@ -2,6 +2,7 @@
 
 #include "Aurous.h"
 #include "Modules/ModuleManager.h"
+#include "ShewchukPredicates.h"
 
 #if WITH_EDITOR
 #include "Editor/SAurousTectonicControlPanel.h"
@@ -17,12 +18,14 @@ class FAurousModule : public IModuleInterface
 public:
 	virtual void StartupModule() override
 	{
+		exactinit();
+
 #if WITH_EDITOR
 		FGlobalTabmanager::Get()->RegisterNomadTabSpawner(
 			TectonicControlPanelTabName,
 			FOnSpawnTab::CreateRaw(this, &FAurousModule::SpawnTectonicControlPanelTab))
 			.SetDisplayName(LOCTEXT("TectonicControlPanelTabTitle", "Tectonic Control Panel"))
-			.SetTooltipText(LOCTEXT("TectonicControlPanelTabTooltip", "Control and monitor ATectonicPlanetActor simulation."))
+			.SetTooltipText(LOCTEXT("TectonicControlPanelTabTooltip", "Control ATectonicPlanetActor instances in the editor."))
 			.SetMenuType(ETabSpawnerMenuType::Hidden);
 
 		UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FAurousModule::RegisterMenus));
@@ -58,7 +61,7 @@ private:
 		Section.AddMenuEntry(
 			"OpenAurousTectonicControlPanel",
 			LOCTEXT("OpenTectonicControlPanelLabel", "Tectonic Control Panel"),
-			LOCTEXT("OpenTectonicControlPanelTooltip", "Open the Aurous tectonic planet control panel."),
+			LOCTEXT("OpenTectonicControlPanelTooltip", "Open the Aurous tectonic control panel."),
 			FSlateIcon(),
 			FUIAction(FExecuteAction::CreateRaw(this, &FAurousModule::OpenTectonicControlPanelTab)));
 	}
