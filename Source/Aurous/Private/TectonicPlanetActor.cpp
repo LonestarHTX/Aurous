@@ -261,6 +261,20 @@ FTectonicPlanetMetrics ATectonicPlanetActor::GetMetrics() const
 	return BuildPlanetMetrics(Planet);
 }
 
+FString ATectonicPlanetActor::GetActiveRuntimePresetLabel() const
+{
+	return bUseM6BaselineRuntimePreset ? TEXT("M6Baseline") : TEXT("EngineDefaults");
+}
+
+FString ATectonicPlanetActor::GetRuntimeConfigSummary() const
+{
+	const FTectonicPlanetRuntimeConfig RuntimeConfig =
+		Planet.Plates.IsEmpty()
+			? (bUseM6BaselineRuntimePreset ? GetM6BaselineRuntimeConfig() : FTectonicPlanetRuntimeConfig{})
+			: CaptureTectonicPlanetRuntimeConfig(Planet);
+	return DescribeTectonicPlanetRuntimeConfig(RuntimeConfig);
+}
+
 void ATectonicPlanetActor::GeneratePlanet(
 	const int32 InSampleCount,
 	const int32 InPlateCount,
@@ -285,6 +299,16 @@ void ATectonicPlanetActor::GeneratePlanet(
 
 	Planet.Initialize(SampleCount, PlanetRadiusKm);
 	Planet.InitializePlates(PlateCount, RandomSeed, BoundaryWarpAmplitude, ContinentalFraction);
+	if (bUseM6BaselineRuntimePreset)
+	{
+		ApplyTectonicPlanetRuntimeConfig(Planet, GetM6BaselineRuntimeConfig());
+	}
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("TectonicPlanetActor: runtime_preset=%s %s"),
+		*GetActiveRuntimePresetLabel(),
+		*GetRuntimeConfigSummary());
 	BuildMeshWithMode(VisualizationMode);
 
 #if WITH_EDITOR

@@ -559,15 +559,17 @@ void SAurousTectonicControlPanel::SyncPendingSettingsFromActor()
 void SAurousTectonicControlPanel::RefreshMetrics()
 {
 	if (ATectonicPlanetActor* Actor = GetSelectedActor())
-	{
-		const FTectonicPlanetMetrics Metrics = Actor->GetMetrics();
-		CachedCurrentStep = Metrics.CurrentStep;
-		CachedLastAdvanceStepMs = Actor->GetLastAdvanceStepMs();
-		CachedMetricsText = FText::FromString(FString::Printf(
-			TEXT("Step: %d\nSamples: %d\nPlates: %d\nTerranes: %d\nContinental Fraction: %.3f\nElevation Min/Max/Mean: %.3f / %.3f / %.3f"),
-			Metrics.CurrentStep,
-			Metrics.SampleCount,
-			Metrics.PlateCount,
+		{
+			const FTectonicPlanetMetrics Metrics = Actor->GetMetrics();
+			CachedCurrentStep = Metrics.CurrentStep;
+			CachedLastAdvanceStepMs = Actor->GetLastAdvanceStepMs();
+			CachedMetricsText = FText::FromString(FString::Printf(
+				TEXT("Preset: %s\nRuntime: %s\nStep: %d\nSamples: %d\nPlates: %d\nTerranes: %d\nContinental Fraction: %.3f\nElevation Min/Max/Mean: %.3f / %.3f / %.3f"),
+				*Actor->GetActiveRuntimePresetLabel(),
+				*Actor->GetRuntimeConfigSummary(),
+				Metrics.CurrentStep,
+				Metrics.SampleCount,
+				Metrics.PlateCount,
 			Metrics.TerraneCount,
 			Metrics.ContinentalFraction,
 			Metrics.MinElevation,

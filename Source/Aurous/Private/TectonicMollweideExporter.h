@@ -32,4 +32,17 @@ namespace TectonicMollweideExporter
 		const FTectonicMollweideExportOptions& Options,
 		FTectonicMollweideExportStats& OutStats,
 		FString& OutError);
+
+	// Rasterize an arbitrary per-sample scalar onto the Mollweide projection.
+	// Values are barycentric-interpolated, gap-filled, and written as a grayscale PNG
+	// (black = MinValue, white = MaxValue). PerSampleValues must be same length as Planet.Samples.
+	AUROUS_API bool ExportScalarOverlay(
+		const FTectonicPlanet& Planet,
+		const TArray<float>& PerSampleValues,
+		float MinValue,
+		float MaxValue,
+		const FString& OutputPath,
+		int32 Width,
+		int32 Height,
+		FString& OutError);
 }

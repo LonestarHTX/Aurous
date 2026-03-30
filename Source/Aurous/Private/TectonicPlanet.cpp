@@ -26,7 +26,6 @@ namespace
 	constexpr double ConvergentThresholdRatio = -0.3;
 	constexpr double SlabPullEpsilon = 0.1;
 	constexpr double MaxAxisChangePerStepRad = 0.05;
-	constexpr double AndeanContinentalConversionRate = 0.005;
 	constexpr double CollisionGlobalDistanceRad = 0.659;
 	constexpr double CollisionCoefficient = 0.013;
 	constexpr double CollisionCWBoost = 0.3;
@@ -38,6 +37,8 @@ namespace
 	constexpr int32 MaxForcedRiftChildren = 4;
 	constexpr int32 MinBoundaryContactCollisionEdges = 4;
 	constexpr int32 MinBoundaryContactPersistenceResamples = 3;
+	constexpr int32 MinGeometricCollisionOverlapContinentalSamples = 3;
+	constexpr int32 MinGeometricCollisionOpposingContinentalSupport = 3;
 	constexpr double ElevationCeilingKm = 10.0;
 	constexpr double AbyssalPlainElevationKm = -6.0;
 	constexpr double TrenchElevationKm = -10.0;
@@ -52,12 +53,16 @@ namespace
 	constexpr double RidgeElevationKm = -1.0;
 	constexpr double MaxPlateSpeedMmPerYear = 100.0;
 	constexpr double MinPlateAngularSpeedFactor = 0.3;
+	constexpr double InitialPlateSpeedMinKmPerStep = 10.0;
+	constexpr double InitialPlateSpeedMaxKmPerStep = 40.0;
 	constexpr double ResampleTriggerK = 10.0;
 	constexpr int32 ResampleIntervalMin = 10;
 	constexpr int32 ResampleIntervalMax = 60;
 	constexpr double BoundingCapMargin = 1.0e-6;
 	constexpr double TriangleEpsilon = 1.0e-12;
 	constexpr double OverlapScoreEpsilon = 0.1;
+	constexpr double PreserveBoundaryStrongContinentalThreshold = 0.9;
+	constexpr double PreserveBoundaryRecoveredContinentalThreshold = 0.5;
 	constexpr double DirectionDegeneracyThreshold = 1.0e-8;
 	constexpr double GapSeparationDirectionEpsilon = 1.0e-10;
 	constexpr double DivergenceEpsilon = 1.0e-10;
@@ -311,8 +316,182 @@ namespace
 		FVector3d ContactCenterSum = FVector3d::ZeroVector;
 	};
 
-	bool IsFiniteVector(const FVector3d& Vector)
+	struct FGeometricCollisionOverlapHit
 	{
+		int32 OwningPlateId = INDEX_NONE;
+		int32 ContainingPlateId = INDEX_NONE;
+		int32 SampleIndex = INDEX_NONE;
+		double ConvergenceMagnitudeKmPerMy = 0.0;
+		int32 MinSampleIndex = INDEX_NONE;
+	};
+
+	struct FGeometricCollisionPairDiagnostics
+	{
+		int32 PlateA = INDEX_NONE;
+		int32 PlateB = INDEX_NONE;
+		int32 TotalOverlapSampleCount = 0;
+		int32 SubductingOverlapSampleCount = 0;
+		int32 OpposingContinentalSupportCount = 0;
+		int32 TerraneEstimate = 0;
+		int32 MinSampleIndex = INDEX_NONE;
+		double TotalConvergenceMagnitudeKmPerMy = 0.0;
+		double TotalConvergenceMagnitudeAInsideBKmPerMy = 0.0;
+		double TotalConvergenceMagnitudeBInsideAKmPerMy = 0.0;
+		double MaxConvergenceMagnitudeKmPerMy = 0.0;
+		double MeanOverlapDepthKm = 0.0;
+		double MaxOverlapDepthKm = 0.0;
+		bool bPassedMassFilter = false;
+		TArray<int32> SamplesFromAInsideB;
+		TArray<int32> SamplesFromBInsideA;
+	};
+
+	double GetGeometricCollisionPairMeanConvergenceMagnitudeKmPerMy(
+		const FGeometricCollisionPairDiagnostics& PairDiagnostics)
+	{
+		return PairDiagnostics.TotalOverlapSampleCount > 0
+			? PairDiagnostics.TotalConvergenceMagnitudeKmPerMy /
+				static_cast<double>(PairDiagnostics.TotalOverlapSampleCount)
+			: 0.0;
+	}
+
+	double GetGeometricCollisionDirectionalMeanConvergenceMagnitudeKmPerMy(
+		const FGeometricCollisionPairDiagnostics& PairDiagnostics,
+		const int32 DonorPlateId)
+	{
+		if (DonorPlateId == PairDiagnostics.PlateA)
+		{
+			return PairDiagnostics.SamplesFromAInsideB.Num() > 0
+				? PairDiagnostics.TotalConvergenceMagnitudeAInsideBKmPerMy /
+					static_cast<double>(PairDiagnostics.SamplesFromAInsideB.Num())
+				: 0.0;
+		}
+		if (DonorPlateId == PairDiagnostics.PlateB)
+		{
+			return PairDiagnostics.SamplesFromBInsideA.Num() > 0
+				? PairDiagnostics.TotalConvergenceMagnitudeBInsideAKmPerMy /
+					static_cast<double>(PairDiagnostics.SamplesFromBInsideA.Num())
+				: 0.0;
+		}
+		return 0.0;
+	}
+
+	enum class EGeometricCollisionDonorSelectionRule : uint8
+	{
+		None = 0,
+		DirectionalSingleBucket,
+		DirectionalCount,
+		DirectionalConvergence,
+		FallbackLowerPlateScore,
+		FallbackDirectionalCount,
+		FallbackConvergence,
+		FallbackStablePairTieBreak,
+	};
+
+	enum class EGeometricDirectionalBucketPopulation : uint8
+	{
+		Neither = 0,
+		OnlyOverriding,
+		OnlySubducting,
+		Both,
+	};
+
+	EGeometricDirectionalBucketPopulation ClassifyGeometricDirectionalBucketPopulation(
+		const int32 SubductingDirectionalSeedCount,
+		const int32 OverridingDirectionalSeedCount)
+	{
+		const bool bHasSubductingDirectionalSeeds = SubductingDirectionalSeedCount > 0;
+		const bool bHasOverridingDirectionalSeeds = OverridingDirectionalSeedCount > 0;
+		if (bHasSubductingDirectionalSeeds && bHasOverridingDirectionalSeeds)
+		{
+			return EGeometricDirectionalBucketPopulation::Both;
+		}
+		if (bHasOverridingDirectionalSeeds)
+		{
+			return EGeometricDirectionalBucketPopulation::OnlyOverriding;
+		}
+		if (bHasSubductingDirectionalSeeds)
+		{
+			return EGeometricDirectionalBucketPopulation::OnlySubducting;
+		}
+		return EGeometricDirectionalBucketPopulation::Neither;
+	}
+
+	const TCHAR* GetGeometricDirectionalBucketPopulationName(
+		const EGeometricDirectionalBucketPopulation Population)
+	{
+		switch (Population)
+		{
+		case EGeometricDirectionalBucketPopulation::OnlyOverriding:
+			return TEXT("only_overriding");
+		case EGeometricDirectionalBucketPopulation::OnlySubducting:
+			return TEXT("only_subducting");
+		case EGeometricDirectionalBucketPopulation::Both:
+			return TEXT("both");
+		case EGeometricDirectionalBucketPopulation::Neither:
+		default:
+			return TEXT("neither");
+		}
+	}
+
+	const TCHAR* GetGeometricCollisionDonorSelectionRuleName(
+		const EGeometricCollisionDonorSelectionRule Rule)
+	{
+		switch (Rule)
+		{
+		case EGeometricCollisionDonorSelectionRule::DirectionalSingleBucket:
+			return TEXT("directional_single_bucket");
+		case EGeometricCollisionDonorSelectionRule::DirectionalCount:
+			return TEXT("directional_count");
+		case EGeometricCollisionDonorSelectionRule::DirectionalConvergence:
+			return TEXT("directional_convergence");
+		case EGeometricCollisionDonorSelectionRule::FallbackLowerPlateScore:
+			return TEXT("fallback_lower_plate_score");
+		case EGeometricCollisionDonorSelectionRule::FallbackDirectionalCount:
+			return TEXT("fallback_directional_count");
+		case EGeometricCollisionDonorSelectionRule::FallbackConvergence:
+			return TEXT("fallback_convergence");
+		case EGeometricCollisionDonorSelectionRule::FallbackStablePairTieBreak:
+			return TEXT("fallback_stable_pair_tie_break");
+		case EGeometricCollisionDonorSelectionRule::None:
+		default:
+			return TEXT("none");
+		}
+	}
+
+	bool IsDirectionalGeometricCollisionDonorSelectionRule(const EGeometricCollisionDonorSelectionRule Rule)
+	{
+		return
+			Rule == EGeometricCollisionDonorSelectionRule::DirectionalSingleBucket ||
+			Rule == EGeometricCollisionDonorSelectionRule::DirectionalCount ||
+			Rule == EGeometricCollisionDonorSelectionRule::DirectionalConvergence;
+	}
+
+	double ComputeContainmentScore(const FVector3d& Barycentric);
+	FVector3d ProjectOntoTangent(const FVector3d& Vector, const FVector3d& Normal);
+	FVector3d ComputePlateSurfaceVelocity(const FPlate& Plate, const FVector3d& QueryPoint, const double PlanetRadius);
+	bool FindContainingTriangleInBVH(
+		const FPlateTriangleSoupBVH& BVH,
+		const FPlateTriangleSoupAdapter& Adapter,
+		const FVector3d& QueryPoint,
+		int32& OutLocalTriangleId,
+		FVector3d& OutA,
+		FVector3d& OutB,
+		FVector3d& OutC);
+		bool FindNearestMemberSample(
+			const FTectonicPlanet& Planet,
+			const int32 PlateId,
+			const FVector3d& QueryPoint,
+			int32& OutCanonicalSampleIndex,
+			double& OutGeodesicDistanceRadians);
+		struct FRecoveredContainmentHit;
+		bool TryFindNearestTriangleRecoveryHit(
+			const FTectonicPlanet& Planet,
+			const int32 PlateId,
+			const FVector3d& QueryPoint,
+			FRecoveredContainmentHit& OutHit);
+
+		bool IsFiniteVector(const FVector3d& Vector)
+		{
 		return FMath::IsFinite(Vector.X) && FMath::IsFinite(Vector.Y) && FMath::IsFinite(Vector.Z);
 	}
 
@@ -360,6 +539,51 @@ namespace
 		return nullptr;
 	}
 
+	void PruneEmptyPlates(FTectonicPlanet& Planet)
+	{
+		const int32 RemovedPlateCount = Planet.Plates.RemoveAll([](const FPlate& Plate)
+		{
+			return Plate.MemberSamples.IsEmpty();
+		});
+		if (RemovedPlateCount <= 0)
+		{
+			return;
+		}
+
+		for (auto PersistenceIt = Planet.BoundaryContactPersistenceByPair.CreateIterator(); PersistenceIt; ++PersistenceIt)
+		{
+			const FBoundaryContactPersistence& Persistence = PersistenceIt.Value();
+			if (FindPlateById(Planet, Persistence.PlateA) == nullptr ||
+				FindPlateById(Planet, Persistence.PlateB) == nullptr)
+			{
+				PersistenceIt.RemoveCurrent();
+			}
+		}
+		for (auto RecurrenceIt = Planet.GeometricCollisionPairRecurrenceByKey.CreateIterator(); RecurrenceIt; ++RecurrenceIt)
+		{
+			const uint64 PairKey = RecurrenceIt.Key();
+			const int32 PlateA = static_cast<int32>(PairKey >> 32);
+			const int32 PlateB = static_cast<int32>(PairKey & 0xffffffffu);
+			if (FindPlateById(Planet, PlateA) == nullptr || FindPlateById(Planet, PlateB) == nullptr)
+			{
+				RecurrenceIt.RemoveCurrent();
+			}
+		}
+
+		if (Planet.PendingBoundaryContactCollisionEvent.bValid &&
+			(FindPlateById(Planet, Planet.PendingBoundaryContactCollisionEvent.PlateA) == nullptr ||
+				FindPlateById(Planet, Planet.PendingBoundaryContactCollisionEvent.PlateB) == nullptr))
+		{
+			Planet.PendingBoundaryContactCollisionEvent = FPendingBoundaryContactCollisionEvent{};
+		}
+		if (Planet.PendingGeometricCollisionEvent.bValid &&
+			(FindPlateById(Planet, Planet.PendingGeometricCollisionEvent.PlateA) == nullptr ||
+				FindPlateById(Planet, Planet.PendingGeometricCollisionEvent.PlateB) == nullptr))
+		{
+			Planet.PendingGeometricCollisionEvent = FPendingGeometricCollisionEvent{};
+		}
+	}
+
 	bool IsOverridingPlate(const FTectonicPlanet& Planet, const int32 CandidatePlateId, const int32 OtherPlateId)
 	{
 		const FPlate* CandidatePlate = FindPlateById(Planet, CandidatePlateId);
@@ -373,8 +597,8 @@ namespace
 				CandidatePlateId < OtherPlateId);
 	}
 
-	const TCHAR* GetResampleTriggerReasonName(const EResampleTriggerReason Reason)
-	{
+		const TCHAR* GetResampleTriggerReasonName(const EResampleTriggerReason Reason)
+		{
 		switch (Reason)
 		{
 		case EResampleTriggerReason::Periodic:
@@ -390,11 +614,29 @@ namespace
 		case EResampleTriggerReason::None:
 		default:
 			return TEXT("None");
+			}
 		}
-	}
 
-	const TCHAR* GetResampleOwnershipModeName(const EResampleOwnershipMode OwnershipMode)
-	{
+		const TCHAR* GetResamplingPolicyName(const EResamplingPolicy Policy)
+		{
+			switch (Policy)
+			{
+			case EResamplingPolicy::PeriodicGlobalAuthoritativeSpike:
+				return TEXT("PeriodicGlobalAuthoritativeSpike");
+			case EResamplingPolicy::PreserveOwnershipPeriodic:
+				return TEXT("PreserveOwnershipPeriodic");
+			case EResamplingPolicy::HybridStablePeriodic:
+				return TEXT("HybridStablePeriodic");
+			case EResamplingPolicy::EventDrivenOnly:
+				return TEXT("EventDrivenOnly");
+			case EResamplingPolicy::PeriodicFull:
+			default:
+				return TEXT("PeriodicFull");
+			}
+		}
+
+		const TCHAR* GetResampleOwnershipModeName(const EResampleOwnershipMode OwnershipMode)
+		{
 		switch (OwnershipMode)
 		{
 		case EResampleOwnershipMode::PreserveOwnership:
@@ -404,6 +646,1098 @@ namespace
 		case EResampleOwnershipMode::FullResolution:
 		default:
 			return TEXT("FullResolution");
+		}
+	}
+
+	const TCHAR* GetRiftRecipientTypeName(const int32 TypeCode)
+	{
+		switch (TypeCode)
+		{
+		case 1:
+			return TEXT("sibling_child");
+		case 2:
+			return TEXT("other_neighbor");
+		default:
+			return TEXT("other_affected_plate");
+		}
+	}
+
+	FString JoinRiftRecipientTypeCodesForLog(const TArray<int32>& TypeCodes)
+	{
+		TArray<FString> Labels;
+		Labels.Reserve(TypeCodes.Num());
+		for (const int32 TypeCode : TypeCodes)
+		{
+			Labels.Add(GetRiftRecipientTypeName(TypeCode));
+		}
+		return FString::Join(Labels, TEXT(","));
+	}
+
+	struct FPlateComponentCountSummary
+	{
+		TMap<int32, int32> ComponentsByPlate;
+		int32 GlobalMaxComponents = 0;
+	};
+
+	struct FCollisionReceiverContiguityDiagnostics
+	{
+		int32 ReceiverComponentsBefore = 0;
+		int32 ReceiverComponentsAfter = 0;
+		bool bContiguousWithExistingTerritory = false;
+		int32 DisconnectedFragmentCount = 0;
+		int32 LargestNewDisconnectedFragmentSize = 0;
+	};
+
+	struct FSinglePlateComponentDiagnostics
+	{
+		int32 ComponentCount = 0;
+		int32 LargestComponentSize = 0;
+		int32 LargestSecondaryComponentSize = 0;
+	};
+
+	struct FDonorFragmentationDiagnostics
+	{
+		int32 ComponentsBefore = 0;
+		int32 ComponentsAfter = 0;
+		int32 LargestRemainingComponentSize = 0;
+		int32 NewFragmentCount = 0;
+		int32 SmallestNewFragmentSize = 0;
+		int32 LargestNewFragmentSize = 0;
+		double MeanNewFragmentSize = 0.0;
+	};
+
+	struct FCollisionTransferConnectivityDiagnostics
+	{
+		int32 GlobalMaxComponentsBefore = 0;
+		int32 GlobalMaxComponentsAfter = 0;
+		int32 DonorComponentsBefore = 0;
+		int32 DonorComponentsAfter = 0;
+		int32 ReceiverComponentsBefore = 0;
+		int32 ReceiverComponentsAfter = 0;
+		int32 DonorLargestRemainingComponentSize = 0;
+		int32 DonorNewFragmentCount = 0;
+		int32 DonorSmallestNewFragmentSize = 0;
+		int32 DonorLargestNewFragmentSize = 0;
+		double DonorMeanNewFragmentSize = 0.0;
+		bool bReceiverTransferContiguousWithExistingTerritory = false;
+		int32 ReceiverDisconnectedFragmentCount = 0;
+		int32 ReceiverLargestNewDisconnectedFragmentSize = 0;
+	};
+
+	struct FCollisionTransferProtectionDiagnostics
+	{
+		FCollisionTransferConnectivityDiagnostics Proposed;
+		FCollisionTransferConnectivityDiagnostics Applied;
+		int32 ProposedTerraneSampleCount = 0;
+		int32 AppliedTerraneSampleCount = 0;
+		double AppliedTrimRatio = 0.0;
+		bool bTrimmedByDonorProtection = false;
+		bool bRejectedByDonorProtection = false;
+		bool bTrimmedByDonorComponentCap = false;
+		bool bTrimmedByDonorFragmentFloor = false;
+		bool bRejectedByDonorComponentCap = false;
+		bool bRejectedByDonorFragmentFloor = false;
+		bool bTrimmedByReceiverProtection = false;
+		bool bRejectedByReceiverProtection = false;
+	};
+
+	struct FCollisionDonorProtectionResult
+	{
+		bool bPasses = true;
+		bool bFailedComponentCap = false;
+		bool bFailedFragmentFloor = false;
+	};
+
+	struct FRiftPlateAssignmentComponent
+	{
+		TArray<int32> SampleIndices;
+		TMap<int32, int32> BoundaryCountsByPlate;
+	};
+
+	enum class ERiftRecipientTypeCode : int32
+	{
+		OtherAffectedPlate = 0,
+		SiblingChild = 1,
+		OtherNeighbor = 2,
+	};
+
+	struct FRiftFragmentDestinationSelectionResult
+	{
+		int32 DestinationPlateId = INDEX_NONE;
+		bool bUsedSiblingChild = false;
+		bool bUsedZeroAdjacencySiblingFallback = false;
+		bool bUsedNonChildFallback = false;
+		bool bHadPositiveSiblingAdjacency = false;
+		int32 BestSiblingEdgeCount = 0;
+		int32 CandidateCountConsidered = 0;
+		int32 IncoherenceRejectedCount = 0;
+	};
+
+	void CollectPlateAssignmentComponents(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& PlateAssignments,
+		const int32 PlateId,
+		TArray<FRiftPlateAssignmentComponent>& OutComponents)
+	{
+		OutComponents.Reset();
+		if (PlateId == INDEX_NONE || PlateAssignments.Num() != Planet.Samples.Num())
+		{
+			return;
+		}
+
+		TArray<uint8> Visited;
+		Visited.Init(0, Planet.Samples.Num());
+		for (int32 SeedSampleIndex = 0; SeedSampleIndex < Planet.Samples.Num(); ++SeedSampleIndex)
+		{
+			if (!Planet.Samples.IsValidIndex(SeedSampleIndex) ||
+				Visited[SeedSampleIndex] != 0 ||
+				PlateAssignments[SeedSampleIndex] != PlateId)
+			{
+				continue;
+			}
+
+			FRiftPlateAssignmentComponent& Component = OutComponents.Emplace_GetRef();
+			TArray<int32, TInlineAllocator<128>> Stack;
+			Stack.Add(SeedSampleIndex);
+			Visited[SeedSampleIndex] = 1;
+			while (!Stack.IsEmpty())
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				Component.SampleIndices.Add(SampleIndex);
+				if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (!Planet.Samples.IsValidIndex(NeighborIndex))
+					{
+						continue;
+					}
+
+					const int32 NeighborPlateId = PlateAssignments[NeighborIndex];
+					if (NeighborPlateId == PlateId)
+					{
+						if (Visited[NeighborIndex] == 0)
+						{
+							Visited[NeighborIndex] = 1;
+							Stack.Add(NeighborIndex);
+						}
+						continue;
+					}
+
+					if (NeighborPlateId != INDEX_NONE)
+					{
+						++Component.BoundaryCountsByPlate.FindOrAdd(NeighborPlateId);
+					}
+				}
+			}
+		}
+	}
+
+	int32 CountPlateAssignmentComponents(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& PlateAssignments,
+		const int32 PlateId)
+	{
+		TArray<FRiftPlateAssignmentComponent> Components;
+		CollectPlateAssignmentComponents(Planet, PlateAssignments, PlateId, Components);
+		return Components.Num();
+	}
+
+	int32 FindRiftChildPlateIndex(
+		const FPendingRiftEvent& RiftEvent,
+		const int32 ChildPlateId)
+	{
+		for (int32 ChildIndex = 0; ChildIndex < RiftEvent.ChildPlateIds.Num(); ++ChildIndex)
+		{
+			if (RiftEvent.ChildPlateIds[ChildIndex] == ChildPlateId)
+			{
+				return ChildIndex;
+			}
+		}
+
+		return INDEX_NONE;
+	}
+
+	int32 CountAssignedSamplesForPlate(
+		const TArray<int32>& PlateAssignments,
+		const int32 PlateId)
+	{
+		int32 Count = 0;
+		for (const int32 AssignedPlateId : PlateAssignments)
+		{
+			Count += AssignedPlateId == PlateId ? 1 : 0;
+		}
+		return Count;
+	}
+
+	int32 SelectDeterministicRiftFragmentDestination(
+		const FPendingRiftEvent& RiftEvent,
+		const int32 SourceChildPlateId,
+		const TMap<int32, int32>& BoundaryCountsByPlate,
+		bool& bOutUsedSiblingChild)
+	{
+		bOutUsedSiblingChild = false;
+		int32 BestSiblingPlateId = INDEX_NONE;
+		int32 BestSiblingEdgeCount = -1;
+		for (const int32 CandidateChildPlateId : RiftEvent.ChildPlateIds)
+		{
+			if (CandidateChildPlateId == INDEX_NONE || CandidateChildPlateId == SourceChildPlateId)
+			{
+				continue;
+			}
+
+			const int32 EdgeCount = BoundaryCountsByPlate.FindRef(CandidateChildPlateId);
+			if (EdgeCount <= 0)
+			{
+				continue;
+			}
+
+			if (EdgeCount > BestSiblingEdgeCount ||
+				(EdgeCount == BestSiblingEdgeCount &&
+					(BestSiblingPlateId == INDEX_NONE || CandidateChildPlateId < BestSiblingPlateId)))
+			{
+				BestSiblingPlateId = CandidateChildPlateId;
+				BestSiblingEdgeCount = EdgeCount;
+			}
+		}
+
+		if (BestSiblingPlateId != INDEX_NONE)
+		{
+			bOutUsedSiblingChild = true;
+			return BestSiblingPlateId;
+		}
+
+		int32 BestNeighborPlateId = INDEX_NONE;
+		int32 BestNeighborEdgeCount = -1;
+		for (const TPair<int32, int32>& Pair : BoundaryCountsByPlate)
+		{
+			const int32 CandidatePlateId = Pair.Key;
+			const int32 EdgeCount = Pair.Value;
+			if (CandidatePlateId == INDEX_NONE ||
+				CandidatePlateId == SourceChildPlateId ||
+				EdgeCount <= 0)
+			{
+				continue;
+			}
+
+			if (EdgeCount > BestNeighborEdgeCount ||
+				(EdgeCount == BestNeighborEdgeCount &&
+					(BestNeighborPlateId == INDEX_NONE || CandidatePlateId < BestNeighborPlateId)))
+			{
+				BestNeighborPlateId = CandidatePlateId;
+				BestNeighborEdgeCount = EdgeCount;
+			}
+		}
+
+		return BestNeighborPlateId;
+	}
+
+	bool DoesRiftFragmentAttachToRecipientPrimaryBody(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& PlateAssignments,
+		const int32 RecipientPlateId,
+		const FRiftPlateAssignmentComponent& Fragment)
+	{
+		if (RecipientPlateId == INDEX_NONE)
+		{
+			return false;
+		}
+
+		TArray<FRiftPlateAssignmentComponent> RecipientComponents;
+		CollectPlateAssignmentComponents(Planet, PlateAssignments, RecipientPlateId, RecipientComponents);
+		if (RecipientComponents.IsEmpty())
+		{
+			return false;
+		}
+
+		int32 PrimaryComponentIndex = INDEX_NONE;
+		const int32 ChildIndex = FindRiftChildPlateIndex(Planet.PendingRiftEvent, RecipientPlateId);
+		if (ChildIndex != INDEX_NONE)
+		{
+			const int32 AnchorSampleIndex =
+				Planet.PendingRiftEvent.ChildAnchorSampleIndices.IsValidIndex(ChildIndex)
+					? Planet.PendingRiftEvent.ChildAnchorSampleIndices[ChildIndex]
+					: INDEX_NONE;
+			if (Planet.Samples.IsValidIndex(AnchorSampleIndex))
+			{
+				for (int32 ComponentIndex = 0; ComponentIndex < RecipientComponents.Num(); ++ComponentIndex)
+				{
+					if (RecipientComponents[ComponentIndex].SampleIndices.Contains(AnchorSampleIndex))
+					{
+						PrimaryComponentIndex = ComponentIndex;
+						break;
+					}
+				}
+			}
+		}
+
+		if (PrimaryComponentIndex == INDEX_NONE)
+		{
+			int32 LargestComponentSize = -1;
+			int32 LowestSampleIndex = TNumericLimits<int32>::Max();
+			for (int32 ComponentIndex = 0; ComponentIndex < RecipientComponents.Num(); ++ComponentIndex)
+			{
+				const FRiftPlateAssignmentComponent& Component = RecipientComponents[ComponentIndex];
+				const int32 ComponentSize = Component.SampleIndices.Num();
+				int32 ComponentLowestSampleIndex = TNumericLimits<int32>::Max();
+				for (const int32 SampleIndex : Component.SampleIndices)
+				{
+					ComponentLowestSampleIndex = FMath::Min(ComponentLowestSampleIndex, SampleIndex);
+				}
+				if (ComponentSize > LargestComponentSize ||
+					(ComponentSize == LargestComponentSize &&
+						ComponentLowestSampleIndex < LowestSampleIndex))
+				{
+					LargestComponentSize = ComponentSize;
+					LowestSampleIndex = ComponentLowestSampleIndex;
+					PrimaryComponentIndex = ComponentIndex;
+				}
+			}
+		}
+
+		if (!RecipientComponents.IsValidIndex(PrimaryComponentIndex))
+		{
+			return false;
+		}
+
+		TSet<int32> PrimaryComponentSamples;
+		for (const int32 SampleIndex : RecipientComponents[PrimaryComponentIndex].SampleIndices)
+		{
+			PrimaryComponentSamples.Add(SampleIndex);
+		}
+
+		for (const int32 SampleIndex : Fragment.SampleIndices)
+		{
+			if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+			{
+				if (!PlateAssignments.IsValidIndex(NeighborIndex) ||
+					PlateAssignments[NeighborIndex] != RecipientPlateId)
+				{
+					continue;
+				}
+
+				if (PrimaryComponentSamples.Contains(NeighborIndex))
+				{
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	int32 CountPlateComponentsAfterRiftFragmentAssignment(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& PlateAssignments,
+		const FRiftPlateAssignmentComponent& Fragment,
+		const int32 DestinationPlateId)
+	{
+		TArray<int32> AdjustedAssignments = PlateAssignments;
+		for (const int32 SampleIndex : Fragment.SampleIndices)
+		{
+			if (AdjustedAssignments.IsValidIndex(SampleIndex))
+			{
+				AdjustedAssignments[SampleIndex] = DestinationPlateId;
+			}
+		}
+
+		return CountPlateAssignmentComponents(Planet, AdjustedAssignments, DestinationPlateId);
+	}
+
+	FRiftFragmentDestinationSelectionResult SelectRecipientAwareRiftFragmentDestination(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& PlateAssignments,
+		const int32 SourceChildPlateId,
+		const FRiftPlateAssignmentComponent& Fragment)
+	{
+		FRiftFragmentDestinationSelectionResult Result;
+
+		TArray<TPair<int32, int32>> AdjacentSiblingCandidates;
+		TArray<TPair<int32, int32>> NeighborCandidates;
+		for (const TPair<int32, int32>& Pair : Fragment.BoundaryCountsByPlate)
+		{
+			const int32 CandidatePlateId = Pair.Key;
+			const int32 EdgeCount = Pair.Value;
+			if (CandidatePlateId == INDEX_NONE ||
+				CandidatePlateId == SourceChildPlateId ||
+				EdgeCount <= 0)
+			{
+				continue;
+			}
+
+			if (Planet.PendingRiftEvent.ChildPlateIds.Contains(CandidatePlateId))
+			{
+				AdjacentSiblingCandidates.Add(TPair<int32, int32>(CandidatePlateId, EdgeCount));
+			}
+			else
+			{
+				NeighborCandidates.Add(TPair<int32, int32>(CandidatePlateId, EdgeCount));
+			}
+		}
+
+		const auto CandidateSort = [](const TPair<int32, int32>& A, const TPair<int32, int32>& B)
+		{
+			return
+				A.Value > B.Value ||
+				(A.Value == B.Value && A.Key < B.Key);
+		};
+		AdjacentSiblingCandidates.Sort(CandidateSort);
+		NeighborCandidates.Sort(CandidateSort);
+
+		if (!AdjacentSiblingCandidates.IsEmpty())
+		{
+			Result.DestinationPlateId = AdjacentSiblingCandidates[0].Key;
+			Result.bUsedSiblingChild = true;
+			Result.bHadPositiveSiblingAdjacency = true;
+			Result.BestSiblingEdgeCount = AdjacentSiblingCandidates[0].Value;
+			return Result;
+		}
+
+		TArray<int32> SiblingFallbackCandidates;
+		for (const int32 CandidateChildPlateId : Planet.PendingRiftEvent.ChildPlateIds)
+		{
+			if (CandidateChildPlateId == INDEX_NONE || CandidateChildPlateId == SourceChildPlateId)
+			{
+				continue;
+			}
+			SiblingFallbackCandidates.Add(CandidateChildPlateId);
+		}
+
+		if (!SiblingFallbackCandidates.IsEmpty())
+		{
+			SiblingFallbackCandidates.Sort([&PlateAssignments](const int32 A, const int32 B)
+			{
+				const int32 SampleCountA = CountAssignedSamplesForPlate(PlateAssignments, A);
+				const int32 SampleCountB = CountAssignedSamplesForPlate(PlateAssignments, B);
+				return
+					SampleCountA > SampleCountB ||
+					(SampleCountA == SampleCountB && A < B);
+			});
+			Result.DestinationPlateId = SiblingFallbackCandidates[0];
+			Result.bUsedSiblingChild = true;
+			Result.bUsedZeroAdjacencySiblingFallback = true;
+			Result.bHadPositiveSiblingAdjacency = false;
+			Result.BestSiblingEdgeCount = 0;
+			return Result;
+		}
+
+		if (!NeighborCandidates.IsEmpty())
+		{
+			Result.DestinationPlateId = NeighborCandidates[0].Key;
+			Result.bUsedSiblingChild = false;
+			Result.bUsedNonChildFallback = true;
+		}
+		return Result;
+	}
+
+	void ComputePlateComponentCountSummary(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>* OverridePlateAssignments,
+		FPlateComponentCountSummary& OutSummary)
+	{
+		OutSummary.ComponentsByPlate.Reset();
+		OutSummary.GlobalMaxComponents = 0;
+		if (Planet.Samples.IsEmpty())
+		{
+			return;
+		}
+
+		const auto GetPlateId = [&Planet, OverridePlateAssignments](const int32 SampleIndex)
+		{
+			if (OverridePlateAssignments != nullptr)
+			{
+				return OverridePlateAssignments->IsValidIndex(SampleIndex)
+					? (*OverridePlateAssignments)[SampleIndex]
+					: INDEX_NONE;
+			}
+			return Planet.Samples.IsValidIndex(SampleIndex)
+				? Planet.Samples[SampleIndex].PlateId
+				: INDEX_NONE;
+		};
+
+		TArray<uint8> Visited;
+		Visited.Init(0, Planet.Samples.Num());
+		for (int32 SeedSampleIndex = 0; SeedSampleIndex < Planet.Samples.Num(); ++SeedSampleIndex)
+		{
+			if (!Planet.Samples.IsValidIndex(SeedSampleIndex) || Visited[SeedSampleIndex] != 0)
+			{
+				continue;
+			}
+
+			const int32 PlateId = GetPlateId(SeedSampleIndex);
+			if (PlateId == INDEX_NONE)
+			{
+				continue;
+			}
+
+			TArray<int32, TInlineAllocator<128>> Stack;
+			Stack.Add(SeedSampleIndex);
+			Visited[SeedSampleIndex] = 1;
+
+			while (!Stack.IsEmpty())
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (!Planet.Samples.IsValidIndex(NeighborIndex) ||
+						Visited[NeighborIndex] != 0 ||
+						GetPlateId(NeighborIndex) != PlateId)
+					{
+						continue;
+					}
+
+					Visited[NeighborIndex] = 1;
+					Stack.Add(NeighborIndex);
+				}
+			}
+
+			const int32 ComponentCount = ++OutSummary.ComponentsByPlate.FindOrAdd(PlateId);
+			OutSummary.GlobalMaxComponents = FMath::Max(OutSummary.GlobalMaxComponents, ComponentCount);
+		}
+	}
+
+	FCollisionReceiverContiguityDiagnostics ComputeCollisionReceiverContiguityDiagnostics(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& PreviousPlateAssignments,
+		const TArray<int32>* AfterPlateAssignments,
+		const int32 ReceiverPlateId,
+		const TArray<int32>& TransferredTerraneSampleIndices,
+		const FPlateComponentCountSummary& BeforeSummary,
+		const FPlateComponentCountSummary& AfterSummary)
+	{
+		FCollisionReceiverContiguityDiagnostics Diagnostics;
+		Diagnostics.ReceiverComponentsBefore = BeforeSummary.ComponentsByPlate.FindRef(ReceiverPlateId);
+		Diagnostics.ReceiverComponentsAfter = AfterSummary.ComponentsByPlate.FindRef(ReceiverPlateId);
+		if (ReceiverPlateId == INDEX_NONE || TransferredTerraneSampleIndices.IsEmpty())
+		{
+			return Diagnostics;
+		}
+
+		TArray<uint8> TransferredMask;
+		TransferredMask.Init(0, Planet.Samples.Num());
+		for (const int32 SampleIndex : TransferredTerraneSampleIndices)
+		{
+			if (TransferredMask.IsValidIndex(SampleIndex))
+			{
+				TransferredMask[SampleIndex] = 1;
+			}
+		}
+
+		TArray<uint8> Visited;
+		Visited.Init(0, Planet.Samples.Num());
+		for (int32 SeedSampleIndex = 0; SeedSampleIndex < Planet.Samples.Num(); ++SeedSampleIndex)
+		{
+			if (!Planet.Samples.IsValidIndex(SeedSampleIndex) ||
+				Visited[SeedSampleIndex] != 0 ||
+				((AfterPlateAssignments != nullptr)
+					 ? (AfterPlateAssignments->IsValidIndex(SeedSampleIndex)
+							? (*AfterPlateAssignments)[SeedSampleIndex]
+							: INDEX_NONE)
+					 : Planet.Samples[SeedSampleIndex].PlateId) != ReceiverPlateId)
+			{
+				continue;
+			}
+
+			bool bHasTransferredSamples = false;
+			bool bHasPreExistingReceiverSamples = false;
+			int32 ComponentSize = 0;
+			TArray<int32, TInlineAllocator<128>> Stack;
+			Stack.Add(SeedSampleIndex);
+			Visited[SeedSampleIndex] = 1;
+
+			while (!Stack.IsEmpty())
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				++ComponentSize;
+				bHasTransferredSamples |= TransferredMask[SampleIndex] != 0;
+				bHasPreExistingReceiverSamples |=
+					PreviousPlateAssignments.IsValidIndex(SampleIndex) &&
+					PreviousPlateAssignments[SampleIndex] == ReceiverPlateId;
+
+				if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (!Planet.Samples.IsValidIndex(NeighborIndex) ||
+						Visited[NeighborIndex] != 0 ||
+						((AfterPlateAssignments != nullptr)
+							 ? (AfterPlateAssignments->IsValidIndex(NeighborIndex)
+									? (*AfterPlateAssignments)[NeighborIndex]
+									: INDEX_NONE)
+							 : Planet.Samples[NeighborIndex].PlateId) != ReceiverPlateId)
+					{
+						continue;
+					}
+
+					Visited[NeighborIndex] = 1;
+					Stack.Add(NeighborIndex);
+				}
+			}
+
+			if (!bHasTransferredSamples)
+			{
+				continue;
+			}
+
+			if (bHasPreExistingReceiverSamples)
+			{
+				Diagnostics.bContiguousWithExistingTerritory = true;
+			}
+			else
+			{
+				++Diagnostics.DisconnectedFragmentCount;
+				Diagnostics.LargestNewDisconnectedFragmentSize = FMath::Max(
+					Diagnostics.LargestNewDisconnectedFragmentSize,
+					ComponentSize);
+			}
+		}
+
+		return Diagnostics;
+	}
+
+	FSinglePlateComponentDiagnostics ComputeSinglePlateComponentDiagnostics(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& PlateAssignments,
+		const int32 PlateId)
+	{
+		FSinglePlateComponentDiagnostics Diagnostics;
+		if (PlateId == INDEX_NONE || PlateAssignments.Num() != Planet.Samples.Num())
+		{
+			return Diagnostics;
+		}
+
+		TArray<uint8> Visited;
+		Visited.Init(0, Planet.Samples.Num());
+		for (int32 SeedSampleIndex = 0; SeedSampleIndex < Planet.Samples.Num(); ++SeedSampleIndex)
+		{
+			if (!Planet.Samples.IsValidIndex(SeedSampleIndex) ||
+				Visited[SeedSampleIndex] != 0 ||
+				PlateAssignments[SeedSampleIndex] != PlateId)
+			{
+				continue;
+			}
+
+			int32 ComponentSize = 0;
+			TArray<int32, TInlineAllocator<128>> Stack;
+			Stack.Add(SeedSampleIndex);
+			Visited[SeedSampleIndex] = 1;
+			while (!Stack.IsEmpty())
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				++ComponentSize;
+				if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (!Planet.Samples.IsValidIndex(NeighborIndex) ||
+						Visited[NeighborIndex] != 0 ||
+						PlateAssignments[NeighborIndex] != PlateId)
+					{
+						continue;
+					}
+
+					Visited[NeighborIndex] = 1;
+					Stack.Add(NeighborIndex);
+				}
+			}
+
+			++Diagnostics.ComponentCount;
+			if (ComponentSize > Diagnostics.LargestComponentSize)
+			{
+				Diagnostics.LargestSecondaryComponentSize = Diagnostics.LargestComponentSize;
+				Diagnostics.LargestComponentSize = ComponentSize;
+			}
+			else if (ComponentSize > Diagnostics.LargestSecondaryComponentSize)
+			{
+				Diagnostics.LargestSecondaryComponentSize = ComponentSize;
+			}
+		}
+
+		return Diagnostics;
+	}
+
+	FDonorFragmentationDiagnostics ComputeDonorFragmentationDiagnostics(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& BeforeAssignments,
+		const TArray<int32>& AfterAssignments,
+		const int32 DonorPlateId)
+	{
+		FDonorFragmentationDiagnostics Diagnostics;
+		if (DonorPlateId == INDEX_NONE ||
+			BeforeAssignments.Num() != Planet.Samples.Num() ||
+			AfterAssignments.Num() != Planet.Samples.Num())
+		{
+			return Diagnostics;
+		}
+
+		TArray<int32> BeforeComponentIds;
+		BeforeComponentIds.Init(INDEX_NONE, Planet.Samples.Num());
+		TArray<int32> BeforeComponentSizes;
+		TArray<uint8> VisitedBefore;
+		VisitedBefore.Init(0, Planet.Samples.Num());
+		for (int32 SeedSampleIndex = 0; SeedSampleIndex < Planet.Samples.Num(); ++SeedSampleIndex)
+		{
+			if (!Planet.Samples.IsValidIndex(SeedSampleIndex) ||
+				VisitedBefore[SeedSampleIndex] != 0 ||
+				BeforeAssignments[SeedSampleIndex] != DonorPlateId)
+			{
+				continue;
+			}
+
+			const int32 ComponentId = BeforeComponentSizes.Num();
+			int32 ComponentSize = 0;
+			TArray<int32, TInlineAllocator<128>> Stack;
+			Stack.Add(SeedSampleIndex);
+			VisitedBefore[SeedSampleIndex] = 1;
+			BeforeComponentIds[SeedSampleIndex] = ComponentId;
+			while (!Stack.IsEmpty())
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				++ComponentSize;
+				if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (!Planet.Samples.IsValidIndex(NeighborIndex) ||
+						VisitedBefore[NeighborIndex] != 0 ||
+						BeforeAssignments[NeighborIndex] != DonorPlateId)
+					{
+						continue;
+					}
+
+					VisitedBefore[NeighborIndex] = 1;
+					BeforeComponentIds[NeighborIndex] = ComponentId;
+					Stack.Add(NeighborIndex);
+				}
+			}
+
+			BeforeComponentSizes.Add(ComponentSize);
+		}
+
+		Diagnostics.ComponentsBefore = BeforeComponentSizes.Num();
+		TArray<TArray<int32>> AfterFragmentSizesByBeforeComponent;
+		AfterFragmentSizesByBeforeComponent.SetNum(BeforeComponentSizes.Num());
+
+		TArray<uint8> VisitedAfter;
+		VisitedAfter.Init(0, Planet.Samples.Num());
+		for (int32 SeedSampleIndex = 0; SeedSampleIndex < Planet.Samples.Num(); ++SeedSampleIndex)
+		{
+			if (!Planet.Samples.IsValidIndex(SeedSampleIndex) ||
+				VisitedAfter[SeedSampleIndex] != 0 ||
+				AfterAssignments[SeedSampleIndex] != DonorPlateId)
+			{
+				continue;
+			}
+
+			int32 ComponentSize = 0;
+			int32 SourceBeforeComponentId = INDEX_NONE;
+			TArray<int32, TInlineAllocator<128>> Stack;
+			Stack.Add(SeedSampleIndex);
+			VisitedAfter[SeedSampleIndex] = 1;
+			while (!Stack.IsEmpty())
+			{
+				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+				++ComponentSize;
+				if (BeforeComponentIds.IsValidIndex(SampleIndex))
+				{
+					const int32 BeforeComponentId = BeforeComponentIds[SampleIndex];
+					if (BeforeComponentId != INDEX_NONE)
+					{
+						SourceBeforeComponentId = BeforeComponentId;
+					}
+				}
+
+				if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (!Planet.Samples.IsValidIndex(NeighborIndex) ||
+						VisitedAfter[NeighborIndex] != 0 ||
+						AfterAssignments[NeighborIndex] != DonorPlateId)
+					{
+						continue;
+					}
+
+					VisitedAfter[NeighborIndex] = 1;
+					Stack.Add(NeighborIndex);
+				}
+			}
+
+			++Diagnostics.ComponentsAfter;
+			Diagnostics.LargestRemainingComponentSize = FMath::Max(
+				Diagnostics.LargestRemainingComponentSize,
+				ComponentSize);
+			if (AfterFragmentSizesByBeforeComponent.IsValidIndex(SourceBeforeComponentId))
+			{
+				AfterFragmentSizesByBeforeComponent[SourceBeforeComponentId].Add(ComponentSize);
+			}
+		}
+
+		int64 TotalNewFragmentSamples = 0;
+		for (TArray<int32>& FragmentSizes : AfterFragmentSizesByBeforeComponent)
+		{
+			if (FragmentSizes.Num() <= 1)
+			{
+				continue;
+			}
+
+			FragmentSizes.Sort(TGreater<int32>());
+			for (int32 FragmentIndex = 1; FragmentIndex < FragmentSizes.Num(); ++FragmentIndex)
+			{
+				const int32 FragmentSize = FragmentSizes[FragmentIndex];
+				++Diagnostics.NewFragmentCount;
+				TotalNewFragmentSamples += FragmentSize;
+				Diagnostics.SmallestNewFragmentSize =
+					Diagnostics.SmallestNewFragmentSize == 0
+						? FragmentSize
+						: FMath::Min(Diagnostics.SmallestNewFragmentSize, FragmentSize);
+				Diagnostics.LargestNewFragmentSize = FMath::Max(
+					Diagnostics.LargestNewFragmentSize,
+					FragmentSize);
+			}
+		}
+
+		if (Diagnostics.NewFragmentCount > 0)
+		{
+			Diagnostics.MeanNewFragmentSize =
+				static_cast<double>(TotalNewFragmentSamples) /
+				static_cast<double>(Diagnostics.NewFragmentCount);
+		}
+
+		return Diagnostics;
+	}
+
+	FCollisionTransferConnectivityDiagnostics ComputeCollisionTransferConnectivityDiagnostics(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& BeforeAssignments,
+		const int32 ReceiverPlateId,
+		const int32 DonorPlateId,
+		const TArray<int32>& TransferredTerraneSampleIndices)
+	{
+		FCollisionTransferConnectivityDiagnostics Diagnostics;
+		if (BeforeAssignments.Num() != Planet.Samples.Num())
+		{
+			return Diagnostics;
+		}
+
+		TArray<int32> AfterAssignments = BeforeAssignments;
+		for (const int32 SampleIndex : TransferredTerraneSampleIndices)
+		{
+			if (AfterAssignments.IsValidIndex(SampleIndex))
+			{
+				AfterAssignments[SampleIndex] = ReceiverPlateId;
+			}
+		}
+
+		FPlateComponentCountSummary BeforeSummary;
+		FPlateComponentCountSummary AfterSummary;
+		ComputePlateComponentCountSummary(Planet, &BeforeAssignments, BeforeSummary);
+		ComputePlateComponentCountSummary(Planet, &AfterAssignments, AfterSummary);
+
+		Diagnostics.GlobalMaxComponentsBefore = BeforeSummary.GlobalMaxComponents;
+		Diagnostics.GlobalMaxComponentsAfter = AfterSummary.GlobalMaxComponents;
+		Diagnostics.DonorComponentsBefore = BeforeSummary.ComponentsByPlate.FindRef(DonorPlateId);
+		Diagnostics.DonorComponentsAfter = AfterSummary.ComponentsByPlate.FindRef(DonorPlateId);
+		Diagnostics.ReceiverComponentsBefore = BeforeSummary.ComponentsByPlate.FindRef(ReceiverPlateId);
+		Diagnostics.ReceiverComponentsAfter = AfterSummary.ComponentsByPlate.FindRef(ReceiverPlateId);
+
+		const FDonorFragmentationDiagnostics DonorDiagnostics = ComputeDonorFragmentationDiagnostics(
+			Planet,
+			BeforeAssignments,
+			AfterAssignments,
+			DonorPlateId);
+		Diagnostics.DonorLargestRemainingComponentSize =
+			DonorDiagnostics.LargestRemainingComponentSize;
+		Diagnostics.DonorNewFragmentCount = DonorDiagnostics.NewFragmentCount;
+		Diagnostics.DonorSmallestNewFragmentSize = DonorDiagnostics.SmallestNewFragmentSize;
+		Diagnostics.DonorLargestNewFragmentSize = DonorDiagnostics.LargestNewFragmentSize;
+		Diagnostics.DonorMeanNewFragmentSize = DonorDiagnostics.MeanNewFragmentSize;
+
+		const FCollisionReceiverContiguityDiagnostics ReceiverDiagnostics =
+			ComputeCollisionReceiverContiguityDiagnostics(
+				Planet,
+				BeforeAssignments,
+				&AfterAssignments,
+				ReceiverPlateId,
+				TransferredTerraneSampleIndices,
+				BeforeSummary,
+				AfterSummary);
+		Diagnostics.bReceiverTransferContiguousWithExistingTerritory =
+			ReceiverDiagnostics.bContiguousWithExistingTerritory;
+		Diagnostics.ReceiverDisconnectedFragmentCount =
+			ReceiverDiagnostics.DisconnectedFragmentCount;
+		Diagnostics.ReceiverLargestNewDisconnectedFragmentSize =
+			ReceiverDiagnostics.LargestNewDisconnectedFragmentSize;
+		return Diagnostics;
+	}
+
+	FCollisionDonorProtectionResult EvaluateCollisionDonorConnectivityProtection(
+		const FTectonicPlanet& Planet,
+		const FCollisionTransferConnectivityDiagnostics& Diagnostics)
+	{
+		FCollisionDonorProtectionResult Result;
+		const int32 DonorComponentIncrease = FMath::Max(
+			0,
+			Diagnostics.DonorComponentsAfter - Diagnostics.DonorComponentsBefore);
+		Result.bFailedComponentCap =
+			DonorComponentIncrease > Planet.GeometricCollisionDonorMaxComponentIncrease;
+
+		const bool bFragmentFloorEnabled =
+			Planet.GeometricCollisionDonorMinNewFragmentSampleCount > 0;
+		Result.bFailedFragmentFloor =
+			bFragmentFloorEnabled &&
+			Diagnostics.DonorNewFragmentCount > 0 &&
+			Diagnostics.DonorSmallestNewFragmentSize <
+				Planet.GeometricCollisionDonorMinNewFragmentSampleCount;
+		Result.bPasses = !Result.bFailedComponentCap && !Result.bFailedFragmentFloor;
+		return Result;
+	}
+
+	bool PassesCollisionDonorConnectivityProtection(
+		const FTectonicPlanet& Planet,
+		const FCollisionTransferConnectivityDiagnostics& Diagnostics)
+	{
+		return EvaluateCollisionDonorConnectivityProtection(Planet, Diagnostics).bPasses;
+	}
+
+	bool PassesCollisionReceiverConnectivityProtection(
+		const FCollisionTransferConnectivityDiagnostics& Diagnostics)
+	{
+		return true;
+	}
+
+	void BuildCollisionTransferSubsetByDistanceThreshold(
+		const TArray<int32>& SourceTerraneSampleIndices,
+		const TArray<double>& BestDistancesKm,
+		const double MaxDistanceKm,
+		TArray<int32>& OutSubset)
+	{
+		OutSubset.Reset();
+		OutSubset.Reserve(SourceTerraneSampleIndices.Num());
+		for (const int32 SampleIndex : SourceTerraneSampleIndices)
+		{
+			if (!BestDistancesKm.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			const double DistanceKm = BestDistancesKm[SampleIndex];
+			if (!FMath::IsFinite(DistanceKm) || DistanceKm > MaxDistanceKm + UE_DOUBLE_SMALL_NUMBER)
+			{
+				continue;
+			}
+
+			OutSubset.Add(SampleIndex);
+		}
+	}
+
+	void PopulateCanonicalSampleMetrics(const FTectonicPlanet& Planet, FResamplingStats& OutStats)
+	{
+		OutStats.PlateCount = Planet.Plates.Num();
+		OutStats.ContinentalSampleCount = 0;
+		OutStats.BoundarySampleCount = 0;
+		OutStats.MaxComponentsPerPlate = 0;
+		OutStats.ActiveCollisionTrackCount = Planet.BoundaryContactPersistenceByPair.Num();
+		OutStats.ContinentalAreaFraction = 0.0;
+		OutStats.BoundarySampleFraction = 0.0;
+		OutStats.GapRate = 0.0;
+		OutStats.OverlapRate = 0.0;
+		OutStats.ElevationMinKm = 0.0;
+		OutStats.ElevationMaxKm = 0.0;
+		OutStats.ElevationMeanKm = 0.0;
+
+		if (Planet.Samples.IsEmpty())
+		{
+			return;
+		}
+
+		double ElevationSumKm = 0.0;
+		OutStats.ElevationMinKm = TNumericLimits<double>::Max();
+		OutStats.ElevationMaxKm = -TNumericLimits<double>::Max();
+		for (const FSample& Sample : Planet.Samples)
+		{
+			OutStats.ContinentalSampleCount += Sample.ContinentalWeight >= 0.5f ? 1 : 0;
+			OutStats.BoundarySampleCount += Sample.bIsBoundary ? 1 : 0;
+			const double ElevationKm = static_cast<double>(Sample.Elevation);
+			OutStats.ElevationMinKm = FMath::Min(OutStats.ElevationMinKm, ElevationKm);
+			OutStats.ElevationMaxKm = FMath::Max(OutStats.ElevationMaxKm, ElevationKm);
+			ElevationSumKm += ElevationKm;
+		}
+
+		const double SampleCount = static_cast<double>(Planet.Samples.Num());
+		OutStats.ContinentalAreaFraction = static_cast<double>(OutStats.ContinentalSampleCount) / SampleCount;
+		OutStats.BoundarySampleFraction = static_cast<double>(OutStats.BoundarySampleCount) / SampleCount;
+		OutStats.GapRate = static_cast<double>(OutStats.GapCount) / SampleCount;
+		OutStats.OverlapRate = static_cast<double>(OutStats.OverlapCount) / SampleCount;
+		OutStats.ElevationMeanKm = ElevationSumKm / SampleCount;
+
+		TArray<uint8> Visited;
+		Visited.Init(0, Planet.Samples.Num());
+		for (const FPlate& Plate : Planet.Plates)
+		{
+			int32 ComponentCount = 0;
+			for (const int32 SeedSampleIndex : Plate.MemberSamples)
+			{
+				if (!Planet.Samples.IsValidIndex(SeedSampleIndex) || Visited[SeedSampleIndex] != 0)
+				{
+					continue;
+				}
+
+				TArray<int32, TInlineAllocator<128>> Stack;
+				Stack.Add(SeedSampleIndex);
+				Visited[SeedSampleIndex] = 1;
+
+				while (!Stack.IsEmpty())
+				{
+					const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+					if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+					{
+						continue;
+					}
+
+					for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+					{
+						if (!Planet.Samples.IsValidIndex(NeighborIndex) ||
+							Visited[NeighborIndex] != 0 ||
+							Planet.Samples[NeighborIndex].PlateId != Plate.Id)
+						{
+							continue;
+						}
+
+						Visited[NeighborIndex] = 1;
+						Stack.Add(NeighborIndex);
+					}
+				}
+
+				++ComponentCount;
+			}
+
+			OutStats.MaxComponentsPerPlate = FMath::Max(OutStats.MaxComponentsPerPlate, ComponentCount);
 		}
 	}
 
@@ -562,15 +1896,494 @@ namespace
 		return Left.MinSampleIndex < Right.MinSampleIndex;
 	}
 
+	bool IsGeometricCollisionPairStronger(
+		const FGeometricCollisionPairDiagnostics& Left,
+		const FGeometricCollisionPairDiagnostics& Right)
+	{
+		if (Left.bPassedMassFilter != Right.bPassedMassFilter)
+		{
+			return Left.bPassedMassFilter;
+		}
+		if (Left.TerraneEstimate != Right.TerraneEstimate)
+		{
+			return Left.TerraneEstimate > Right.TerraneEstimate;
+		}
+		if (Left.TotalOverlapSampleCount != Right.TotalOverlapSampleCount)
+		{
+			return Left.TotalOverlapSampleCount > Right.TotalOverlapSampleCount;
+		}
+		if (!FMath::IsNearlyEqual(
+				Left.TotalConvergenceMagnitudeKmPerMy,
+				Right.TotalConvergenceMagnitudeKmPerMy,
+				UE_DOUBLE_SMALL_NUMBER))
+		{
+			return Left.TotalConvergenceMagnitudeKmPerMy > Right.TotalConvergenceMagnitudeKmPerMy;
+		}
+		if (Left.PlateA != Right.PlateA)
+		{
+			return Left.PlateA < Right.PlateA;
+		}
+		if (Left.PlateB != Right.PlateB)
+		{
+			return Left.PlateB < Right.PlateB;
+		}
+		return Left.MinSampleIndex < Right.MinSampleIndex;
+	}
+
+	bool IsRepeatedGeometricCollisionCandidateStronger(
+		const FGeometricCollisionPairRecurrenceState& LeftState,
+		const FGeometricCollisionPairRecurrenceState& RightState,
+		const FGeometricCollisionPairDiagnostics& LeftPair,
+		const FGeometricCollisionPairDiagnostics& RightPair)
+	{
+		if (LeftState.ObservationCount != RightState.ObservationCount)
+		{
+			return LeftState.ObservationCount > RightState.ObservationCount;
+		}
+		if (!FMath::IsNearlyEqual(
+				LeftState.AccumulatedPenetrationKm,
+				RightState.AccumulatedPenetrationKm,
+				UE_DOUBLE_SMALL_NUMBER))
+		{
+			return LeftState.AccumulatedPenetrationKm > RightState.AccumulatedPenetrationKm;
+		}
+		if (LeftPair.TerraneEstimate != RightPair.TerraneEstimate)
+		{
+			return LeftPair.TerraneEstimate > RightPair.TerraneEstimate;
+		}
+		if (LeftPair.PlateA != RightPair.PlateA)
+		{
+			return LeftPair.PlateA < RightPair.PlateA;
+		}
+		if (LeftPair.PlateB != RightPair.PlateB)
+		{
+			return LeftPair.PlateB < RightPair.PlateB;
+		}
+		return LeftPair.MinSampleIndex < RightPair.MinSampleIndex;
+	}
+
+	bool TryFindMeaningfulContainmentHitInPlate(
+		const FTectonicPlanet& Planet,
+		const FPlate& Plate,
+		const FVector3d& QueryPoint)
+	{
+		if (Plate.SoupData.LocalTriangles.IsEmpty())
+		{
+			return false;
+		}
+		if (!Plate.BoundingCap.Center.IsNearlyZero() &&
+			QueryPoint.Dot(Plate.BoundingCap.Center) < Plate.BoundingCap.CosAngle)
+		{
+			return false;
+		}
+
+		int32 LocalTriangleId = INDEX_NONE;
+		FVector3d A;
+		FVector3d B;
+		FVector3d C;
+		if (!FindContainingTriangleInBVH(Plate.SoupBVH, Plate.SoupAdapter, QueryPoint, LocalTriangleId, A, B, C))
+		{
+			return false;
+		}
+
+		const FVector3d Barycentric = NormalizeBarycentric(ComputePlanarBarycentric(A, B, C, QueryPoint));
+		return ComputeContainmentScore(Barycentric) > OverlapScoreEpsilon;
+	}
+
+	double ComputeGeometricOverlapConvergenceMagnitudeKmPerMy(
+		const FTectonicPlanet& Planet,
+		const int32 OwningPlateId,
+		const int32 ContainingPlateId,
+		const FVector3d& QueryPoint)
+	{
+		const FPlate* OwningPlate = FindPlateById(Planet, OwningPlateId);
+		const FPlate* ContainingPlate = FindPlateById(Planet, ContainingPlateId);
+		if (OwningPlate == nullptr || ContainingPlate == nullptr || OwningPlateId == ContainingPlateId)
+		{
+			return 0.0;
+		}
+
+		int32 NearestContainingMember = INDEX_NONE;
+		double NearestContainingDistance = TNumericLimits<double>::Max();
+		if (!FindNearestMemberSample(
+				Planet,
+				ContainingPlateId,
+				QueryPoint,
+				NearestContainingMember,
+				NearestContainingDistance) ||
+			!Planet.Samples.IsValidIndex(NearestContainingMember))
+		{
+			return 0.0;
+		}
+
+		const FVector3d ContainingPosition =
+			ContainingPlate->CumulativeRotation.RotateVector(Planet.Samples[NearestContainingMember].Position).GetSafeNormal();
+		const FVector3d SeparationDirection =
+			ProjectOntoTangent(ContainingPosition - QueryPoint, QueryPoint).GetSafeNormal();
+		if (SeparationDirection.IsNearlyZero())
+		{
+			return 0.0;
+		}
+
+		const FVector3d RelativeVelocity =
+			ComputePlateSurfaceVelocity(*ContainingPlate, QueryPoint, Planet.PlanetRadiusKm) -
+			ComputePlateSurfaceVelocity(*OwningPlate, QueryPoint, Planet.PlanetRadiusKm);
+		const double ClosingSpeed = -RelativeVelocity.Dot(SeparationDirection);
+		if (ClosingSpeed <= UE_DOUBLE_SMALL_NUMBER)
+		{
+			return 0.0;
+		}
+
+		return ClosingSpeed / FMath::Max(DeltaTimeMyears, UE_DOUBLE_SMALL_NUMBER);
+	}
+
+	int32 EstimateGeometricCollisionTerraneSize(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& PlateAssignments,
+		const int32 PlateId,
+		const TArray<int32>& SeedSampleIndices)
+	{
+		if (PlateAssignments.Num() != Planet.Samples.Num() || PlateId == INDEX_NONE)
+		{
+			return 0;
+		}
+
+		TArray<uint8> Visited;
+		Visited.Init(0, Planet.Samples.Num());
+		TArray<int32, TInlineAllocator<128>> Stack;
+		for (const int32 SeedSampleIndex : SeedSampleIndices)
+		{
+			if (!Planet.Samples.IsValidIndex(SeedSampleIndex) ||
+				Visited[SeedSampleIndex] != 0 ||
+				PlateAssignments[SeedSampleIndex] != PlateId ||
+				Planet.Samples[SeedSampleIndex].ContinentalWeight < 0.5f)
+			{
+				continue;
+			}
+
+			Visited[SeedSampleIndex] = 1;
+			Stack.Add(SeedSampleIndex);
+		}
+
+		int32 TerraneSize = 0;
+		while (!Stack.IsEmpty())
+		{
+			const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
+			++TerraneSize;
+			if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+			{
+				if (!Planet.Samples.IsValidIndex(NeighborIndex) ||
+					Visited[NeighborIndex] != 0 ||
+					PlateAssignments[NeighborIndex] != PlateId ||
+					Planet.Samples[NeighborIndex].ContinentalWeight < 0.5f)
+				{
+					continue;
+				}
+
+				Visited[NeighborIndex] = 1;
+				Stack.Add(NeighborIndex);
+			}
+		}
+
+		return TerraneSize;
+	}
+
+	void CollectBoundarySamplesForPlate(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& PlateAssignments,
+		const int32 PlateId,
+		TArray<int32>& OutBoundarySampleIndices)
+	{
+		OutBoundarySampleIndices.Reset();
+		if (PlateAssignments.Num() != Planet.Samples.Num() || PlateId == INDEX_NONE)
+		{
+			return;
+		}
+
+		for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+		{
+			if (PlateAssignments[SampleIndex] != PlateId || !Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			bool bIsBoundarySample = false;
+			for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+			{
+				if (!PlateAssignments.IsValidIndex(NeighborIndex))
+				{
+					continue;
+				}
+				if (PlateAssignments[NeighborIndex] != PlateId)
+				{
+					bIsBoundarySample = true;
+					break;
+				}
+			}
+
+			if (bIsBoundarySample)
+			{
+				OutBoundarySampleIndices.Add(SampleIndex);
+			}
+		}
+	}
+
+	bool ComputeDirectionalOverlapDepthStatsKm(
+		const FTectonicPlanet& Planet,
+		const TArray<int32>& PlateAssignments,
+		const int32 ReceiverPlateId,
+		const TArray<int32>& DirectionalSeedSamples,
+		double& OutMeanDepthKm,
+		double& OutMaxDepthKm)
+	{
+		OutMeanDepthKm = 0.0;
+		OutMaxDepthKm = 0.0;
+		if (ReceiverPlateId == INDEX_NONE ||
+			DirectionalSeedSamples.IsEmpty() ||
+			PlateAssignments.Num() != Planet.Samples.Num())
+		{
+			return false;
+		}
+
+		TArray<int32> ReceiverBoundarySamples;
+		CollectBoundarySamplesForPlate(Planet, PlateAssignments, ReceiverPlateId, ReceiverBoundarySamples);
+		if (ReceiverBoundarySamples.IsEmpty())
+		{
+			return false;
+		}
+
+		double TotalDepthKm = 0.0;
+		int32 ValidSeedCount = 0;
+		for (const int32 SeedSampleIndex : DirectionalSeedSamples)
+		{
+			if (!Planet.Samples.IsValidIndex(SeedSampleIndex))
+			{
+				continue;
+			}
+
+			double MinBoundaryDistanceKm = TNumericLimits<double>::Max();
+			const FVector3d SeedPosition = Planet.Samples[SeedSampleIndex].Position.GetSafeNormal();
+			for (const int32 BoundarySampleIndex : ReceiverBoundarySamples)
+			{
+				if (!Planet.Samples.IsValidIndex(BoundarySampleIndex))
+				{
+					continue;
+				}
+
+				const double DistanceKm =
+					ComputeGeodesicDistance(
+						SeedPosition,
+						Planet.Samples[BoundarySampleIndex].Position.GetSafeNormal()) * Planet.PlanetRadiusKm;
+				MinBoundaryDistanceKm = FMath::Min(MinBoundaryDistanceKm, DistanceKm);
+			}
+
+			if (!FMath::IsFinite(MinBoundaryDistanceKm) || MinBoundaryDistanceKm == TNumericLimits<double>::Max())
+			{
+				continue;
+			}
+
+			TotalDepthKm += MinBoundaryDistanceKm;
+			OutMaxDepthKm = FMath::Max(OutMaxDepthKm, MinBoundaryDistanceKm);
+			++ValidSeedCount;
+		}
+
+		if (ValidSeedCount <= 0)
+		{
+			OutMaxDepthKm = 0.0;
+			return false;
+		}
+
+		OutMeanDepthKm = TotalDepthKm / static_cast<double>(ValidSeedCount);
+		return true;
+	}
+
+	void AccumulateGeometricCollisionFailureReason(
+		FResamplingStats& InOutStats,
+		const TCHAR* FailureReason)
+	{
+		if (FailureReason == nullptr)
+		{
+			return;
+		}
+
+		if (FCString::Strcmp(FailureReason, TEXT("donor_seed_empty")) == 0 ||
+			FCString::Strcmp(FailureReason, TEXT("no_subducting_side_seeds")) == 0)
+		{
+			++InOutStats.GeometricCollisionQualifiedButDonorSeedEmptyCount;
+			return;
+		}
+
+		if (FCString::Strcmp(FailureReason, TEXT("empty_terrane")) == 0)
+		{
+			++InOutStats.GeometricCollisionRejectedByEmptyTerraneCount;
+			return;
+		}
+
+		if (FCString::Strcmp(FailureReason, TEXT("overlap_too_shallow")) == 0)
+		{
+			++InOutStats.GeometricCollisionRejectedByOverlapDepthCount;
+			return;
+		}
+		if (FCString::Strcmp(FailureReason, TEXT("persistent_penetration_below_threshold")) == 0)
+		{
+			++InOutStats.GeometricCollisionRejectedByPersistentPenetrationCount;
+			return;
+		}
+
+		if (FCString::Strcmp(FailureReason, TEXT("donor_ambiguous")) == 0)
+		{
+			++InOutStats.GeometricCollisionQualifiedButDonorAmbiguousCount;
+			return;
+		}
+
+		if (FCString::Strcmp(FailureReason, TEXT("invalid_pair")) == 0 ||
+			FCString::Strcmp(FailureReason, TEXT("invalid_contact_center")) == 0)
+		{
+			++InOutStats.GeometricCollisionRejectedByRoleResolutionCount;
+		}
+	}
+
+	bool AssignGeometricCollisionDirectionalBucketsForRoles(
+		const int32 PlateA,
+		const int32 PlateB,
+		const TArray<int32>& SamplesFromAInsideB,
+		const TArray<int32>& SamplesFromBInsideA,
+		const int32 OverridingPlateId,
+		const int32 SubductingPlateId,
+		const TArray<int32>*& OutDirectionalSeedSamples,
+		const TArray<int32>*& OutOppositeDirectionalSamples)
+	{
+		OutDirectionalSeedSamples = nullptr;
+		OutOppositeDirectionalSamples = nullptr;
+		if (PlateA == PlateB)
+		{
+			return false;
+		}
+
+		if (OverridingPlateId == PlateA && SubductingPlateId == PlateB)
+		{
+			OutDirectionalSeedSamples = &SamplesFromBInsideA;
+			OutOppositeDirectionalSamples = &SamplesFromAInsideB;
+			return true;
+		}
+		if (OverridingPlateId == PlateB && SubductingPlateId == PlateA)
+		{
+			OutDirectionalSeedSamples = &SamplesFromAInsideB;
+			OutOppositeDirectionalSamples = &SamplesFromBInsideA;
+			return true;
+		}
+		return false;
+	}
+
+	bool ResolveGeometricCollisionDonorReceiver(
+		const FTectonicPlanet& Planet,
+		const FGeometricCollisionPairDiagnostics& PairDiagnostics,
+		int32& OutReceiverPlateId,
+		int32& OutDonorPlateId,
+		const TArray<int32>*& OutDonorDirectionalSeedSamples,
+		const TArray<int32>*& OutOppositeDirectionalSamples,
+		EGeometricCollisionDonorSelectionRule& OutRule)
+	{
+		OutReceiverPlateId = INDEX_NONE;
+		OutDonorPlateId = INDEX_NONE;
+		OutDonorDirectionalSeedSamples = nullptr;
+		OutOppositeDirectionalSamples = nullptr;
+		OutRule = EGeometricCollisionDonorSelectionRule::None;
+
+		if (FindPlateById(Planet, PairDiagnostics.PlateA) == nullptr ||
+			FindPlateById(Planet, PairDiagnostics.PlateB) == nullptr ||
+			PairDiagnostics.PlateA == PairDiagnostics.PlateB)
+		{
+			return false;
+		}
+
+		const int32 AInsideBCount = PairDiagnostics.SamplesFromAInsideB.Num();
+		const int32 BInsideACount = PairDiagnostics.SamplesFromBInsideA.Num();
+		if (AInsideBCount <= 0 && BInsideACount <= 0)
+		{
+			return false;
+		}
+
+		if (AInsideBCount > 0 && BInsideACount <= 0)
+		{
+			OutReceiverPlateId = PairDiagnostics.PlateB;
+			OutDonorPlateId = PairDiagnostics.PlateA;
+			OutRule = EGeometricCollisionDonorSelectionRule::DirectionalSingleBucket;
+		}
+		else if (BInsideACount > 0 && AInsideBCount <= 0)
+		{
+			OutReceiverPlateId = PairDiagnostics.PlateA;
+			OutDonorPlateId = PairDiagnostics.PlateB;
+			OutRule = EGeometricCollisionDonorSelectionRule::DirectionalSingleBucket;
+		}
+		else if (AInsideBCount != BInsideACount)
+		{
+			const bool bAIsDonor = AInsideBCount > BInsideACount;
+			OutReceiverPlateId = bAIsDonor ? PairDiagnostics.PlateB : PairDiagnostics.PlateA;
+			OutDonorPlateId = bAIsDonor ? PairDiagnostics.PlateA : PairDiagnostics.PlateB;
+			OutRule = EGeometricCollisionDonorSelectionRule::DirectionalCount;
+		}
+		else if (!FMath::IsNearlyEqual(
+					 PairDiagnostics.TotalConvergenceMagnitudeAInsideBKmPerMy,
+					 PairDiagnostics.TotalConvergenceMagnitudeBInsideAKmPerMy,
+					 UE_DOUBLE_SMALL_NUMBER))
+		{
+			const bool bAIsDonor =
+				PairDiagnostics.TotalConvergenceMagnitudeAInsideBKmPerMy >
+				PairDiagnostics.TotalConvergenceMagnitudeBInsideAKmPerMy;
+			OutReceiverPlateId = bAIsDonor ? PairDiagnostics.PlateB : PairDiagnostics.PlateA;
+			OutDonorPlateId = bAIsDonor ? PairDiagnostics.PlateA : PairDiagnostics.PlateB;
+			OutRule = EGeometricCollisionDonorSelectionRule::DirectionalConvergence;
+		}
+		else
+		{
+			const FPlate* PlateA = FindPlateById(Planet, PairDiagnostics.PlateA);
+			const FPlate* PlateB = FindPlateById(Planet, PairDiagnostics.PlateB);
+			if (PlateA == nullptr || PlateB == nullptr)
+			{
+				return false;
+			}
+
+			if (PlateA->OverlapScore != PlateB->OverlapScore)
+			{
+				const bool bAIsDonor = PlateA->OverlapScore < PlateB->OverlapScore;
+				OutReceiverPlateId = bAIsDonor ? PairDiagnostics.PlateB : PairDiagnostics.PlateA;
+				OutDonorPlateId = bAIsDonor ? PairDiagnostics.PlateA : PairDiagnostics.PlateB;
+				OutRule = EGeometricCollisionDonorSelectionRule::FallbackLowerPlateScore;
+			}
+			else
+			{
+				OutReceiverPlateId = PairDiagnostics.PlateA;
+				OutDonorPlateId = PairDiagnostics.PlateB;
+				OutRule = EGeometricCollisionDonorSelectionRule::FallbackStablePairTieBreak;
+			}
+		}
+
+		return AssignGeometricCollisionDirectionalBucketsForRoles(
+			PairDiagnostics.PlateA,
+			PairDiagnostics.PlateB,
+			PairDiagnostics.SamplesFromAInsideB,
+			PairDiagnostics.SamplesFromBInsideA,
+			OutReceiverPlateId,
+			OutDonorPlateId,
+			OutDonorDirectionalSeedSamples,
+			OutOppositeDirectionalSamples);
+	}
+
 	int32 ChooseDominantPreviousTerraneId(
 		const TArray<int32>& PreviousTerraneAssignments,
 		const TArray<int32>& TerraneSampleIndices);
 
-	bool TryBuildCollisionEventFromBoundaryContactSeeds(
+	bool TryBuildCollisionEventFromSeedSamples(
 		const FTectonicPlanet& Planet,
-		const TArray<int32>& BoundarySeedSampleIndices,
-		const int32 PlateA,
-		const int32 PlateB,
+		const TArray<int32>& CollisionSeedSampleIndices,
+		const int32 OverridingPlateId,
+		const int32 SubductingPlateId,
 		const FVector3d& ContactCenterHint,
 		const TArray<int32>& PreviousPlateIds,
 		const TArray<float>& PreviousContinentalWeights,
@@ -579,26 +2392,30 @@ namespace
 		FCollisionEvent& OutEvent,
 		int32& OutTerraneSeedCount,
 		int32& OutRecoveredTerraneCount,
-		const TCHAR*& OutFailureReason)
+		int32& OutLocalityLimitedCount,
+		const TCHAR*& OutFailureReason,
+		FCollisionTransferProtectionDiagnostics* OutProtectionDiagnostics = nullptr)
 	{
 		OutEvent = FCollisionEvent{};
 		OutTerraneSeedCount = 0;
 		OutRecoveredTerraneCount = 0;
+		OutLocalityLimitedCount = 0;
 		OutFailureReason = TEXT("none");
+		if (OutProtectionDiagnostics != nullptr)
+		{
+			*OutProtectionDiagnostics = FCollisionTransferProtectionDiagnostics{};
+		}
 
-		if (FindPlateById(Planet, PlateA) == nullptr ||
-			FindPlateById(Planet, PlateB) == nullptr ||
-			PlateA == PlateB)
+		if (FindPlateById(Planet, OverridingPlateId) == nullptr ||
+			FindPlateById(Planet, SubductingPlateId) == nullptr ||
+			OverridingPlateId == SubductingPlateId)
 		{
 			OutFailureReason = TEXT("invalid_pair");
 			return false;
 		}
 
-		const int32 OverridingPlateId = IsOverridingPlate(Planet, PlateA, PlateB) ? PlateA : PlateB;
-		const int32 SubductingPlateId = OverridingPlateId == PlateA ? PlateB : PlateA;
-
 		TArray<int32> TerraneSeedSampleIndices;
-		for (const int32 SampleIndex : BoundarySeedSampleIndices)
+		for (const int32 SampleIndex : CollisionSeedSampleIndices)
 		{
 			if (!Planet.Samples.IsValidIndex(SampleIndex) ||
 				!PreviousPlateIds.IsValidIndex(SampleIndex) ||
@@ -621,47 +2438,145 @@ namespace
 			return false;
 		}
 
-		TArray<uint8> Visited;
-		Visited.Init(0, Planet.Samples.Num());
-		TArray<int32> TerraneSampleIndices;
+		const int32 UnboundedTerraneSize = EstimateGeometricCollisionTerraneSize(
+			Planet,
+			PreviousPlateIds,
+			SubductingPlateId,
+			TerraneSeedSampleIndices);
+
+		TArray<uint8> AllOverlapSeedMask;
+		AllOverlapSeedMask.Init(0, Planet.Samples.Num());
 		for (const int32 SeedSampleIndex : TerraneSeedSampleIndices)
 		{
-			if (!Planet.Samples.IsValidIndex(SeedSampleIndex) || Visited[SeedSampleIndex] != 0)
+			if (AllOverlapSeedMask.IsValidIndex(SeedSampleIndex))
 			{
-				continue;
+				AllOverlapSeedMask[SeedSampleIndex] = 1;
 			}
+		}
 
-			TArray<int32, TInlineAllocator<64>> Stack;
-			Stack.Add(SeedSampleIndex);
-			Visited[SeedSampleIndex] = 1;
-
-			while (!Stack.IsEmpty())
+		const auto BuildLocalityLimitedTerraneFromSeeds =
+			[&Planet, &PreviousPlateIds, &PreviousContinentalWeights, &AllOverlapSeedMask, SubductingPlateId](
+				const TArray<int32>& SelectedSeedSampleIndices,
+				const bool bRestrictThroughOtherOverlapSeeds,
+				TArray<double>& OutBestDistancesKm,
+				TArray<int32>& OutTerraneSampleIndices)
 			{
-				const int32 SampleIndex = Stack.Pop(EAllowShrinking::No);
-				TerraneSampleIndices.Add(SampleIndex);
+				OutBestDistancesKm.Init(TNumericLimits<double>::Max(), Planet.Samples.Num());
+				OutTerraneSampleIndices.Reset();
+				OutTerraneSampleIndices.Reserve(SelectedSeedSampleIndices.Num());
 
-				if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+				TArray<uint8> SelectedSeedMask;
+				if (bRestrictThroughOtherOverlapSeeds)
 				{
-					continue;
+					SelectedSeedMask.Init(0, Planet.Samples.Num());
+					for (const int32 SeedSampleIndex : SelectedSeedSampleIndices)
+					{
+						if (SelectedSeedMask.IsValidIndex(SeedSampleIndex))
+						{
+							SelectedSeedMask[SeedSampleIndex] = 1;
+						}
+					}
 				}
 
-				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				TArray<int32> Frontier;
+				Frontier.Reserve(SelectedSeedSampleIndices.Num());
+				for (const int32 SeedSampleIndex : SelectedSeedSampleIndices)
 				{
-					if (!Planet.Samples.IsValidIndex(NeighborIndex) ||
-						Visited[NeighborIndex] != 0 ||
-						!PreviousPlateIds.IsValidIndex(NeighborIndex) ||
-						!PreviousContinentalWeights.IsValidIndex(NeighborIndex) ||
-						PreviousPlateIds[NeighborIndex] != SubductingPlateId ||
-						PreviousContinentalWeights[NeighborIndex] < 0.5f)
+					if (!Planet.Samples.IsValidIndex(SeedSampleIndex) ||
+						!PreviousPlateIds.IsValidIndex(SeedSampleIndex) ||
+						!PreviousContinentalWeights.IsValidIndex(SeedSampleIndex) ||
+						PreviousPlateIds[SeedSampleIndex] != SubductingPlateId ||
+						PreviousContinentalWeights[SeedSampleIndex] < 0.5f ||
+						OutBestDistancesKm[SeedSampleIndex] <= 0.0)
 					{
 						continue;
 					}
 
-					Visited[NeighborIndex] = 1;
-					Stack.Add(NeighborIndex);
+					OutBestDistancesKm[SeedSampleIndex] = 0.0;
+					Frontier.Add(SeedSampleIndex);
 				}
-			}
-		}
+
+				TArray<uint8> AddedToTerrane;
+				AddedToTerrane.Init(0, Planet.Samples.Num());
+				const double MaxPropagationKm = Planet.GeometricCollisionDonorLocalityClampKm;
+				while (!Frontier.IsEmpty())
+				{
+					int32 BestFrontierIndex = 0;
+					double BestDistanceKm = OutBestDistancesKm[Frontier[0]];
+					for (int32 FrontierIndex = 1; FrontierIndex < Frontier.Num(); ++FrontierIndex)
+					{
+						const double CandidateDistanceKm = OutBestDistancesKm[Frontier[FrontierIndex]];
+						if (CandidateDistanceKm < BestDistanceKm)
+						{
+							BestDistanceKm = CandidateDistanceKm;
+							BestFrontierIndex = FrontierIndex;
+						}
+					}
+
+					const int32 SampleIndex = Frontier[BestFrontierIndex];
+					Frontier.RemoveAtSwap(BestFrontierIndex, 1, EAllowShrinking::No);
+					if (!Planet.Samples.IsValidIndex(SampleIndex) ||
+						AddedToTerrane[SampleIndex] != 0 ||
+						BestDistanceKm > MaxPropagationKm)
+					{
+						continue;
+					}
+
+					AddedToTerrane[SampleIndex] = 1;
+					OutTerraneSampleIndices.Add(SampleIndex);
+
+					if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+					{
+						continue;
+					}
+
+					const FVector3d SamplePosition = Planet.Samples[SampleIndex].Position.GetSafeNormal();
+					for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+					{
+						if (!Planet.Samples.IsValidIndex(NeighborIndex) ||
+							!PreviousPlateIds.IsValidIndex(NeighborIndex) ||
+							!PreviousContinentalWeights.IsValidIndex(NeighborIndex) ||
+							PreviousPlateIds[NeighborIndex] != SubductingPlateId ||
+							PreviousContinentalWeights[NeighborIndex] < 0.5f)
+						{
+							continue;
+						}
+
+						if (bRestrictThroughOtherOverlapSeeds &&
+							AllOverlapSeedMask.IsValidIndex(NeighborIndex) &&
+							AllOverlapSeedMask[NeighborIndex] != 0 &&
+							(!SelectedSeedMask.IsValidIndex(NeighborIndex) ||
+								SelectedSeedMask[NeighborIndex] == 0))
+						{
+							continue;
+						}
+
+						const double EdgeDistanceKm =
+							ComputeGeodesicDistance(
+								SamplePosition,
+								Planet.Samples[NeighborIndex].Position.GetSafeNormal()) * Planet.PlanetRadiusKm;
+						const double CandidateDistanceKm = BestDistanceKm + EdgeDistanceKm;
+						if (CandidateDistanceKm > MaxPropagationKm)
+						{
+							continue;
+						}
+
+						if (CandidateDistanceKm + UE_DOUBLE_SMALL_NUMBER < OutBestDistancesKm[NeighborIndex])
+						{
+							OutBestDistancesKm[NeighborIndex] = CandidateDistanceKm;
+							Frontier.Add(NeighborIndex);
+						}
+					}
+				}
+			};
+
+		TArray<double> BestDistancesKm;
+		TArray<int32> TerraneSampleIndices;
+		BuildLocalityLimitedTerraneFromSeeds(
+			TerraneSeedSampleIndices,
+			false,
+			BestDistancesKm,
+			TerraneSampleIndices);
 
 		OutRecoveredTerraneCount = TerraneSampleIndices.Num();
 		if (TerraneSampleIndices.IsEmpty())
@@ -670,7 +2585,223 @@ namespace
 			return false;
 		}
 
-		for (const int32 SampleIndex : TerraneSampleIndices)
+		const auto EvaluateTransferSubset =
+			[&Planet, &PreviousPlateIds, OverridingPlateId, SubductingPlateId](
+				const TArray<int32>& CandidateSampleIndices,
+				FCollisionTransferConnectivityDiagnostics& OutDiagnostics)
+			{
+				OutDiagnostics = ComputeCollisionTransferConnectivityDiagnostics(
+					Planet,
+					PreviousPlateIds,
+					OverridingPlateId,
+					SubductingPlateId,
+					CandidateSampleIndices);
+				return PassesCollisionDonorConnectivityProtection(Planet, OutDiagnostics) &&
+					PassesCollisionReceiverConnectivityProtection(OutDiagnostics);
+			};
+
+		FCollisionTransferConnectivityDiagnostics ProposedDiagnostics;
+		const bool bFullTransferPassesProtection =
+			EvaluateTransferSubset(TerraneSampleIndices, ProposedDiagnostics);
+		if (OutProtectionDiagnostics != nullptr)
+		{
+			OutProtectionDiagnostics->Proposed = ProposedDiagnostics;
+			OutProtectionDiagnostics->ProposedTerraneSampleCount = TerraneSampleIndices.Num();
+		}
+
+		const FCollisionDonorProtectionResult ProposedDonorProtectionResult =
+			EvaluateCollisionDonorConnectivityProtection(Planet, ProposedDiagnostics);
+		const bool bProposedFailsDonorProtection =
+			!ProposedDonorProtectionResult.bPasses;
+		const bool bProposedFailsReceiverProtection =
+			!PassesCollisionReceiverConnectivityProtection(ProposedDiagnostics);
+
+		TArray<int32> FinalTerraneSampleIndices = TerraneSampleIndices;
+		FCollisionTransferConnectivityDiagnostics AppliedDiagnostics = ProposedDiagnostics;
+		if (!bFullTransferPassesProtection)
+		{
+			TArray<int32> BestProtectedSubset;
+			FCollisionTransferConnectivityDiagnostics BestProtectedDiagnostics;
+			const auto TryAdoptProtectedSubset =
+				[&BestProtectedSubset, &BestProtectedDiagnostics, &TerraneSampleIndices](
+					const TArray<int32>& CandidateSubset,
+					const FCollisionTransferConnectivityDiagnostics& CandidateDiagnostics)
+				{
+					if (CandidateSubset.IsEmpty() ||
+						CandidateSubset.Num() >= TerraneSampleIndices.Num())
+					{
+						return false;
+					}
+
+					if (BestProtectedSubset.IsEmpty() ||
+						CandidateSubset.Num() > BestProtectedSubset.Num())
+					{
+						BestProtectedSubset = CandidateSubset;
+						BestProtectedDiagnostics = CandidateDiagnostics;
+						return true;
+					}
+
+					return false;
+				};
+
+			for (const int32 SeedSampleIndex : TerraneSeedSampleIndices)
+			{
+				TArray<double> SingleSeedDistancesKm;
+				TArray<int32> SingleSeedTerraneSampleIndices;
+				BuildLocalityLimitedTerraneFromSeeds(
+					TArray<int32>{ SeedSampleIndex },
+					true,
+					SingleSeedDistancesKm,
+					SingleSeedTerraneSampleIndices);
+
+				FCollisionTransferConnectivityDiagnostics CandidateDiagnostics;
+				if (!EvaluateTransferSubset(SingleSeedTerraneSampleIndices, CandidateDiagnostics))
+				{
+					continue;
+				}
+
+				TryAdoptProtectedSubset(
+					SingleSeedTerraneSampleIndices,
+					CandidateDiagnostics);
+			}
+
+			TArray<double> CandidateDistanceThresholdsKm;
+			TArray<double> SortedTerraneDistancesKm;
+			SortedTerraneDistancesKm.Reserve(TerraneSampleIndices.Num());
+			for (const int32 SampleIndex : TerraneSampleIndices)
+			{
+				if (BestDistancesKm.IsValidIndex(SampleIndex) &&
+					FMath::IsFinite(BestDistancesKm[SampleIndex]))
+				{
+					SortedTerraneDistancesKm.Add(BestDistancesKm[SampleIndex]);
+				}
+			}
+			SortedTerraneDistancesKm.Sort();
+
+			const TArray<double> DistancePercentiles = {
+				0.85,
+				0.70,
+				0.55,
+				0.40,
+				0.25,
+				0.10,
+				0.0
+			};
+			double LastThresholdKm = -1.0;
+			for (const double Percentile : DistancePercentiles)
+			{
+				if (SortedTerraneDistancesKm.IsEmpty())
+				{
+					break;
+				}
+
+				const int32 ThresholdIndex = FMath::Clamp(
+					FMath::FloorToInt(
+						static_cast<double>(SortedTerraneDistancesKm.Num() - 1) * Percentile),
+					0,
+					SortedTerraneDistancesKm.Num() - 1);
+				const double ThresholdKm = SortedTerraneDistancesKm[ThresholdIndex];
+				if (!CandidateDistanceThresholdsKm.IsEmpty() &&
+					FMath::IsNearlyEqual(ThresholdKm, LastThresholdKm, UE_DOUBLE_SMALL_NUMBER))
+				{
+					continue;
+				}
+
+				CandidateDistanceThresholdsKm.Add(ThresholdKm);
+				LastThresholdKm = ThresholdKm;
+			}
+
+			TArray<int32> CandidateSubset;
+			for (const double ThresholdKm : CandidateDistanceThresholdsKm)
+			{
+				BuildCollisionTransferSubsetByDistanceThreshold(
+					TerraneSampleIndices,
+					BestDistancesKm,
+					ThresholdKm,
+					CandidateSubset);
+				if (CandidateSubset.IsEmpty() || CandidateSubset.Num() >= FinalTerraneSampleIndices.Num())
+				{
+					continue;
+				}
+
+				FCollisionTransferConnectivityDiagnostics CandidateDiagnostics;
+				if (!EvaluateTransferSubset(CandidateSubset, CandidateDiagnostics))
+				{
+					continue;
+				}
+
+				TryAdoptProtectedSubset(CandidateSubset, CandidateDiagnostics);
+			}
+
+			if (!BestProtectedSubset.IsEmpty())
+			{
+				FinalTerraneSampleIndices = BestProtectedSubset;
+				AppliedDiagnostics = BestProtectedDiagnostics;
+				if (OutProtectionDiagnostics != nullptr)
+				{
+					OutProtectionDiagnostics->bTrimmedByDonorProtection = bProposedFailsDonorProtection;
+					OutProtectionDiagnostics->bTrimmedByDonorComponentCap =
+						ProposedDonorProtectionResult.bFailedComponentCap;
+					OutProtectionDiagnostics->bTrimmedByDonorFragmentFloor =
+						ProposedDonorProtectionResult.bFailedFragmentFloor;
+					OutProtectionDiagnostics->bTrimmedByReceiverProtection = bProposedFailsReceiverProtection;
+					OutProtectionDiagnostics->AppliedTerraneSampleCount =
+						FinalTerraneSampleIndices.Num();
+					OutProtectionDiagnostics->AppliedTrimRatio =
+						TerraneSampleIndices.IsEmpty()
+							? 0.0
+							: 1.0 - (
+								static_cast<double>(FinalTerraneSampleIndices.Num()) /
+								static_cast<double>(TerraneSampleIndices.Num()));
+				}
+			}
+			else
+			{
+				if (OutProtectionDiagnostics != nullptr)
+				{
+					OutProtectionDiagnostics->bRejectedByDonorProtection = bProposedFailsDonorProtection;
+					OutProtectionDiagnostics->bRejectedByDonorComponentCap =
+						ProposedDonorProtectionResult.bFailedComponentCap;
+					OutProtectionDiagnostics->bRejectedByDonorFragmentFloor =
+						ProposedDonorProtectionResult.bFailedFragmentFloor;
+					OutProtectionDiagnostics->bRejectedByReceiverProtection = bProposedFailsReceiverProtection;
+					OutProtectionDiagnostics->AppliedTerraneSampleCount = 0;
+					OutProtectionDiagnostics->AppliedTrimRatio = 1.0;
+				}
+				if (bProposedFailsDonorProtection && bProposedFailsReceiverProtection)
+				{
+					OutFailureReason = TEXT("donor_and_receiver_connectivity_protection");
+				}
+				else if (bProposedFailsDonorProtection)
+				{
+					OutFailureReason = TEXT("donor_connectivity_protection");
+				}
+				else
+				{
+					OutFailureReason = TEXT("receiver_connectivity_protection");
+				}
+				return false;
+			}
+		}
+
+		OutRecoveredTerraneCount = FinalTerraneSampleIndices.Num();
+		OutLocalityLimitedCount = FMath::Max(0, UnboundedTerraneSize - OutRecoveredTerraneCount);
+		if (OutProtectionDiagnostics != nullptr)
+		{
+			OutProtectionDiagnostics->Applied = AppliedDiagnostics;
+			if (OutProtectionDiagnostics->AppliedTerraneSampleCount <= 0)
+			{
+				OutProtectionDiagnostics->AppliedTerraneSampleCount =
+					FinalTerraneSampleIndices.Num();
+			}
+			if (OutProtectionDiagnostics->AppliedTrimRatio <= 0.0 &&
+				FinalTerraneSampleIndices.Num() == TerraneSampleIndices.Num())
+			{
+				OutProtectionDiagnostics->AppliedTrimRatio = 0.0;
+			}
+		}
+
+		for (const int32 SampleIndex : FinalTerraneSampleIndices)
 		{
 			if (InOutNewPlateIds.IsValidIndex(SampleIndex))
 			{
@@ -682,7 +2813,7 @@ namespace
 		if (CollisionCenter.IsNearlyZero())
 		{
 			FVector3d CollisionCenterSum = FVector3d::ZeroVector;
-			for (const int32 SampleIndex : BoundarySeedSampleIndices)
+			for (const int32 SampleIndex : CollisionSeedSampleIndices)
 			{
 				if (Planet.Samples.IsValidIndex(SampleIndex))
 				{
@@ -704,9 +2835,9 @@ namespace
 		OutEvent.bDetected = true;
 		OutEvent.OverridingPlateId = OverridingPlateId;
 		OutEvent.SubductingPlateId = SubductingPlateId;
-		OutEvent.CollisionSampleIndices = BoundarySeedSampleIndices;
-		OutEvent.TerraneSampleIndices = TerraneSampleIndices;
-		OutEvent.TerraneId = ChooseDominantPreviousTerraneId(PreviousTerraneAssignments, TerraneSampleIndices);
+		OutEvent.CollisionSampleIndices = CollisionSeedSampleIndices;
+		OutEvent.TerraneSampleIndices = FinalTerraneSampleIndices;
+		OutEvent.TerraneId = ChooseDominantPreviousTerraneId(PreviousTerraneAssignments, FinalTerraneSampleIndices);
 		OutEvent.CollisionCenter = CollisionCenter;
 		return true;
 	}
@@ -1966,6 +4097,63 @@ namespace
 			OutContinentalWeight);
 	}
 
+	bool TryComputeAuthoritativeContinentalWeightForPlate(
+		const FTectonicPlanet& Planet,
+		const int32 SampleIndex,
+		const int32 PlateId,
+		float& OutContinentalWeight)
+	{
+		OutContinentalWeight = 0.0f;
+		if (!Planet.Samples.IsValidIndex(SampleIndex) || FindPlateById(Planet, PlateId) == nullptr)
+		{
+			return false;
+		}
+
+		double ContinentalWeight = 0.0;
+		const FVector3d QueryPoint = Planet.Samples[SampleIndex].Position;
+		if (TryComputeContainedPlateContinentalWeight(Planet, PlateId, QueryPoint, ContinentalWeight))
+		{
+			OutContinentalWeight = static_cast<float>(FMath::Clamp(ContinentalWeight, 0.0, 1.0));
+			return true;
+		}
+
+		FRecoveredContainmentHit RecoveryHit;
+		if (TryFindNearestTriangleRecoveryHit(Planet, PlateId, QueryPoint, RecoveryHit) &&
+			TryComputeRecoveredContinentalWeight(
+				Planet,
+				PlateId,
+				RecoveryHit.GlobalTriangleIndex,
+				RecoveryHit.Barycentric,
+				ContinentalWeight))
+		{
+			OutContinentalWeight = static_cast<float>(FMath::Clamp(ContinentalWeight, 0.0, 1.0));
+			return true;
+		}
+
+		int32 NearestMemberSampleIndex = INDEX_NONE;
+		double NearestMemberDistance = TNumericLimits<double>::Max();
+		if (!FindNearestMemberSample(
+				Planet,
+				PlateId,
+				QueryPoint,
+				NearestMemberSampleIndex,
+				NearestMemberDistance))
+		{
+			return false;
+		}
+
+		const FCarriedSample* NearestCarriedSample =
+			FindCarriedSampleForCanonicalVertex(Planet, PlateId, NearestMemberSampleIndex);
+		if (NearestCarriedSample == nullptr)
+		{
+			return false;
+		}
+
+		OutContinentalWeight =
+			FMath::Clamp(NearestCarriedSample->ContinentalWeight, 0.0f, 1.0f);
+		return true;
+	}
+
 	bool TryFindNearestTriangleRecoveryHit(
 		const FTectonicPlanet& Planet,
 		const int32 PlateId,
@@ -2046,6 +4234,124 @@ namespace
 		return true;
 	}
 
+	int32 CountAdjacentSamplesAssignedToPlate(
+		const FTectonicPlanet& Planet,
+		const int32 SampleIndex,
+		const int32 PlateId)
+	{
+		if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+		{
+			return 0;
+		}
+
+		int32 Count = 0;
+		for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+		{
+			if (!Planet.Samples.IsValidIndex(NeighborIndex))
+			{
+				continue;
+			}
+
+			Count += Planet.Samples[NeighborIndex].PlateId == PlateId ? 1 : 0;
+		}
+
+		return Count;
+	}
+
+	bool TryResolvePreserveBoundaryPreviousOwnerHysteresis(
+		const FTectonicPlanet& Planet,
+		const int32 SampleIndex,
+		const int32 PreviousPlateId,
+		const int32 WinningPlateId,
+		FRecoveredContainmentHit& OutRecoveryHit)
+	{
+		OutRecoveryHit = FRecoveredContainmentHit{};
+		if (!Planet.Samples.IsValidIndex(SampleIndex) ||
+			PreviousPlateId == INDEX_NONE ||
+			WinningPlateId == INDEX_NONE ||
+			PreviousPlateId == WinningPlateId)
+		{
+			return false;
+		}
+
+		const double PreviousContinentalWeight = FMath::Clamp(
+			static_cast<double>(Planet.Samples[SampleIndex].ContinentalWeight),
+			0.0,
+			1.0);
+		if (PreviousContinentalWeight < PreserveBoundaryStrongContinentalThreshold)
+		{
+			return false;
+		}
+
+		const FVector3d QueryPoint = Planet.Samples[SampleIndex].Position;
+		if (!TryFindNearestTriangleRecoveryHit(Planet, PreviousPlateId, QueryPoint, OutRecoveryHit))
+		{
+			return false;
+		}
+
+		double RecoveredContinentalWeight = 0.0;
+		if (!TryComputeRecoveredContinentalWeight(
+				Planet,
+				PreviousPlateId,
+				OutRecoveryHit.GlobalTriangleIndex,
+				OutRecoveryHit.Barycentric,
+				RecoveredContinentalWeight) ||
+			RecoveredContinentalWeight < PreserveBoundaryRecoveredContinentalThreshold)
+		{
+			return false;
+		}
+
+		const int32 PreviousOwnerNeighborVotes =
+			CountAdjacentSamplesAssignedToPlate(Planet, SampleIndex, PreviousPlateId);
+		const int32 WinningOwnerNeighborVotes =
+			CountAdjacentSamplesAssignedToPlate(Planet, SampleIndex, WinningPlateId);
+		return PreviousOwnerNeighborVotes > 0 &&
+			PreviousOwnerNeighborVotes >= WinningOwnerNeighborVotes;
+	}
+
+	uint64 MakeOwnerTransitionKey(const int32 PreviousPlateId, const int32 FinalPlateId)
+	{
+		return
+			(static_cast<uint64>(static_cast<uint32>(PreviousPlateId)) << 32) |
+			static_cast<uint32>(FinalPlateId);
+	}
+
+	int32 DecodeOwnerTransitionPreviousPlateId(const uint64 Key)
+	{
+		return static_cast<int32>(static_cast<uint32>(Key >> 32));
+	}
+
+	int32 DecodeOwnerTransitionFinalPlateId(const uint64 Key)
+	{
+		return static_cast<int32>(static_cast<uint32>(Key & 0xffffffffU));
+	}
+
+	FString JoinOwnerTransitionCountsForLog(
+		const TArray<int32>& PreviousPlateIds,
+		const TArray<int32>& FinalPlateIds,
+		const TArray<int32>& Counts)
+	{
+		if (PreviousPlateIds.Num() != FinalPlateIds.Num() ||
+			PreviousPlateIds.Num() != Counts.Num() ||
+			Counts.IsEmpty())
+		{
+			return TEXT("none");
+		}
+
+		TArray<FString> Parts;
+		Parts.Reserve(Counts.Num());
+		for (int32 Index = 0; Index < Counts.Num(); ++Index)
+		{
+			Parts.Add(FString::Printf(
+				TEXT("%d->%d:%d"),
+				PreviousPlateIds[Index],
+				FinalPlateIds[Index],
+				Counts[Index]));
+		}
+
+		return FString::Join(Parts, TEXT(","));
+	}
+
 	FVector3d ProjectDirectionToSurface(const FVector3d& Direction, const FVector3d& SurfaceNormal)
 	{
 		const FVector3d Projected = ProjectOntoTangent(Direction, SurfaceNormal);
@@ -2084,6 +4390,11 @@ namespace
 		float& OutSubductionSpeed)
 	{
 		const FVector3d Barycentric = NormalizeBarycentric(RawBarycentric);
+		const int32 DominantBarycentricIndex = PickDominantBarycentricIndex(Barycentric);
+		const FCarriedSample& DominantSource =
+			DominantBarycentricIndex == 1
+				? V1
+				: (DominantBarycentricIndex == 2 ? V2 : V0);
 
 		Sample.Elevation = static_cast<float>(
 			(Barycentric.X * V0.Elevation) +
@@ -2097,12 +4408,8 @@ namespace
 			(Barycentric.X * V0.Age) +
 			(Barycentric.Y * V1.Age) +
 			(Barycentric.Z * V2.Age));
-		Sample.ContinentalWeight = static_cast<float>(FMath::Clamp(
-			(Barycentric.X * V0.ContinentalWeight) +
-			(Barycentric.Y * V1.ContinentalWeight) +
-			(Barycentric.Z * V2.ContinentalWeight),
-			0.0,
-			1.0));
+		Sample.ContinentalWeight =
+			FMath::Clamp(DominantSource.ContinentalWeight, 0.0f, 1.0f);
 		Sample.OrogenyType = MajorityOrogenyType(V0.OrogenyType, V1.OrogenyType, V2.OrogenyType, Barycentric);
 		Sample.RidgeDirection = InterpolateDirection(
 			V0.RidgeDirection,
@@ -2117,7 +4424,7 @@ namespace
 			Barycentric,
 			SurfaceNormal);
 
-		switch (PickDominantBarycentricIndex(Barycentric))
+		switch (DominantBarycentricIndex)
 		{
 		case 1:
 			Sample.TerraneId = V1.TerraneId;
@@ -2618,10 +4925,39 @@ namespace
 			const int32 PlateA = Planet.Samples[Triangle.X].PlateId;
 			const int32 PlateB = Planet.Samples[Triangle.Y].PlateId;
 			const int32 PlateC = Planet.Samples[Triangle.Z].PlateId;
-			const int32 AssignedPlateId = ChooseSoupPlateIdForTriangle(Planet, Triangle);
-			if (FPlate* AssignedPlate = FindPlateById(Planet, AssignedPlateId))
+
+			if (Planet.bUseVertexLevelSoupInclusionForTest)
 			{
-				AssignedPlate->SoupTriangles.Add(TriangleIndex);
+				// Spike path: include triangle in every plate that owns at least one vertex.
+				TArray<int32, TInlineAllocator<3>> SoupPlates;
+				if (FindPlateById(Planet, PlateA) != nullptr)
+				{
+					SoupPlates.AddUnique(PlateA);
+				}
+				if (FindPlateById(Planet, PlateB) != nullptr)
+				{
+					SoupPlates.AddUnique(PlateB);
+				}
+				if (FindPlateById(Planet, PlateC) != nullptr)
+				{
+					SoupPlates.AddUnique(PlateC);
+				}
+				for (const int32 SoupPlateId : SoupPlates)
+				{
+					if (FPlate* SoupPlate = FindPlateById(Planet, SoupPlateId))
+					{
+						SoupPlate->SoupTriangles.Add(TriangleIndex);
+					}
+				}
+			}
+			else
+			{
+				// Legacy path: majority-vote single-owner assignment.
+				const int32 AssignedPlateId = ChooseSoupPlateIdForTriangle(Planet, Triangle);
+				if (FPlate* AssignedPlate = FindPlateById(Planet, AssignedPlateId))
+				{
+					AssignedPlate->SoupTriangles.Add(TriangleIndex);
+				}
 			}
 
 			if (FindPlateById(Planet, PlateA) != nullptr && PlateA == PlateB && PlateB == PlateC)
@@ -3220,17 +5556,91 @@ namespace
 	void AssignInitialPlateMotion(FTectonicPlanet& Planet, const int32 RandomSeed)
 	{
 		FRandomStream Random(MakeDeterministicSeed(RandomSeed, Planet.Plates.Num(), 77));
-		const double MaxAngularSpeed = MaxDistanceAdvanceKmPerStep / FMath::Max(Planet.PlanetRadiusKm, UE_DOUBLE_SMALL_NUMBER);
-		const double MinAngularSpeed = MinPlateAngularSpeedFactor * MaxAngularSpeed;
+		const double MaxInitialAngularSpeed = InitialPlateSpeedMaxKmPerStep / FMath::Max(Planet.PlanetRadiusKm, UE_DOUBLE_SMALL_NUMBER);
+		const double MinInitialAngularSpeed = InitialPlateSpeedMinKmPerStep / FMath::Max(Planet.PlanetRadiusKm, UE_DOUBLE_SMALL_NUMBER);
 
 		for (FPlate& Plate : Planet.Plates)
 		{
 			Plate.RotationAxis = MakeRandomUnitVector(Random).GetSafeNormal();
-			Plate.AngularSpeed = Random.FRandRange(static_cast<float>(MinAngularSpeed), static_cast<float>(MaxAngularSpeed));
+			Plate.AngularSpeed = Random.FRandRange(static_cast<float>(MinInitialAngularSpeed), static_cast<float>(MaxInitialAngularSpeed));
 			Plate.CumulativeRotation = FQuat4d::Identity;
 			ResetSoupState(Plate);
 		}
 	}
+}
+
+FTectonicPlanetRuntimeConfig GetM6BaselineRuntimeConfig()
+{
+	FTectonicPlanetRuntimeConfig Config;
+	Config.ResamplingPolicy = EResamplingPolicy::PreserveOwnershipPeriodic;
+	Config.bEnableAutomaticRifting = true;
+	Config.bEnableWarpedRiftBoundaries = true;
+	Config.AutomaticRiftMinParentSamples = 1500;
+	Config.AutomaticRiftMinContinentalSamples = 64;
+	Config.AutomaticRiftCooldownSteps = 20;
+	Config.AutomaticRiftBaseRatePerMy = 0.18;
+	Config.AutomaticRiftMinContinentalFraction = 0.05;
+	Config.RiftBoundaryWarpAmplitude = 0.25;
+	Config.RiftBoundaryWarpFrequency = 1.5;
+	Config.AndeanContinentalConversionRatePerMy = 0.005;
+	return Config;
+}
+
+FTectonicPlanetRuntimeConfig GetArchitectureSpikeARuntimeConfig()
+{
+	FTectonicPlanetRuntimeConfig Config = GetM6BaselineRuntimeConfig();
+	Config.ResamplingPolicy = EResamplingPolicy::PeriodicGlobalAuthoritativeSpike;
+	return Config;
+}
+
+FTectonicPlanetRuntimeConfig CaptureTectonicPlanetRuntimeConfig(const FTectonicPlanet& Planet)
+{
+	FTectonicPlanetRuntimeConfig Config;
+	Config.ResamplingPolicy = Planet.ResamplingPolicy;
+	Config.bEnableAutomaticRifting = Planet.bEnableAutomaticRifting;
+	Config.bEnableWarpedRiftBoundaries = Planet.bEnableWarpedRiftBoundaries;
+	Config.AutomaticRiftMinParentSamples = Planet.AutomaticRiftMinParentSamples;
+	Config.AutomaticRiftMinContinentalSamples = Planet.AutomaticRiftMinContinentalSamples;
+	Config.AutomaticRiftCooldownSteps = Planet.AutomaticRiftCooldownSteps;
+	Config.AutomaticRiftBaseRatePerMy = Planet.AutomaticRiftBaseRatePerMy;
+	Config.AutomaticRiftMinContinentalFraction = Planet.AutomaticRiftMinContinentalFraction;
+	Config.RiftBoundaryWarpAmplitude = Planet.RiftBoundaryWarpAmplitude;
+	Config.RiftBoundaryWarpFrequency = Planet.RiftBoundaryWarpFrequency;
+	Config.AndeanContinentalConversionRatePerMy = Planet.AndeanContinentalConversionRatePerMy;
+	return Config;
+}
+
+void ApplyTectonicPlanetRuntimeConfig(
+	FTectonicPlanet& Planet,
+	const FTectonicPlanetRuntimeConfig& Config)
+{
+	Planet.ResamplingPolicy = Config.ResamplingPolicy;
+	Planet.bEnableAutomaticRifting = Config.bEnableAutomaticRifting;
+	Planet.bEnableWarpedRiftBoundaries = Config.bEnableWarpedRiftBoundaries;
+	Planet.AutomaticRiftMinParentSamples = Config.AutomaticRiftMinParentSamples;
+	Planet.AutomaticRiftMinContinentalSamples = Config.AutomaticRiftMinContinentalSamples;
+	Planet.AutomaticRiftCooldownSteps = Config.AutomaticRiftCooldownSteps;
+	Planet.AutomaticRiftBaseRatePerMy = Config.AutomaticRiftBaseRatePerMy;
+	Planet.AutomaticRiftMinContinentalFraction = Config.AutomaticRiftMinContinentalFraction;
+	Planet.RiftBoundaryWarpAmplitude = Config.RiftBoundaryWarpAmplitude;
+	Planet.RiftBoundaryWarpFrequency = Config.RiftBoundaryWarpFrequency;
+	Planet.AndeanContinentalConversionRatePerMy = Config.AndeanContinentalConversionRatePerMy;
+}
+
+FString DescribeTectonicPlanetRuntimeConfig(const FTectonicPlanetRuntimeConfig& Config)
+{
+	return FString::Printf(
+		TEXT("resampling_policy=%s automatic_rifting=%d automatic_rift_base_rate_per_my=%.3f automatic_rift_min_parent_samples=%d automatic_rift_min_continental_samples=%d automatic_rift_min_continental_fraction=%.3f automatic_rift_cooldown_steps=%d rift_boundary_warp_amplitude=%.3f rift_boundary_warp_frequency=%.3f andean_rate_per_my=%.3f"),
+		GetResamplingPolicyName(Config.ResamplingPolicy),
+		Config.bEnableAutomaticRifting ? 1 : 0,
+		Config.AutomaticRiftBaseRatePerMy,
+		Config.AutomaticRiftMinParentSamples,
+		Config.AutomaticRiftMinContinentalSamples,
+		Config.AutomaticRiftMinContinentalFraction,
+		Config.AutomaticRiftCooldownSteps,
+		Config.RiftBoundaryWarpAmplitude,
+		Config.RiftBoundaryWarpFrequency,
+		Config.AndeanContinentalConversionRatePerMy);
 }
 
 void FTectonicPlanet::Initialize(const int32 InSampleCount, const double InPlanetRadiusKm)
@@ -3238,6 +5648,7 @@ void FTectonicPlanet::Initialize(const int32 InSampleCount, const double InPlane
 	SampleCountConfig = InSampleCount;
 	PlanetRadiusKm = InPlanetRadiusKm;
 	PlateCountConfig = 0;
+	InitialPlateCountConfig = 0;
 	NextPlateId = 0;
 	CurrentStep = 0;
 	NextTerraneId = 0;
@@ -3246,6 +5657,7 @@ void FTectonicPlanet::Initialize(const int32 InSampleCount, const double InPlane
 	MaxStepsWithoutResampling = INDEX_NONE;
 	bEnableSlabPull = true;
 	bEnableAndeanContinentalConversion = true;
+	AndeanContinentalConversionRatePerMy = 0.005;
 	bEnableOverlapHysteresis = false;
 	bEnableContinentalCollision = true;
 	ResamplingPolicy = EResamplingPolicy::PeriodicFull;
@@ -3254,10 +5666,15 @@ void FTectonicPlanet::Initialize(const int32 InSampleCount, const double InPlane
 	bPendingFullResolutionResample = false;
 	bPendingBoundaryContactPersistenceReset = false;
 	LastResamplingStats = FResamplingStats{};
+	ResamplingHistory.Reset();
 	ResamplingSteps.Reset();
 	BoundaryContactPersistenceByPair.Reset();
+	CollisionLastExecutionOrdinalByPair.Reset();
+	GeometricCollisionPairRecurrenceByKey.Reset();
 	PendingBoundaryContactCollisionEvent = FPendingBoundaryContactCollisionEvent{};
+	PendingGeometricCollisionEvent = FPendingGeometricCollisionEvent{};
 	PendingRiftEvent = FPendingRiftEvent{};
+	ResamplingExecutionOrdinal = 0;
 	SimulationSeed = 0;
 	Samples.Reset();
 	Plates.Reset();
@@ -3364,16 +5781,22 @@ void FTectonicPlanet::InitializePlates(
 	checkf(!Samples.IsEmpty(), TEXT("InitializePlates requires canonical samples. Call Initialize() first."));
 
 	PlateCountConfig = FMath::Clamp(InPlateCount, 1, Samples.Num());
+	InitialPlateCountConfig = PlateCountConfig;
 	CurrentStep = 0;
 	LastResamplingStats = FResamplingStats{};
 	LastResampleTriggerReason = EResampleTriggerReason::None;
 	LastResampleOwnershipMode = EResampleOwnershipMode::FullResolution;
 	bPendingFullResolutionResample = false;
 	bPendingBoundaryContactPersistenceReset = false;
+	ResamplingHistory.Reset();
 	ResamplingSteps.Reset();
 	BoundaryContactPersistenceByPair.Reset();
+	CollisionLastExecutionOrdinalByPair.Reset();
+	GeometricCollisionPairRecurrenceByKey.Reset();
 	PendingBoundaryContactCollisionEvent = FPendingBoundaryContactCollisionEvent{};
+	PendingGeometricCollisionEvent = FPendingGeometricCollisionEvent{};
 	PendingRiftEvent = FPendingRiftEvent{};
+	ResamplingExecutionOrdinal = 0;
 	Terranes.Reset();
 	SimulationSeed = InRandomSeed;
 	NextPlateId = 0;
@@ -3617,7 +6040,8 @@ void FTectonicPlanet::AdvanceStep()
 			{
 				CarriedSample.ContinentalWeight = FMath::Min(
 					1.0f,
-					CarriedSample.ContinentalWeight + static_cast<float>(AndeanContinentalConversionRate * DeltaTimeMyears));
+					CarriedSample.ContinentalWeight +
+						static_cast<float>(AndeanContinentalConversionRatePerMy * DeltaTimeMyears));
 			}
 
 			if (CarriedSample.ContinentalWeight >= 0.5f)
@@ -3655,6 +6079,7 @@ void FTectonicPlanet::AdvanceStep()
 		switch (ResamplingPolicy)
 		{
 		case EResamplingPolicy::PeriodicFull:
+		case EResamplingPolicy::PeriodicGlobalAuthoritativeSpike:
 			if (CurrentStep > 0 && ResampleInterval > 0 && (CurrentStep % ResampleInterval) == 0)
 			{
 				PerformResampling(EResampleOwnershipMode::FullResolution, EResampleTriggerReason::Periodic);
@@ -3749,28 +6174,75 @@ bool FTectonicPlanet::IsPlateEligibleForAutomaticRift(
 		OutContinentalFraction >= AutomaticRiftMinContinentalFraction;
 }
 
-double FTectonicPlanet::ComputeAutomaticRiftProbability(const FPlate& Plate, const double ContinentalFraction) const
+double FTectonicPlanet::ComputeAutomaticRiftProbabilityForSampleCount(
+	const int32 ParentSampleCount,
+	const double ContinentalFraction) const
 {
-	if (Samples.IsEmpty() || Plates.IsEmpty())
+	if (Samples.IsEmpty() || ParentSampleCount <= 0)
 	{
 		return 0.0;
 	}
 
-	const double AveragePlateSampleCount =
-		static_cast<double>(Samples.Num()) / static_cast<double>(FMath::Max(Plates.Num(), 1));
-	const double SizeScale = FMath::Clamp(
-		static_cast<double>(Plate.MemberSamples.Num()) / FMath::Max(AveragePlateSampleCount, 1.0),
-		0.25,
-		4.0);
+	const double ParentSampleShare =
+		FMath::Clamp(static_cast<double>(ParentSampleCount) / static_cast<double>(Samples.Num()), 0.0, 1.0);
 	const double ContinentalScale = FMath::Clamp(
 		ContinentalFraction / FMath::Max(AutomaticRiftMinContinentalFraction, 0.01),
-		0.25,
+		1.0,
 		4.0);
+	const int32 InitialPlateCount = FMath::Max(InitialPlateCountConfig, 1);
 	const double Lambda =
-		FMath::Max(0.0, AutomaticRiftBaseLambdaPerStep) *
-		FMath::Pow(SizeScale, AutomaticRiftParentSizeExponent) *
-		FMath::Pow(ContinentalScale, AutomaticRiftContinentalExponent);
+		FMath::Max(0.0, AutomaticRiftBaseRatePerMy) *
+		DeltaTimeMyears *
+		ParentSampleShare *
+		ContinentalScale /
+		static_cast<double>(InitialPlateCount);
 	return FMath::Clamp(1.0 - FMath::Exp(-Lambda), 0.0, 0.95);
+}
+
+int32 FTectonicPlanet::FindLargestEligibleAutomaticRiftParentId(
+	int32* OutContinentalSampleCount,
+	double* OutContinentalFraction) const
+{
+	if (OutContinentalSampleCount != nullptr)
+	{
+		*OutContinentalSampleCount = 0;
+	}
+	if (OutContinentalFraction != nullptr)
+	{
+		*OutContinentalFraction = 0.0;
+	}
+
+	int32 BestParentPlateId = INDEX_NONE;
+	int32 BestParentSampleCount = -1;
+	int32 BestContinentalSampleCount = 0;
+	double BestContinentalFraction = 0.0;
+	for (const FPlate& Plate : Plates)
+	{
+		int32 ContinentalSampleCount = 0;
+		double ContinentalFraction = 0.0;
+		if (!IsPlateEligibleForAutomaticRift(Plate, MinForcedRiftChildren, ContinentalSampleCount, ContinentalFraction))
+		{
+			continue;
+		}
+		if (Plate.MemberSamples.Num() > BestParentSampleCount ||
+			(Plate.MemberSamples.Num() == BestParentSampleCount &&
+				(BestParentPlateId == INDEX_NONE || Plate.Id < BestParentPlateId)))
+		{
+			BestParentPlateId = Plate.Id;
+			BestParentSampleCount = Plate.MemberSamples.Num();
+			BestContinentalSampleCount = ContinentalSampleCount;
+			BestContinentalFraction = ContinentalFraction;
+		}
+	}
+	if (OutContinentalSampleCount != nullptr)
+	{
+		*OutContinentalSampleCount = BestContinentalSampleCount;
+	}
+	if (OutContinentalFraction != nullptr)
+	{
+		*OutContinentalFraction = BestContinentalFraction;
+	}
+	return BestParentPlateId;
 }
 
 bool FTectonicPlanet::TryTriggerAutomaticRift()
@@ -3780,120 +6252,56 @@ bool FTectonicPlanet::TryTriggerAutomaticRift()
 		return false;
 	}
 
-	struct FAutomaticRiftCandidate
-	{
-		int32 ParentPlateId = INDEX_NONE;
-		int32 ChildCount = 0;
-		int32 EventSeed = 0;
-		int32 ParentSampleCount = 0;
-		int32 ContinentalSampleCount = 0;
-		double ContinentalFraction = 0.0;
-		double Probability = 0.0;
-		double TriggerMargin = -1.0;
-	};
-
-	FAutomaticRiftCandidate BestCandidate;
-	TArray<const FPlate*> SortedPlates;
-	SortedPlates.Reserve(Plates.Num());
-	for (const FPlate& Plate : Plates)
-	{
-		SortedPlates.Add(&Plate);
-	}
-	SortedPlates.Sort([](const FPlate& Left, const FPlate& Right)
-	{
-		if (Left.MemberSamples.Num() != Right.MemberSamples.Num())
-		{
-			return Left.MemberSamples.Num() > Right.MemberSamples.Num();
-		}
-		return Left.Id < Right.Id;
-	});
-
-	for (const FPlate* Plate : SortedPlates)
-	{
-		if (Plate == nullptr)
-		{
-			continue;
-		}
-
-		TArray<int32> EligibleChildCounts;
-		for (int32 ChildCount = MinForcedRiftChildren; ChildCount <= MaxForcedRiftChildren; ++ChildCount)
-		{
-			int32 ContinentalSampleCount = 0;
-			double ContinentalFraction = 0.0;
-			if (IsPlateEligibleForAutomaticRift(*Plate, ChildCount, ContinentalSampleCount, ContinentalFraction))
-			{
-				EligibleChildCounts.Add(ChildCount);
-			}
-		}
-
-		if (EligibleChildCounts.IsEmpty())
-		{
-			continue;
-		}
-
-		FRandomStream ChildCountRandom(MakeDeterministicSeed(SimulationSeed, CurrentStep, Plate->Id));
-		const int32 ChildCount =
-			EligibleChildCounts[ChildCountRandom.RandRange(0, EligibleChildCounts.Num() - 1)];
-		int32 ContinentalSampleCount = 0;
-		double ContinentalFraction = 0.0;
-		if (!IsPlateEligibleForAutomaticRift(*Plate, ChildCount, ContinentalSampleCount, ContinentalFraction))
-		{
-			continue;
-		}
-
-		const double Probability = ComputeAutomaticRiftProbability(*Plate, ContinentalFraction);
-		FRandomStream TriggerRandom(MakeDeterministicSeed(SimulationSeed, CurrentStep, MakeDeterministicSeed(Plate->Id, ChildCount, 701)));
-		const double Draw = TriggerRandom.FRand();
-		if (Draw >= Probability)
-		{
-			continue;
-		}
-
-		const double TriggerMargin = Probability - Draw;
-		if (BestCandidate.ParentPlateId == INDEX_NONE ||
-			TriggerMargin > BestCandidate.TriggerMargin + TriangleEpsilon ||
-			(FMath::IsNearlyEqual(TriggerMargin, BestCandidate.TriggerMargin, TriangleEpsilon) &&
-				(Plate->MemberSamples.Num() > BestCandidate.ParentSampleCount ||
-					(Plate->MemberSamples.Num() == BestCandidate.ParentSampleCount &&
-						Plate->Id < BestCandidate.ParentPlateId))))
-		{
-			BestCandidate.ParentPlateId = Plate->Id;
-			BestCandidate.ChildCount = ChildCount;
-			BestCandidate.EventSeed = MakeDeterministicSeed(SimulationSeed, CurrentStep, MakeDeterministicSeed(Plate->Id, ChildCount, 991));
-			BestCandidate.ParentSampleCount = Plate->MemberSamples.Num();
-			BestCandidate.ContinentalSampleCount = ContinentalSampleCount;
-			BestCandidate.ContinentalFraction = ContinentalFraction;
-			BestCandidate.Probability = Probability;
-			BestCandidate.TriggerMargin = TriggerMargin;
-		}
-	}
-
-	if (BestCandidate.ParentPlateId == INDEX_NONE)
+	int32 ContinentalSampleCount = 0;
+	double ContinentalFraction = 0.0;
+	const int32 ParentPlateId =
+		FindLargestEligibleAutomaticRiftParentId(&ContinentalSampleCount, &ContinentalFraction);
+	if (ParentPlateId == INDEX_NONE)
 	{
 		return false;
 	}
 
+	const FPlate* ParentPlate = FindPlateById(*this, ParentPlateId);
+	if (ParentPlate == nullptr)
+	{
+		return false;
+	}
+
+	const int32 ChildCount = 2; // M6b stabilization: automatic rifts stay binary to suppress fragmentation cascades.
+	const double Probability =
+		ComputeAutomaticRiftProbabilityForSampleCount(ParentPlate->MemberSamples.Num(), ContinentalFraction);
+	const int32 EventSeed = MakeDeterministicSeed(SimulationSeed, CurrentStep, MakeDeterministicSeed(ParentPlateId, ChildCount, 991));
+	FRandomStream TriggerRandom(MakeDeterministicSeed(SimulationSeed, CurrentStep, MakeDeterministicSeed(ParentPlateId, ChildCount, 701)));
+	const double Draw = TriggerRandom.FRand();
+	const bool bTriggered = Draw < Probability;
+
 	UE_LOG(
 		LogTemp,
 		Log,
-		TEXT("[AutoRift Step=%d] parent=%d child_count=%d parent_samples=%d parent_continental_samples=%d parent_continental_fraction=%.4f probability=%.6f event_seed=%d"),
+		TEXT("[AutoRiftCheck Step=%d] parent=%d child_count=%d parent_samples=%d parent_continental_samples=%d parent_continental_fraction=%.4f probability=%.6f draw=%.6f triggered=%d event_seed=%d"),
 		CurrentStep,
-		BestCandidate.ParentPlateId,
-		BestCandidate.ChildCount,
-		BestCandidate.ParentSampleCount,
-		BestCandidate.ContinentalSampleCount,
-		BestCandidate.ContinentalFraction,
-		BestCandidate.Probability,
-		BestCandidate.EventSeed);
+		ParentPlateId,
+		ChildCount,
+		ParentPlate->MemberSamples.Num(),
+		ContinentalSampleCount,
+		ContinentalFraction,
+		Probability,
+		Draw,
+		bTriggered ? 1 : 0,
+		EventSeed);
+	if (!bTriggered)
+	{
+		return false;
+	}
 
 	return TriggerForcedRiftInternal(
-		BestCandidate.ParentPlateId,
-		BestCandidate.ChildCount,
-		BestCandidate.EventSeed,
+		ParentPlateId,
+		ChildCount,
+		EventSeed,
 		true,
-		BestCandidate.Probability,
-		BestCandidate.ContinentalSampleCount,
-		BestCandidate.ContinentalFraction);
+		Probability,
+		ContinentalSampleCount,
+		ContinentalFraction);
 }
 
 int32 FTectonicPlanet::FindPlateArrayIndexById(const int32 PlateId) const
@@ -4039,7 +6447,6 @@ bool FTectonicPlanet::TriggerForcedRiftInternal(
 	{
 		Plates.Add(MoveTemp(ChildPlate));
 	}
-	PlateCountConfig = Plates.Num();
 	ResetBoundaryContactCollisionPersistence();
 
 	TArray<int32> PostRiftPlateIds;
@@ -4063,6 +6470,7 @@ bool FTectonicPlanet::TriggerForcedRiftInternal(
 	PendingRiftEvent.ChildSampleCountB = ChildSampleCounts.IsValidIndex(1) ? ChildSampleCounts[1] : 0;
 	PendingRiftEvent.EventSeed = RiftEventSeed;
 	PendingRiftEvent.ChildPlateIds = ChildPlateIds;
+	PendingRiftEvent.ChildAnchorSampleIndices = CentroidSampleIndices;
 	PendingRiftEvent.ChildSampleCounts = ChildSampleCounts;
 	PendingRiftEvent.FormerParentSampleIndices = ParentMembers;
 	PendingRiftEvent.FormerParentTerraneIds = MoveTemp(FormerParentTerraneIds);
@@ -4174,7 +6582,9 @@ void FTectonicPlanet::QueryOwnership(
 	int32& OutOverlapCount,
 	TArray<TArray<int32>>* OutOverlapPlateIds,
 	FResamplingStats* OutStats,
-	const EResampleOwnershipMode OwnershipMode) const
+	const EResampleOwnershipMode OwnershipMode,
+	TArray<uint8>* OutPreserveOwnershipCWRetainFlags,
+	TArray<uint8>* OutPreserveOwnershipFallbackQueryFlags) const
 {
 	OutNewPlateIds.Init(INDEX_NONE, Samples.Num());
 	OutContainingTriangles.Init(INDEX_NONE, Samples.Num());
@@ -4183,13 +6593,23 @@ void FTectonicPlanet::QueryOwnership(
 	OutOverlapFlags.Init(0, Samples.Num());
 	TArray<uint8> RecoveryFlags;
 	TArray<uint8> RecoveryContinentalFlags;
+	TArray<uint8> PreserveOwnershipPreviousOwnerHysteresisFlags;
 	TArray<double> RecoveryDistances;
 	RecoveryFlags.Init(0, Samples.Num());
 	RecoveryContinentalFlags.Init(0, Samples.Num());
+	PreserveOwnershipPreviousOwnerHysteresisFlags.Init(0, Samples.Num());
 	RecoveryDistances.Init(-1.0, Samples.Num());
 	if (OutOverlapPlateIds != nullptr)
 	{
 		OutOverlapPlateIds->SetNum(Samples.Num());
+	}
+	if (OutPreserveOwnershipCWRetainFlags != nullptr)
+	{
+		OutPreserveOwnershipCWRetainFlags->Init(0, Samples.Num());
+	}
+	if (OutPreserveOwnershipFallbackQueryFlags != nullptr)
+	{
+		OutPreserveOwnershipFallbackQueryFlags->Init(0, Samples.Num());
 	}
 	if (OutStats != nullptr)
 	{
@@ -4207,6 +6627,10 @@ void FTectonicPlanet::QueryOwnership(
 		OutStats->PreserveOwnershipSamePlateRecoveryCount = 0;
 		OutStats->PreserveOwnershipFallbackQueryCount = 0;
 		OutStats->PreserveOwnershipPlateChangedCount = 0;
+		OutStats->PreserveOwnershipCWRetainedCount = 0;
+		OutStats->PreserveOwnershipCWThresholdCrossingPreventedCount = 0;
+		OutStats->PreserveOwnershipPreviousOwnerHysteresisApplicationCount = 0;
+		OutStats->PreserveOwnershipStronglyContinentalBoundarySavedCount = 0;
 	}
 
 	TAtomic<int32> HysteresisRetainedCount(0);
@@ -4230,7 +6654,7 @@ void FTectonicPlanet::QueryOwnership(
 
 	ParallelFor(
 		Samples.Num(),
-		[this, bAllRotationsIdentity, bUseStableOverlaps, bUsePreserveOwnership, &OutNewPlateIds, &OutContainingTriangles, &OutBarycentricCoords, &OutGapFlags, &OutOverlapFlags, OutOverlapPlateIds, &RecoveryFlags, &RecoveryContinentalFlags, &RecoveryDistances, &HysteresisRetainedCount, &HysteresisReassignedCount, &PreserveOwnershipSamePlateHitCount, &PreserveOwnershipSamePlateRecoveryCount, &PreserveOwnershipFallbackQueryCount](const int32 SampleIndex)
+		[this, bAllRotationsIdentity, bUseStableOverlaps, bUsePreserveOwnership, &OutNewPlateIds, &OutContainingTriangles, &OutBarycentricCoords, &OutGapFlags, &OutOverlapFlags, OutOverlapPlateIds, OutPreserveOwnershipCWRetainFlags, OutPreserveOwnershipFallbackQueryFlags, &RecoveryFlags, &RecoveryContinentalFlags, &PreserveOwnershipPreviousOwnerHysteresisFlags, &RecoveryDistances, &HysteresisRetainedCount, &HysteresisReassignedCount, &PreserveOwnershipSamePlateHitCount, &PreserveOwnershipSamePlateRecoveryCount, &PreserveOwnershipFallbackQueryCount](const int32 SampleIndex)
 	{
 		const FVector3d QueryPoint = Samples[SampleIndex].Position;
 		const int32 CurrentPlateId = Samples[SampleIndex].PlateId;
@@ -4238,6 +6662,10 @@ void FTectonicPlanet::QueryOwnership(
 		const FPlate* CurrentPlatePtr = FindPlateById(*this, CurrentPlateId);
 		if (bUsePreserveOwnership && CurrentPlatePtr == nullptr)
 		{
+			if (OutPreserveOwnershipFallbackQueryFlags != nullptr)
+			{
+				(*OutPreserveOwnershipFallbackQueryFlags)[SampleIndex] = 1;
+			}
 			++PreserveOwnershipFallbackQueryCount;
 		}
 		else if (bUsePreserveOwnership && CurrentPlatePtr != nullptr)
@@ -4245,6 +6673,10 @@ void FTectonicPlanet::QueryOwnership(
 			const FPlate& CurrentPlate = *CurrentPlatePtr;
 			if (CurrentPlate.SoupData.LocalTriangles.IsEmpty())
 			{
+				if (OutPreserveOwnershipFallbackQueryFlags != nullptr)
+				{
+					(*OutPreserveOwnershipFallbackQueryFlags)[SampleIndex] = 1;
+				}
 				++PreserveOwnershipFallbackQueryCount;
 			}
 			else
@@ -4264,6 +6696,10 @@ void FTectonicPlanet::QueryOwnership(
 						? CurrentPlate.SoupData.GlobalTriangleIndices[LocalTriangleId]
 						: INDEX_NONE;
 					OutBarycentricCoords[SampleIndex] = NormalizeBarycentric(ComputePlanarBarycentric(A, B, C, QueryPoint));
+					if (OutPreserveOwnershipCWRetainFlags != nullptr)
+					{
+						(*OutPreserveOwnershipCWRetainFlags)[SampleIndex] = 1;
+					}
 					++PreserveOwnershipSamePlateHitCount;
 					return;
 				}
@@ -4277,6 +6713,10 @@ void FTectonicPlanet::QueryOwnership(
 					OutBarycentricCoords[SampleIndex] = RecoveryHit.Barycentric;
 					RecoveryFlags[SampleIndex] = 1;
 					RecoveryDistances[SampleIndex] = RecoveryHit.Distance;
+					if (OutPreserveOwnershipCWRetainFlags != nullptr)
+					{
+						(*OutPreserveOwnershipCWRetainFlags)[SampleIndex] = 1;
+					}
 
 					double RecoveredContinentalWeight = 0.0;
 					if (TryComputeRecoveredContinentalWeight(
@@ -4294,6 +6734,10 @@ void FTectonicPlanet::QueryOwnership(
 					return;
 				}
 
+				if (OutPreserveOwnershipFallbackQueryFlags != nullptr)
+				{
+					(*OutPreserveOwnershipFallbackQueryFlags)[SampleIndex] = 1;
+				}
 				++PreserveOwnershipFallbackQueryCount;
 			}
 		}
@@ -4414,6 +6858,35 @@ void FTectonicPlanet::QueryOwnership(
 			return;
 		}
 
+		const bool bPreserveFallbackQueried =
+			bUsePreserveOwnership &&
+			OutPreserveOwnershipFallbackQueryFlags != nullptr &&
+			(*OutPreserveOwnershipFallbackQueryFlags)[SampleIndex] != 0;
+		if (bPreserveFallbackQueried &&
+			MeaningfulContainingPlateCount <= 1 &&
+			BestPlateId != INDEX_NONE &&
+			BestPlateId != CurrentPlateId)
+		{
+			FRecoveredContainmentHit HysteresisRecoveryHit;
+			if (TryResolvePreserveBoundaryPreviousOwnerHysteresis(
+					*this,
+					SampleIndex,
+					CurrentPlateId,
+					BestPlateId,
+					HysteresisRecoveryHit))
+			{
+				OutNewPlateIds[SampleIndex] = CurrentPlateId;
+				OutContainingTriangles[SampleIndex] = HysteresisRecoveryHit.GlobalTriangleIndex;
+				OutBarycentricCoords[SampleIndex] = HysteresisRecoveryHit.Barycentric;
+				if (OutPreserveOwnershipCWRetainFlags != nullptr)
+				{
+					(*OutPreserveOwnershipCWRetainFlags)[SampleIndex] = 1;
+				}
+				PreserveOwnershipPreviousOwnerHysteresisFlags[SampleIndex] = 1;
+				return;
+			}
+		}
+
 		if (!bAllRotationsIdentity && MeaningfulContainingPlateCount > 1)
 		{
 			OutOverlapFlags[SampleIndex] = 1;
@@ -4487,6 +6960,7 @@ void FTectonicPlanet::QueryOwnership(
 	OutOverlapCount = 0;
 	int32 RecoveryContainmentCount = 0;
 	int32 RecoveryContinentalCount = 0;
+	int32 PreserveOwnershipPreviousOwnerHysteresisApplications = 0;
 	TArray<double> RecoveredDistances;
 	RecoveredDistances.Reserve(Samples.Num());
 	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
@@ -4495,6 +6969,8 @@ void FTectonicPlanet::QueryOwnership(
 		OutOverlapCount += OutOverlapFlags[SampleIndex] != 0 ? 1 : 0;
 		RecoveryContainmentCount += RecoveryFlags[SampleIndex] != 0 ? 1 : 0;
 		RecoveryContinentalCount += RecoveryContinentalFlags[SampleIndex] != 0 ? 1 : 0;
+		PreserveOwnershipPreviousOwnerHysteresisApplications +=
+			PreserveOwnershipPreviousOwnerHysteresisFlags[SampleIndex] != 0 ? 1 : 0;
 		if (RecoveryFlags[SampleIndex] != 0 && RecoveryDistances[SampleIndex] >= 0.0)
 		{
 			RecoveredDistances.Add(RecoveryDistances[SampleIndex]);
@@ -4507,6 +6983,8 @@ void FTectonicPlanet::QueryOwnership(
 	const int32 PreserveOwnershipSamePlateHits = PreserveOwnershipSamePlateHitCount.Load();
 	const int32 PreserveOwnershipSamePlateRecoveries = PreserveOwnershipSamePlateRecoveryCount.Load();
 	const int32 PreserveOwnershipFallbackQueries = PreserveOwnershipFallbackQueryCount.Load();
+	const int32 PreserveOwnershipStronglyContinentalBoundarySaves =
+		PreserveOwnershipPreviousOwnerHysteresisApplications;
 	check(ExactSingleHitCount >= 0);
 	check(ExactSingleHitCount + OutOverlapCount + RecoveryContainmentCount + OutGapCount == Samples.Num());
 	if (bUseStableOverlaps)
@@ -4546,6 +7024,10 @@ void FTectonicPlanet::QueryOwnership(
 		OutStats->PreserveOwnershipSamePlateHitCount = PreserveOwnershipSamePlateHits;
 		OutStats->PreserveOwnershipSamePlateRecoveryCount = PreserveOwnershipSamePlateRecoveries;
 		OutStats->PreserveOwnershipFallbackQueryCount = PreserveOwnershipFallbackQueries;
+		OutStats->PreserveOwnershipPreviousOwnerHysteresisApplicationCount =
+			PreserveOwnershipPreviousOwnerHysteresisApplications;
+		OutStats->PreserveOwnershipStronglyContinentalBoundarySavedCount =
+			PreserveOwnershipStronglyContinentalBoundarySaves;
 	}
 }
 
@@ -4624,17 +7106,746 @@ void FTectonicPlanet::InterpolateFromCarried(
 	}
 }
 
+void FTectonicPlanet::ApplyPreserveOwnershipContinentalWeightRetention(
+	const TArray<uint8>& PreserveOwnershipCWRetainFlags,
+	const TArray<float>& PreviousContinentalWeights,
+	const EResampleOwnershipMode OwnershipMode,
+	const EResampleTriggerReason TriggerReason,
+	FResamplingStats* InOutStats)
+{
+	if (OwnershipMode != EResampleOwnershipMode::PreserveOwnership ||
+		TriggerReason == EResampleTriggerReason::CollisionFollowup ||
+		TriggerReason == EResampleTriggerReason::RiftFollowup)
+	{
+		return;
+	}
+
+	check(PreserveOwnershipCWRetainFlags.Num() == Samples.Num());
+	check(PreviousContinentalWeights.Num() == Samples.Num());
+
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		if (PreserveOwnershipCWRetainFlags[SampleIndex] == 0)
+		{
+			continue;
+		}
+
+		const float PreviousContinentalWeight = FMath::Clamp(PreviousContinentalWeights[SampleIndex], 0.0f, 1.0f);
+		const float InterpolatedContinentalWeight = Samples[SampleIndex].ContinentalWeight;
+		if (InOutStats != nullptr)
+		{
+			++InOutStats->PreserveOwnershipCWRetainedCount;
+			InOutStats->PreserveOwnershipCWThresholdCrossingPreventedCount +=
+				(PreviousContinentalWeight >= 0.5f && InterpolatedContinentalWeight < 0.5f) ? 1 : 0;
+		}
+
+		Samples[SampleIndex].ContinentalWeight = PreviousContinentalWeight;
+	}
+}
+
+void FTectonicPlanet::ApplyPreserveOwnershipFallbackSamePlateRetention(
+	const TArray<int32>& NewPlateIds,
+	const TArray<int32>& PreviousPlateAssignments,
+	const TArray<float>& PreviousContinentalWeights,
+	const TArray<uint8>& PreserveOwnershipFallbackQueryFlags,
+	const TArray<EGapResolutionPath>& GapResolutionPaths,
+	const EResampleOwnershipMode OwnershipMode,
+	const EResampleTriggerReason TriggerReason,
+	FResamplingStats* InOutStats)
+{
+	if (OwnershipMode != EResampleOwnershipMode::PreserveOwnership ||
+		TriggerReason == EResampleTriggerReason::CollisionFollowup ||
+		TriggerReason == EResampleTriggerReason::RiftFollowup)
+	{
+		return;
+	}
+
+	check(NewPlateIds.Num() == Samples.Num());
+	check(PreviousPlateAssignments.Num() == Samples.Num());
+	check(PreviousContinentalWeights.Num() == Samples.Num());
+	check(PreserveOwnershipFallbackQueryFlags.Num() == Samples.Num());
+	check(GapResolutionPaths.Num() == Samples.Num());
+
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		if (PreserveOwnershipFallbackQueryFlags[SampleIndex] == 0)
+		{
+			continue;
+		}
+
+		const int32 PreviousPlateId = PreviousPlateAssignments[SampleIndex];
+		const int32 FinalPlateId = NewPlateIds[SampleIndex];
+		const EGapResolutionPath GapResolutionPath = GapResolutionPaths[SampleIndex];
+		const bool bSamePlate = FinalPlateId == PreviousPlateId;
+		const bool bGapResolved = GapResolutionPath != EGapResolutionPath::None;
+		const bool bDivergentOceanized =
+			GapResolutionPath == EGapResolutionPath::DivergentOceanized;
+
+		if (InOutStats != nullptr)
+		{
+			InOutStats->PreserveOwnershipFallbackSamePlateRecontainedCount +=
+				(bSamePlate && GapResolutionPath == EGapResolutionPath::None) ? 1 : 0;
+			InOutStats->PreserveOwnershipFallbackChangedOwnerCount +=
+				bSamePlate ? 0 : 1;
+			InOutStats->PreserveOwnershipFallbackGapCount += bGapResolved ? 1 : 0;
+			InOutStats->PreserveOwnershipFallbackDivergentOceanizationCount +=
+				bDivergentOceanized ? 1 : 0;
+		}
+
+		const bool bEligibleSamePlateRetention =
+			bSamePlate &&
+			GapResolutionPath != EGapResolutionPath::NonDivergentFallbackOceanized &&
+			GapResolutionPath != EGapResolutionPath::DivergentOceanized;
+		if (!bEligibleSamePlateRetention)
+		{
+			continue;
+		}
+
+		const float PreviousContinentalWeight =
+			FMath::Clamp(PreviousContinentalWeights[SampleIndex], 0.0f, 1.0f);
+		const float InterpolatedContinentalWeight = Samples[SampleIndex].ContinentalWeight;
+		Samples[SampleIndex].ContinentalWeight = PreviousContinentalWeight;
+
+		if (InOutStats != nullptr)
+		{
+			++InOutStats->PreserveOwnershipFallbackSamePlateRetainedCount;
+			++InOutStats->PreserveOwnershipCWRetainedCount;
+			InOutStats->PreserveOwnershipCWThresholdCrossingPreventedCount +=
+				(PreviousContinentalWeight >= 0.5f && InterpolatedContinentalWeight < 0.5f) ? 1 : 0;
+		}
+	}
+
+	if (InOutStats == nullptr)
+	{
+		return;
+	}
+
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		if (PreserveOwnershipFallbackQueryFlags[SampleIndex] == 0)
+		{
+			continue;
+		}
+
+		const float PreviousContinentalWeight =
+			FMath::Clamp(PreviousContinentalWeights[SampleIndex], 0.0f, 1.0f);
+		const bool bContinentalLossAfterFallback =
+			PreviousContinentalWeight >= 0.5f &&
+			Samples[SampleIndex].ContinentalWeight < 0.5f;
+		InOutStats->PreserveOwnershipContinentalLossCountAfterFallback +=
+			bContinentalLossAfterFallback ? 1 : 0;
+	}
+}
+
+void FTectonicPlanet::ApplyFullResolutionSamePlateContinentalWeightRetention(
+	const TArray<int32>& NewPlateIds,
+	const TArray<int32>& PreviousPlateAssignments,
+	const TArray<float>& PreviousContinentalWeights,
+	const TArray<EGapResolutionPath>& GapResolutionPaths,
+	const EResampleOwnershipMode OwnershipMode,
+	const EResampleTriggerReason TriggerReason,
+	FResamplingStats* InOutStats)
+{
+	if (OwnershipMode != EResampleOwnershipMode::FullResolution)
+	{
+		return;
+	}
+
+	check(NewPlateIds.Num() == Samples.Num());
+	check(PreviousPlateAssignments.Num() == Samples.Num());
+	check(PreviousContinentalWeights.Num() == Samples.Num());
+	check(GapResolutionPaths.Num() == Samples.Num());
+
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		if (GapResolutionPaths[SampleIndex] != EGapResolutionPath::None)
+		{
+			continue;
+		}
+
+		if (NewPlateIds[SampleIndex] != PreviousPlateAssignments[SampleIndex])
+		{
+			continue;
+		}
+
+		const float PreviousContinentalWeight =
+			FMath::Clamp(PreviousContinentalWeights[SampleIndex], 0.0f, 1.0f);
+		if (PreviousContinentalWeight < 0.5f)
+		{
+			continue;
+		}
+
+		const float InterpolatedContinentalWeight = Samples[SampleIndex].ContinentalWeight;
+		if (InterpolatedContinentalWeight >= 0.5f)
+		{
+			continue;
+		}
+
+		if (InOutStats != nullptr)
+		{
+			++InOutStats->FullResolutionSamePlateCWRetainedCount;
+			++InOutStats->FullResolutionSamePlateCWThresholdCrossingPreventedCount;
+			switch (TriggerReason)
+			{
+			case EResampleTriggerReason::CollisionFollowup:
+				++InOutStats->FullResolutionCollisionFollowupSamePlateCWRetainedCount;
+				break;
+			case EResampleTriggerReason::RiftFollowup:
+				++InOutStats->FullResolutionRiftFollowupSamePlateCWRetainedCount;
+				break;
+			default:
+				++InOutStats->FullResolutionOtherTriggerSamePlateCWRetainedCount;
+				break;
+			}
+		}
+
+		Samples[SampleIndex].ContinentalWeight = PreviousContinentalWeight;
+	}
+}
+
+void FTectonicPlanet::ApplyRiftFollowupLocalizationOverride(
+	TArray<int32>& InOutNewPlateIds,
+	const TArray<int32>& PreviousPlateAssignments,
+	const TArray<float>& PreviousContinentalWeights,
+	TArray<uint8>* InOutGapFlags,
+	TArray<uint8>* InOutOverlapFlags,
+	TArray<TArray<int32>>* InOutOverlapPlateIds,
+	TArray<float>* InOutSubductionDistances,
+	TArray<float>* InOutSubductionSpeeds,
+	TArray<EGapResolutionPath>* InOutGapResolutionPaths,
+	TArray<uint8>* OutLocalizedRestoreFlags,
+	FResamplingStats* InOutStats)
+{
+	if (!PendingRiftEvent.bValid)
+	{
+		return;
+	}
+
+	check(InOutNewPlateIds.Num() == Samples.Num());
+	check(PreviousPlateAssignments.Num() == Samples.Num());
+	check(PreviousContinentalWeights.Num() == Samples.Num());
+	check(InOutGapFlags == nullptr || InOutGapFlags->Num() == Samples.Num());
+	check(InOutOverlapFlags == nullptr || InOutOverlapFlags->Num() == Samples.Num());
+	check(InOutOverlapPlateIds == nullptr || InOutOverlapPlateIds->Num() == Samples.Num());
+	check(InOutSubductionDistances == nullptr || InOutSubductionDistances->Num() == Samples.Num());
+	check(InOutSubductionSpeeds == nullptr || InOutSubductionSpeeds->Num() == Samples.Num());
+	check(InOutGapResolutionPaths == nullptr || InOutGapResolutionPaths->Num() == Samples.Num());
+	if (OutLocalizedRestoreFlags != nullptr)
+	{
+		OutLocalizedRestoreFlags->Init(0, Samples.Num());
+	}
+
+	TSet<int32> ChildPlateIdSet;
+	for (const int32 ChildPlateId : PendingRiftEvent.ChildPlateIds)
+	{
+		if (ChildPlateId != INDEX_NONE)
+		{
+			ChildPlateIdSet.Add(ChildPlateId);
+		}
+	}
+
+	TMap<int32, int32> RestoredCountByPreviousPlateId;
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		const int32 PreviousPlateId = PreviousPlateAssignments[SampleIndex];
+		if (ChildPlateIdSet.Contains(PreviousPlateId))
+		{
+			continue;
+		}
+
+		const bool bGapSample =
+			InOutGapFlags != nullptr &&
+			InOutGapFlags->IsValidIndex(SampleIndex) &&
+			(*InOutGapFlags)[SampleIndex] != 0;
+		const bool bOverlapSample =
+			InOutOverlapFlags != nullptr &&
+			InOutOverlapFlags->IsValidIndex(SampleIndex) &&
+			(*InOutOverlapFlags)[SampleIndex] != 0;
+		const bool bHasOverlapPlateIds =
+			InOutOverlapPlateIds != nullptr &&
+			InOutOverlapPlateIds->IsValidIndex(SampleIndex) &&
+			!(*InOutOverlapPlateIds)[SampleIndex].IsEmpty();
+		const bool bNeedsRestore =
+			InOutNewPlateIds[SampleIndex] != PreviousPlateId ||
+			bGapSample ||
+			bOverlapSample ||
+			bHasOverlapPlateIds;
+		if (!bNeedsRestore)
+		{
+			continue;
+		}
+
+		InOutNewPlateIds[SampleIndex] = PreviousPlateId;
+		if (InOutGapFlags != nullptr && InOutGapFlags->IsValidIndex(SampleIndex))
+		{
+			(*InOutGapFlags)[SampleIndex] = 0;
+		}
+		if (InOutOverlapFlags != nullptr && InOutOverlapFlags->IsValidIndex(SampleIndex))
+		{
+			(*InOutOverlapFlags)[SampleIndex] = 0;
+		}
+		if (InOutOverlapPlateIds != nullptr && InOutOverlapPlateIds->IsValidIndex(SampleIndex))
+		{
+			(*InOutOverlapPlateIds)[SampleIndex].Reset();
+		}
+		float RestoredSubductionDistanceKm = Samples[SampleIndex].SubductionDistanceKm;
+		float RestoredSubductionSpeed = 0.0f;
+		if (const FCarriedSample* PreviousCarriedSample =
+				FindCarriedSampleForCanonicalVertex(*this, PreviousPlateId, SampleIndex))
+		{
+			RestoredSubductionDistanceKm = PreviousCarriedSample->SubductionDistanceKm;
+			RestoredSubductionSpeed = PreviousCarriedSample->SubductionSpeed;
+		}
+		if (InOutSubductionDistances != nullptr && InOutSubductionDistances->IsValidIndex(SampleIndex))
+		{
+			(*InOutSubductionDistances)[SampleIndex] = RestoredSubductionDistanceKm;
+		}
+		if (InOutSubductionSpeeds != nullptr && InOutSubductionSpeeds->IsValidIndex(SampleIndex))
+		{
+			(*InOutSubductionSpeeds)[SampleIndex] = RestoredSubductionSpeed;
+		}
+			if (InOutGapResolutionPaths != nullptr && InOutGapResolutionPaths->IsValidIndex(SampleIndex))
+			{
+				(*InOutGapResolutionPaths)[SampleIndex] = EGapResolutionPath::None;
+			}
+			const float PreviousContinentalWeight =
+				FMath::Clamp(PreviousContinentalWeights[SampleIndex], 0.0f, 1.0f);
+			const float InterpolatedContinentalWeight = Samples[SampleIndex].ContinentalWeight;
+			Samples[SampleIndex].ContinentalWeight = PreviousContinentalWeight;
+			if (OutLocalizedRestoreFlags != nullptr && OutLocalizedRestoreFlags->IsValidIndex(SampleIndex))
+			{
+				(*OutLocalizedRestoreFlags)[SampleIndex] = 1;
+			}
+			if (InOutStats != nullptr)
+			{
+				++InOutStats->RiftLocalizedNonChildSampleRestoreCount;
+				InOutStats->RiftLocalizedGapSampleRestoreCount += bGapSample ? 1 : 0;
+				InOutStats->RiftLocalizedCWRestoredCount +=
+					!FMath::IsNearlyEqual(
+						InterpolatedContinentalWeight,
+						PreviousContinentalWeight,
+						1.0e-6f)
+						? 1
+						: 0;
+				const bool bInterpolatedContinental = InterpolatedContinentalWeight >= 0.5f;
+				const bool bFinalRestoredContinental = PreviousContinentalWeight >= 0.5f;
+				InOutStats->RiftLocalizedCWPhantomPreventedCount +=
+					(!bFinalRestoredContinental && bInterpolatedContinental) ? 1 : 0;
+				InOutStats->RiftLocalizedCWContinentalPreventedCount +=
+					(!bFinalRestoredContinental && bInterpolatedContinental) ? 1 : 0;
+			}
+			++RestoredCountByPreviousPlateId.FindOrAdd(PreviousPlateId);
+		}
+
+	if (InOutStats != nullptr)
+	{
+		InOutStats->RiftLocalizedRestoredPreviousPlateIds.Reset();
+		InOutStats->RiftLocalizedRestoredPreviousPlateCounts.Reset();
+		TArray<int32> SortedPreviousPlateIds;
+		RestoredCountByPreviousPlateId.GenerateKeyArray(SortedPreviousPlateIds);
+		SortedPreviousPlateIds.Sort();
+		for (const int32 PreviousPlateId : SortedPreviousPlateIds)
+		{
+			InOutStats->RiftLocalizedRestoredPreviousPlateIds.Add(PreviousPlateId);
+			InOutStats->RiftLocalizedRestoredPreviousPlateCounts.Add(
+				RestoredCountByPreviousPlateId.FindRef(PreviousPlateId));
+		}
+	}
+}
+
+void FTectonicPlanet::ApplyRiftFollowupFinalOwnerContinentalWeightReconciliation(
+	const TArray<int32>& InterpolationPlateIds,
+	const TArray<int32>& FinalPlateIds,
+	const TArray<int32>& PreviousPlateAssignments,
+	const TArray<float>& PreviousContinentalWeights,
+	const TArray<uint8>& LocalizedRestoreFlags,
+	FResamplingStats* InOutStats)
+{
+	if (!PendingRiftEvent.bValid)
+	{
+		return;
+	}
+
+	check(InterpolationPlateIds.Num() == Samples.Num());
+	check(FinalPlateIds.Num() == Samples.Num());
+	check(PreviousPlateAssignments.Num() == Samples.Num());
+	check(PreviousContinentalWeights.Num() == Samples.Num());
+	check(LocalizedRestoreFlags.Num() == Samples.Num());
+
+	TSet<int32> ChildPlateIdSet;
+	for (const int32 ChildPlateId : PendingRiftEvent.ChildPlateIds)
+	{
+		if (ChildPlateId != INDEX_NONE)
+		{
+			ChildPlateIdSet.Add(ChildPlateId);
+		}
+	}
+
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		const float PreviousContinentalWeight =
+			FMath::Clamp(PreviousContinentalWeights[SampleIndex], 0.0f, 1.0f);
+		const float PreReconciliationContinentalWeight = Samples[SampleIndex].ContinentalWeight;
+		const int32 InterpolationPlateId = InterpolationPlateIds[SampleIndex];
+		const int32 FinalPlateId = FinalPlateIds[SampleIndex];
+			const bool bInterpolatedGain =
+				PreviousContinentalWeight < 0.5f &&
+				PreReconciliationContinentalWeight >= 0.5f;
+			const bool bOwnerMismatch = InterpolationPlateId != FinalPlateId;
+			const bool bOwnerMismatchGain = bOwnerMismatch && bInterpolatedGain;
+			const bool bSameOwnerChildInterpolationGain =
+				!bOwnerMismatch &&
+				ChildPlateIdSet.Contains(FinalPlateId) &&
+				bInterpolatedGain;
+
+			if (InOutStats != nullptr)
+			{
+				InOutStats->RiftFinalOwnerMismatchGainCountBeforeReconciliation +=
+					bOwnerMismatchGain ? 1 : 0;
+				InOutStats->RiftSameOwnerChildInterpolationGainCountBeforeReconciliation +=
+					bSameOwnerChildInterpolationGain ? 1 : 0;
+			}
+
+		if (LocalizedRestoreFlags[SampleIndex] != 0)
+		{
+			continue;
+		}
+
+			if (!bOwnerMismatchGain && !bSameOwnerChildInterpolationGain)
+			{
+				continue;
+			}
+
+		float ReconciledContinentalWeight = PreReconciliationContinentalWeight;
+		bool bResolved = false;
+		if (FinalPlateId == PreviousPlateAssignments[SampleIndex])
+		{
+			ReconciledContinentalWeight = PreviousContinentalWeight;
+			bResolved = true;
+		}
+		else if (TryComputeAuthoritativeContinentalWeightForPlate(
+					*this,
+					SampleIndex,
+					FinalPlateId,
+					ReconciledContinentalWeight))
+		{
+			bResolved = true;
+		}
+
+		if (!bResolved)
+		{
+			continue;
+		}
+
+		if (InOutStats != nullptr)
+		{
+			InOutStats->RiftFinalOwnerCWReconciledCount +=
+				!FMath::IsNearlyEqual(
+					PreReconciliationContinentalWeight,
+					ReconciledContinentalWeight,
+					1.0e-6f)
+					? 1
+					: 0;
+				InOutStats->RiftFinalOwnerMismatchContinentalPreventedCount +=
+					(bOwnerMismatchGain && ReconciledContinentalWeight < 0.5f)
+						? 1
+						: 0;
+			}
+
+		Samples[SampleIndex].ContinentalWeight =
+			FMath::Clamp(ReconciledContinentalWeight, 0.0f, 1.0f);
+	}
+
+	if (InOutStats == nullptr)
+	{
+		return;
+	}
+
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		const float PreviousContinentalWeight =
+			FMath::Clamp(PreviousContinentalWeights[SampleIndex], 0.0f, 1.0f);
+		const bool bFinalGain =
+			PreviousContinentalWeight < 0.5f &&
+			Samples[SampleIndex].ContinentalWeight >= 0.5f;
+		if (!bFinalGain)
+		{
+			continue;
+		}
+
+		const int32 InterpolationPlateId = InterpolationPlateIds[SampleIndex];
+		const int32 FinalPlateId = FinalPlateIds[SampleIndex];
+		InOutStats->RiftFinalOwnerMismatchGainCountAfterReconciliation +=
+			(InterpolationPlateId != FinalPlateId) ? 1 : 0;
+		InOutStats->RiftSameOwnerChildInterpolationGainCountAfterReconciliation +=
+			(InterpolationPlateId == FinalPlateId &&
+				ChildPlateIdSet.Contains(FinalPlateId))
+				? 1
+				: 0;
+		InOutStats->RiftFinalGainStartedBelow025Count += PreviousContinentalWeight < 0.25f ? 1 : 0;
+		InOutStats->RiftFinalGainStartedBelow040Count += PreviousContinentalWeight < 0.40f ? 1 : 0;
+		InOutStats->RiftFinalGainStartedBelow050Count += PreviousContinentalWeight < 0.50f ? 1 : 0;
+	}
+}
+
+void FTectonicPlanet::ApplyRiftChildCoherenceProtection(
+	TArray<int32>& InOutNewPlateIds,
+	const TArray<int32>& PreviousPlateAssignments,
+	TArray<uint8>* InOutGapFlags,
+	TArray<uint8>* InOutOverlapFlags,
+	TArray<TArray<int32>>* InOutOverlapPlateIds,
+	TArray<EGapResolutionPath>* InOutGapResolutionPaths,
+	FResamplingStats* InOutStats) const
+{
+	if (!PendingRiftEvent.bValid)
+	{
+		return;
+	}
+
+	check(InOutNewPlateIds.Num() == Samples.Num());
+	check(PreviousPlateAssignments.Num() == Samples.Num());
+	check(InOutGapFlags == nullptr || InOutGapFlags->Num() == Samples.Num());
+	check(InOutOverlapFlags == nullptr || InOutOverlapFlags->Num() == Samples.Num());
+	check(InOutOverlapPlateIds == nullptr || InOutOverlapPlateIds->Num() == Samples.Num());
+	check(InOutGapResolutionPaths == nullptr || InOutGapResolutionPaths->Num() == Samples.Num());
+
+	if (InOutStats != nullptr)
+	{
+		InOutStats->RiftChildAnchorSampleIndices.Reset();
+		InOutStats->RiftChildComponentCountsBeforeSuppression.Reset();
+		InOutStats->RiftChildComponentCountsAfterSuppression.Reset();
+		InOutStats->RiftChildStrayFragmentDetectedCount = 0;
+		InOutStats->RiftChildStrayFragmentReassignedCount = 0;
+		InOutStats->RiftLargestStrayChildFragmentSize = 0;
+		InOutStats->RiftStrayChildFragmentReassignedToSiblingCount = 0;
+		InOutStats->RiftStrayChildFragmentReassignedToOtherNeighborCount = 0;
+		InOutStats->RiftStrayFragmentReassignedByAdjacentSiblingCount = 0;
+		InOutStats->RiftStrayFragmentReassignedByZeroAdjacencySiblingFallbackCount = 0;
+		InOutStats->RiftStrayFragmentForcedNonChildAssignmentCount = 0;
+		InOutStats->RiftStrayFragmentZeroSiblingAdjacencyCount = 0;
+		InOutStats->RiftStrayFragmentPositiveSiblingAdjacencyCount = 0;
+		InOutStats->RiftStrayFragmentRecipientCandidateConsideredCount = 0;
+		InOutStats->RiftStrayFragmentRecipientIncoherenceRejectedCount = 0;
+		InOutStats->RiftStrayFragmentIncoherentForcedAssignmentCount = 0;
+		InOutStats->RiftLargestFragmentCausingRecipientGrowthSize = 0;
+		InOutStats->RiftStrayFragmentRecipientPlateIds.Reset();
+		InOutStats->RiftStrayFragmentRecipientTypeCodes.Reset();
+		InOutStats->RiftStrayFragmentSiblingEdgeCounts.Reset();
+		InOutStats->RiftStrayFragmentSizes.Reset();
+		InOutStats->RiftStrayFragmentRecipientComponentsBefore.Reset();
+		InOutStats->RiftStrayFragmentRecipientComponentsAfter.Reset();
+	}
+
+	for (int32 ChildIndex = 0; ChildIndex < PendingRiftEvent.ChildPlateIds.Num(); ++ChildIndex)
+	{
+		const int32 ChildPlateId = PendingRiftEvent.ChildPlateIds[ChildIndex];
+		if (ChildPlateId == INDEX_NONE)
+		{
+			if (InOutStats != nullptr)
+			{
+				InOutStats->RiftChildAnchorSampleIndices.Add(INDEX_NONE);
+				InOutStats->RiftChildComponentCountsBeforeSuppression.Add(0);
+				InOutStats->RiftChildComponentCountsAfterSuppression.Add(0);
+			}
+			continue;
+		}
+
+		int32 AnchorSampleIndex =
+			PendingRiftEvent.ChildAnchorSampleIndices.IsValidIndex(ChildIndex)
+				? PendingRiftEvent.ChildAnchorSampleIndices[ChildIndex]
+				: INDEX_NONE;
+		if (!Samples.IsValidIndex(AnchorSampleIndex))
+		{
+			AnchorSampleIndex = INDEX_NONE;
+			for (int32 SampleIndex = 0; SampleIndex < PreviousPlateAssignments.Num(); ++SampleIndex)
+			{
+				if (PreviousPlateAssignments[SampleIndex] == ChildPlateId)
+				{
+					AnchorSampleIndex = SampleIndex;
+					break;
+				}
+			}
+		}
+
+		if (Samples.IsValidIndex(AnchorSampleIndex))
+		{
+			InOutNewPlateIds[AnchorSampleIndex] = ChildPlateId;
+			if (InOutGapFlags != nullptr && InOutGapFlags->IsValidIndex(AnchorSampleIndex))
+			{
+				(*InOutGapFlags)[AnchorSampleIndex] = 0;
+			}
+			if (InOutOverlapFlags != nullptr && InOutOverlapFlags->IsValidIndex(AnchorSampleIndex))
+			{
+				(*InOutOverlapFlags)[AnchorSampleIndex] = 0;
+			}
+			if (InOutOverlapPlateIds != nullptr && InOutOverlapPlateIds->IsValidIndex(AnchorSampleIndex))
+			{
+				(*InOutOverlapPlateIds)[AnchorSampleIndex].Reset();
+			}
+			if (InOutGapResolutionPaths != nullptr && InOutGapResolutionPaths->IsValidIndex(AnchorSampleIndex))
+			{
+				(*InOutGapResolutionPaths)[AnchorSampleIndex] = EGapResolutionPath::None;
+			}
+		}
+
+		TArray<FRiftPlateAssignmentComponent> ChildComponents;
+		CollectPlateAssignmentComponents(*this, InOutNewPlateIds, ChildPlateId, ChildComponents);
+		if (InOutStats != nullptr)
+		{
+			InOutStats->RiftChildAnchorSampleIndices.Add(AnchorSampleIndex);
+			InOutStats->RiftChildComponentCountsBeforeSuppression.Add(ChildComponents.Num());
+		}
+
+		int32 AnchorComponentIndex = INDEX_NONE;
+		for (int32 ComponentIndex = 0; ComponentIndex < ChildComponents.Num(); ++ComponentIndex)
+		{
+			if (ChildComponents[ComponentIndex].SampleIndices.Contains(AnchorSampleIndex))
+			{
+				AnchorComponentIndex = ComponentIndex;
+				break;
+			}
+		}
+		if (AnchorComponentIndex == INDEX_NONE && !ChildComponents.IsEmpty())
+		{
+			AnchorComponentIndex = 0;
+		}
+
+		for (int32 ComponentIndex = 0; ComponentIndex < ChildComponents.Num(); ++ComponentIndex)
+		{
+			if (ComponentIndex == AnchorComponentIndex)
+			{
+				continue;
+			}
+
+			const FRiftPlateAssignmentComponent& Component = ChildComponents[ComponentIndex];
+			if (InOutStats != nullptr)
+			{
+				++InOutStats->RiftChildStrayFragmentDetectedCount;
+				InOutStats->RiftLargestStrayChildFragmentSize = FMath::Max(
+					InOutStats->RiftLargestStrayChildFragmentSize,
+					Component.SampleIndices.Num());
+			}
+
+			const FRiftFragmentDestinationSelectionResult DestinationSelection =
+				SelectRecipientAwareRiftFragmentDestination(
+					*this,
+					InOutNewPlateIds,
+					ChildPlateId,
+					Component);
+			const int32 DestinationPlateId = DestinationSelection.DestinationPlateId;
+			if (DestinationPlateId == INDEX_NONE)
+			{
+				continue;
+			}
+
+			const int32 RecipientComponentsBefore =
+				CountPlateAssignmentComponents(*this, InOutNewPlateIds, DestinationPlateId);
+
+			for (const int32 SampleIndex : Component.SampleIndices)
+			{
+				if (!InOutNewPlateIds.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				InOutNewPlateIds[SampleIndex] = DestinationPlateId;
+				if (InOutGapFlags != nullptr && InOutGapFlags->IsValidIndex(SampleIndex))
+				{
+					(*InOutGapFlags)[SampleIndex] = 0;
+				}
+				if (InOutOverlapFlags != nullptr && InOutOverlapFlags->IsValidIndex(SampleIndex))
+				{
+					(*InOutOverlapFlags)[SampleIndex] = 0;
+				}
+				if (InOutOverlapPlateIds != nullptr && InOutOverlapPlateIds->IsValidIndex(SampleIndex))
+				{
+					(*InOutOverlapPlateIds)[SampleIndex].Reset();
+				}
+				if (InOutGapResolutionPaths != nullptr && InOutGapResolutionPaths->IsValidIndex(SampleIndex))
+				{
+					(*InOutGapResolutionPaths)[SampleIndex] = EGapResolutionPath::None;
+				}
+			}
+
+			const int32 RecipientComponentsAfter =
+				CountPlateAssignmentComponents(*this, InOutNewPlateIds, DestinationPlateId);
+
+			if (InOutStats != nullptr)
+			{
+				++InOutStats->RiftChildStrayFragmentReassignedCount;
+				if (DestinationSelection.bHadPositiveSiblingAdjacency)
+				{
+					++InOutStats->RiftStrayFragmentPositiveSiblingAdjacencyCount;
+				}
+				else
+				{
+					++InOutStats->RiftStrayFragmentZeroSiblingAdjacencyCount;
+				}
+				if (DestinationSelection.bUsedSiblingChild &&
+					!DestinationSelection.bUsedZeroAdjacencySiblingFallback)
+				{
+					++InOutStats->RiftStrayFragmentReassignedByAdjacentSiblingCount;
+				}
+				if (DestinationSelection.bUsedZeroAdjacencySiblingFallback)
+				{
+					++InOutStats->RiftStrayFragmentReassignedByZeroAdjacencySiblingFallbackCount;
+				}
+				if (DestinationSelection.bUsedNonChildFallback)
+				{
+					++InOutStats->RiftStrayFragmentForcedNonChildAssignmentCount;
+				}
+				InOutStats->RiftStrayFragmentRecipientPlateIds.Add(DestinationPlateId);
+				InOutStats->RiftStrayFragmentRecipientTypeCodes.Add(
+					DestinationSelection.bUsedSiblingChild
+						? static_cast<int32>(ERiftRecipientTypeCode::SiblingChild)
+						: static_cast<int32>(ERiftRecipientTypeCode::OtherNeighbor));
+				InOutStats->RiftStrayFragmentSiblingEdgeCounts.Add(
+					DestinationSelection.BestSiblingEdgeCount);
+				InOutStats->RiftStrayFragmentSizes.Add(Component.SampleIndices.Num());
+				InOutStats->RiftStrayFragmentRecipientComponentsBefore.Add(RecipientComponentsBefore);
+				InOutStats->RiftStrayFragmentRecipientComponentsAfter.Add(RecipientComponentsAfter);
+				if (RecipientComponentsAfter > RecipientComponentsBefore)
+				{
+					InOutStats->RiftLargestFragmentCausingRecipientGrowthSize = FMath::Max(
+						InOutStats->RiftLargestFragmentCausingRecipientGrowthSize,
+						Component.SampleIndices.Num());
+				}
+				if (DestinationSelection.bUsedSiblingChild)
+				{
+					++InOutStats->RiftStrayChildFragmentReassignedToSiblingCount;
+				}
+				if (DestinationSelection.bUsedNonChildFallback)
+				{
+					++InOutStats->RiftStrayChildFragmentReassignedToOtherNeighborCount;
+				}
+			}
+		}
+
+		if (InOutStats != nullptr)
+		{
+			InOutStats->RiftChildComponentCountsAfterSuppression.Add(
+				CountPlateAssignmentComponents(*this, InOutNewPlateIds, ChildPlateId));
+		}
+	}
+}
+
 void FTectonicPlanet::ResolveGaps(
 	TArray<int32>& NewPlateIds,
 	const TArray<uint8>& GapFlags,
 	TArray<float>& InOutSubductionDistances,
 	TArray<float>& InOutSubductionSpeeds,
-	FResamplingStats* InOutStats)
+	FResamplingStats* InOutStats,
+	TArray<EGapResolutionPath>* OutGapResolutionPaths)
 {
 	check(NewPlateIds.Num() == Samples.Num());
 	check(GapFlags.Num() == Samples.Num());
 	check(InOutSubductionDistances.Num() == Samples.Num());
 	check(InOutSubductionSpeeds.Num() == Samples.Num());
+
+	if (OutGapResolutionPaths != nullptr)
+	{
+		OutGapResolutionPaths->Init(EGapResolutionPath::None, Samples.Num());
+	}
 
 	if (InOutStats != nullptr)
 	{
@@ -4642,6 +7853,12 @@ void FTectonicPlanet::ResolveGaps(
 		InOutStats->NonDivergentGapCount = 0;
 		InOutStats->DivergentContinentalGapCount = 0;
 		InOutStats->NonDivergentContinentalGapCount = 0;
+		InOutStats->FormerContinentalDivergentGapCount = 0;
+		InOutStats->FormerContinentalNonDivergentGapCount = 0;
+		InOutStats->FormerContinentalNonDivergentGapProjectionResolvedCount = 0;
+		InOutStats->FormerContinentalNonDivergentGapNearestCopyResolvedCount = 0;
+		InOutStats->FormerContinentalNonDivergentFallbackOceanizedCount = 0;
+		InOutStats->FormerContinentalDivergentOceanizedCount = 0;
 		InOutStats->NonDivergentGapTriangleProjectionCount = 0;
 		InOutStats->NonDivergentGapNearestCopyCount = 0;
 	}
@@ -4867,6 +8084,18 @@ void FTectonicPlanet::ResolveGaps(
 		}
 
 		const FGapResolutionDecision& Decision = GapDecisions[SampleIndex];
+		if (InOutStats != nullptr && Decision.bWasContinental)
+		{
+			if (Decision.Disposition == EGapDisposition::NonDivergent)
+			{
+				++InOutStats->FormerContinentalNonDivergentGapCount;
+			}
+			else if (Decision.Disposition == EGapDisposition::Divergent)
+			{
+				++InOutStats->FormerContinentalDivergentGapCount;
+			}
+		}
+
 		if (Decision.Disposition == EGapDisposition::NonDivergent)
 		{
 			bool bResolved = false;
@@ -4882,11 +8111,16 @@ void FTectonicPlanet::ResolveGaps(
 				{
 					NewPlateIds[SampleIndex] = CandidatePlateId;
 					bResolved = true;
+					if (OutGapResolutionPaths != nullptr)
+					{
+						(*OutGapResolutionPaths)[SampleIndex] = EGapResolutionPath::NonDivergentProjection;
+					}
 					if (InOutStats != nullptr)
 					{
 						++InOutStats->NonDivergentGapCount;
 						InOutStats->NonDivergentContinentalGapCount += Decision.bWasContinental ? 1 : 0;
 						++InOutStats->NonDivergentGapTriangleProjectionCount;
+						InOutStats->FormerContinentalNonDivergentGapProjectionResolvedCount += Decision.bWasContinental ? 1 : 0;
 					}
 					break;
 				}
@@ -4895,11 +8129,16 @@ void FTectonicPlanet::ResolveGaps(
 				{
 					NewPlateIds[SampleIndex] = CandidatePlateId;
 					bResolved = true;
+					if (OutGapResolutionPaths != nullptr)
+					{
+						(*OutGapResolutionPaths)[SampleIndex] = EGapResolutionPath::NonDivergentNearestCopy;
+					}
 					if (InOutStats != nullptr)
 					{
 						++InOutStats->NonDivergentGapCount;
 						InOutStats->NonDivergentContinentalGapCount += Decision.bWasContinental ? 1 : 0;
 						++InOutStats->NonDivergentGapNearestCopyCount;
+						InOutStats->FormerContinentalNonDivergentGapNearestCopyResolvedCount += Decision.bWasContinental ? 1 : 0;
 					}
 					break;
 				}
@@ -4911,6 +8150,18 @@ void FTectonicPlanet::ResolveGaps(
 			}
 
 			++NonDivergentFallbackOceanizedCount;
+			if (OutGapResolutionPaths != nullptr)
+			{
+				(*OutGapResolutionPaths)[SampleIndex] = EGapResolutionPath::NonDivergentFallbackOceanized;
+			}
+			if (InOutStats != nullptr && Decision.bWasContinental)
+			{
+				++InOutStats->FormerContinentalNonDivergentFallbackOceanizedCount;
+			}
+		}
+		else if (OutGapResolutionPaths != nullptr)
+		{
+			(*OutGapResolutionPaths)[SampleIndex] = EGapResolutionPath::DivergentOceanized;
 		}
 
 		ApplyDivergentGap(SampleIndex);
@@ -4918,6 +8169,8 @@ void FTectonicPlanet::ResolveGaps(
 		{
 			++InOutStats->DivergentGapCount;
 			InOutStats->DivergentContinentalGapCount += Decision.bWasContinental ? 1 : 0;
+			InOutStats->FormerContinentalDivergentOceanizedCount +=
+				(Decision.bWasContinental && Decision.Disposition == EGapDisposition::Divergent) ? 1 : 0;
 		}
 	}
 
@@ -5210,6 +8463,7 @@ void FTectonicPlanet::RepartitionMembership(
 	}
 
 	RebuildMembershipFromCanonical(*this);
+	PruneEmptyPlates(*this);
 	RecomputeBoundaryFlags(*this);
 	ClassifyPlateTriangles(*this);
 	RecomputePlateBoundingCaps(*this);
@@ -5304,6 +8558,749 @@ void FTectonicPlanet::CollectCollisionCandidates(
 	}
 }
 
+bool FTectonicPlanet::DetectGeometricCollisionOverlapDiagnostics(
+	const TArray<int32>& OwningPlateIds,
+	FResamplingStats* InOutStats,
+	FPendingGeometricCollisionEvent* OutPendingEvent)
+{
+	if (OutPendingEvent != nullptr)
+	{
+		*OutPendingEvent = FPendingGeometricCollisionEvent{};
+	}
+	if (InOutStats != nullptr)
+	{
+		InOutStats->GeometricCollisionCandidateCount = 0;
+		InOutStats->GeometricCollisionQualifiedCount = 0;
+		InOutStats->GeometricCollisionQualifiedButDonorAmbiguousCount = 0;
+		InOutStats->GeometricCollisionQualifiedButDonorSeedEmptyCount = 0;
+		InOutStats->GeometricCollisionQualifiedUsingDirectionalDonorCount = 0;
+		InOutStats->GeometricCollisionQualifiedUsingFallbackDonorRuleCount = 0;
+		InOutStats->GeometricCollisionRejectedByMassFilterCount = 0;
+		InOutStats->GeometricCollisionRejectedByOverlapDepthCount = 0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationCount = 0;
+		InOutStats->GeometricCollisionRejectedByOverlapDepthTotalOverlapSampleCount = 0;
+		InOutStats->GeometricCollisionRejectedByOverlapDepthMaxOverlapSampleCount = 0;
+		InOutStats->GeometricCollisionRejectedByOverlapDepthTotalTerraneEstimate = 0;
+		InOutStats->GeometricCollisionRejectedByOverlapDepthMaxTerraneEstimate = 0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalOverlapSampleCount = 0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxOverlapSampleCount = 0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalTerraneEstimate = 0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxTerraneEstimate = 0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalObservationCount = 0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxObservationCount = 0;
+		InOutStats->GeometricCollisionRejectedByOverlapDepthTotalMeanConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionRejectedByOverlapDepthMaxConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalMeanConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalAccumulatedPenetrationKm = 0.0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxAccumulatedPenetrationKm = 0.0;
+		InOutStats->GeometricCollisionRejectedByEmptyTerraneCount = 0;
+		InOutStats->GeometricCollisionRejectedByRoleResolutionCount = 0;
+		InOutStats->GeometricCollisionRejectedBySeedDirectionCount = 0;
+		InOutStats->GeometricCollisionQualifiedDirectionalCount = 0;
+		InOutStats->GeometricCollisionDirectionalSeedCount = 0;
+		InOutStats->GeometricCollisionDirectionalSeedCountOpposite = 0;
+		InOutStats->GeometricCollisionSeedDirectionAuditCount = 0;
+		InOutStats->GeometricCollisionSeedDirectionMismatchCount = 0;
+		InOutStats->GeometricCollisionOnlyOverridingBucketPopulatedCount = 0;
+		InOutStats->GeometricCollisionOnlySubductingBucketPopulatedCount = 0;
+		InOutStats->GeometricCollisionBothDirectionalBucketsPopulatedCount = 0;
+		InOutStats->GeometricCollisionNeitherDirectionalBucketPopulatedCount = 0;
+		InOutStats->GeometricCollisionPolarityChosenFromDirectionalEvidenceCount = 0;
+		InOutStats->GeometricCollisionPolarityChosenFromBidirectionalTieBreakCount = 0;
+		InOutStats->GeometricCollisionFallbackUsedCount = 0;
+		InOutStats->GeometricCollisionOverlapSampleCount = 0;
+		InOutStats->GeometricCollisionPairCount = 0;
+		InOutStats->GeometricCollisionQualifiedPairCount = 0;
+		InOutStats->GeometricCollisionLargestTerraneEstimate = 0;
+		InOutStats->GeometricCollisionBestPlateA = INDEX_NONE;
+		InOutStats->GeometricCollisionBestPlateB = INDEX_NONE;
+		InOutStats->GeometricCollisionBestOverlapSampleCount = 0;
+		InOutStats->GeometricCollisionBestTerraneEstimate = 0;
+		InOutStats->GeometricCollisionBestSubductingOverlapSampleCount = 0;
+		InOutStats->GeometricCollisionBestOpposingSupportCount = 0;
+		InOutStats->GeometricCollisionExecutedTerraneEstimate = 0;
+		InOutStats->GeometricCollisionExecutedMeanConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionExecutedMaxConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionExecutedAccumulatedPenetrationKm = 0.0;
+		InOutStats->GeometricCollisionRejectedByOverlapDepthTotalDepthKm = 0.0;
+		InOutStats->GeometricCollisionRejectedByOverlapDepthMaxDepthKm = 0.0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalDepthKm = 0.0;
+		InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxDepthKm = 0.0;
+		InOutStats->GeometricCollisionExecutedObservationCount = 0;
+		InOutStats->GeometricCollisionRepeatedCandidatePlateA = INDEX_NONE;
+		InOutStats->GeometricCollisionRepeatedCandidatePlateB = INDEX_NONE;
+		InOutStats->GeometricCollisionRepeatedCandidateObservationCount = 0;
+		InOutStats->GeometricCollisionRepeatedCandidateOverlapSampleCount = 0;
+		InOutStats->GeometricCollisionRepeatedCandidateTerraneEstimate = 0;
+		InOutStats->GeometricCollisionRepeatedCandidateAccumulatedPenetrationKm = 0.0;
+		InOutStats->GeometricCollisionRepeatedCandidateEffectiveConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionRepeatedCandidateMeanConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionRepeatedCandidateMaxConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionRepeatedCandidateMeanOverlapDepthKm = 0.0;
+		InOutStats->GeometricCollisionRepeatedCandidateMaxOverlapDepthKm = 0.0;
+		InOutStats->GeometricCollisionPersistentPenetrationThresholdKm =
+			GeometricCollisionMinPersistentPenetrationKm;
+		InOutStats->bGeometricCollisionBestPassedMassFilter = false;
+	}
+
+	if (!bEnableContinentalCollision ||
+		OwningPlateIds.Num() != Samples.Num() ||
+		Plates.IsEmpty())
+	{
+		return false;
+	}
+
+	TMap<uint64, FGeometricCollisionPairDiagnostics> PairDiagnosticsByKey;
+	int32 TotalOverlapHits = 0;
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		if (!Samples.IsValidIndex(SampleIndex) || Samples[SampleIndex].ContinentalWeight < 0.5f)
+		{
+			continue;
+		}
+
+		const int32 OwningPlateId = OwningPlateIds[SampleIndex];
+		if (OwningPlateId == INDEX_NONE || FindPlateById(*this, OwningPlateId) == nullptr)
+		{
+			continue;
+		}
+
+		const FVector3d QueryPoint = Samples[SampleIndex].Position.GetSafeNormal();
+		for (const FPlate& CandidatePlate : Plates)
+		{
+			if (CandidatePlate.Id == OwningPlateId ||
+				!TryFindMeaningfulContainmentHitInPlate(*this, CandidatePlate, QueryPoint))
+			{
+				continue;
+			}
+
+			++TotalOverlapHits;
+
+			const int32 PlateA = FMath::Min(OwningPlateId, CandidatePlate.Id);
+			const int32 PlateB = FMath::Max(OwningPlateId, CandidatePlate.Id);
+			const uint64 PairKey = MakeBoundaryContactPlatePairKey(PlateA, PlateB);
+			FGeometricCollisionPairDiagnostics& PairDiagnostics =
+				PairDiagnosticsByKey.FindOrAdd(PairKey);
+			PairDiagnostics.PlateA = PlateA;
+			PairDiagnostics.PlateB = PlateB;
+			++PairDiagnostics.TotalOverlapSampleCount;
+			PairDiagnostics.MinSampleIndex =
+				PairDiagnostics.MinSampleIndex == INDEX_NONE
+					? SampleIndex
+					: FMath::Min(PairDiagnostics.MinSampleIndex, SampleIndex);
+
+			const double ConvergenceMagnitudeKmPerMy =
+				ComputeGeometricOverlapConvergenceMagnitudeKmPerMy(
+					*this,
+					OwningPlateId,
+					CandidatePlate.Id,
+					QueryPoint);
+			PairDiagnostics.TotalConvergenceMagnitudeKmPerMy += ConvergenceMagnitudeKmPerMy;
+			PairDiagnostics.MaxConvergenceMagnitudeKmPerMy = FMath::Max(
+				PairDiagnostics.MaxConvergenceMagnitudeKmPerMy,
+				ConvergenceMagnitudeKmPerMy);
+
+			if (OwningPlateId == PlateA)
+			{
+				PairDiagnostics.SamplesFromAInsideB.AddUnique(SampleIndex);
+				PairDiagnostics.TotalConvergenceMagnitudeAInsideBKmPerMy += ConvergenceMagnitudeKmPerMy;
+			}
+			else
+			{
+				PairDiagnostics.SamplesFromBInsideA.AddUnique(SampleIndex);
+				PairDiagnostics.TotalConvergenceMagnitudeBInsideAKmPerMy += ConvergenceMagnitudeKmPerMy;
+			}
+		}
+	}
+
+	if (InOutStats != nullptr)
+	{
+		InOutStats->GeometricCollisionCandidateCount = PairDiagnosticsByKey.Num();
+		InOutStats->GeometricCollisionOverlapSampleCount = TotalOverlapHits;
+		InOutStats->GeometricCollisionPairCount = PairDiagnosticsByKey.Num();
+	}
+
+	if (PairDiagnosticsByKey.IsEmpty())
+	{
+		GeometricCollisionPairRecurrenceByKey.Reset();
+		return false;
+	}
+
+	bool bHasBestPair = false;
+	FGeometricCollisionPairDiagnostics BestPair;
+	bool bHasBestExecutablePair = false;
+	FGeometricCollisionPairDiagnostics BestExecutablePair;
+	bool bHasBestRepeatedPair = false;
+	FGeometricCollisionPairDiagnostics BestRepeatedPair;
+	FGeometricCollisionPairRecurrenceState BestRepeatedPairState;
+	TSet<uint64> ObservedPersistentPenetrationPairKeys;
+	for (TPair<uint64, FGeometricCollisionPairDiagnostics>& PairEntry : PairDiagnosticsByKey)
+	{
+		FGeometricCollisionPairDiagnostics& PairDiagnostics = PairEntry.Value;
+		const bool bLegacyPlateAOverriding = IsOverridingPlate(*this, PairDiagnostics.PlateA, PairDiagnostics.PlateB);
+		const int32 LegacyOverridingPlateId = bLegacyPlateAOverriding ? PairDiagnostics.PlateA : PairDiagnostics.PlateB;
+		const int32 LegacySubductingPlateId = bLegacyPlateAOverriding ? PairDiagnostics.PlateB : PairDiagnostics.PlateA;
+		const TArray<int32>* LegacySubductingOverlapSeeds = nullptr;
+		const TArray<int32>* LegacyOppositeDirectionalSeeds = nullptr;
+		verify(AssignGeometricCollisionDirectionalBucketsForRoles(
+			PairDiagnostics.PlateA,
+			PairDiagnostics.PlateB,
+			PairDiagnostics.SamplesFromAInsideB,
+			PairDiagnostics.SamplesFromBInsideA,
+			LegacyOverridingPlateId,
+			LegacySubductingPlateId,
+			LegacySubductingOverlapSeeds,
+			LegacyOppositeDirectionalSeeds));
+
+		const int32 LegacySubductingSeedCount = LegacySubductingOverlapSeeds != nullptr ? LegacySubductingOverlapSeeds->Num() : 0;
+		const int32 OppositeDirectionalSeedCount = LegacyOppositeDirectionalSeeds != nullptr ? LegacyOppositeDirectionalSeeds->Num() : 0;
+		const EGeometricDirectionalBucketPopulation BucketPopulation =
+			ClassifyGeometricDirectionalBucketPopulation(
+				LegacySubductingSeedCount,
+				OppositeDirectionalSeedCount);
+		if (InOutStats != nullptr)
+		{
+			++InOutStats->GeometricCollisionSeedDirectionAuditCount;
+			switch (BucketPopulation)
+			{
+			case EGeometricDirectionalBucketPopulation::OnlyOverriding:
+				++InOutStats->GeometricCollisionOnlyOverridingBucketPopulatedCount;
+				++InOutStats->GeometricCollisionSeedDirectionMismatchCount;
+				break;
+			case EGeometricDirectionalBucketPopulation::OnlySubducting:
+				++InOutStats->GeometricCollisionOnlySubductingBucketPopulatedCount;
+				break;
+			case EGeometricDirectionalBucketPopulation::Both:
+				++InOutStats->GeometricCollisionBothDirectionalBucketsPopulatedCount;
+				break;
+			case EGeometricDirectionalBucketPopulation::Neither:
+			default:
+				++InOutStats->GeometricCollisionNeitherDirectionalBucketPopulatedCount;
+				break;
+			}
+		}
+		if (LegacySubductingSeedCount <= 0 && OppositeDirectionalSeedCount > 0)
+		{
+			const FPlate* OverridingPlate = FindPlateById(*this, LegacyOverridingPlateId);
+			const FPlate* SubductingPlate = FindPlateById(*this, LegacySubductingPlateId);
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[GeometricCollisionSeedDirectionAudit Step=%d] plate_pair=(%d,%d) overriding_plate=%d subducting_plate=%d a_inside_b=%d b_inside_a=%d chosen_subducting_bucket_count=%d opposite_overriding_bucket_count=%d populated_bucket=%s overriding_overlap_score=%d subducting_overlap_score=%d total_convergence_km_per_my=%.6f max_convergence_km_per_my=%.6f"),
+				CurrentStep,
+				PairDiagnostics.PlateA,
+				PairDiagnostics.PlateB,
+				LegacyOverridingPlateId,
+				LegacySubductingPlateId,
+				PairDiagnostics.SamplesFromAInsideB.Num(),
+				PairDiagnostics.SamplesFromBInsideA.Num(),
+				LegacySubductingSeedCount,
+				OppositeDirectionalSeedCount,
+				GetGeometricDirectionalBucketPopulationName(BucketPopulation),
+				OverridingPlate != nullptr ? OverridingPlate->OverlapScore : 0,
+				SubductingPlate != nullptr ? SubductingPlate->OverlapScore : 0,
+				PairDiagnostics.TotalConvergenceMagnitudeKmPerMy,
+				PairDiagnostics.MaxConvergenceMagnitudeKmPerMy);
+		}
+
+		TSet<int32> OpposingSupportSamples;
+		const auto AccumulateOpposingSupport = [this, &OwningPlateIds, &OpposingSupportSamples](
+			const TArray<int32>& OverlapSeeds,
+			const int32 ReceiverPlateId)
+		{
+			for (const int32 SeedSampleIndex : OverlapSeeds)
+			{
+				if (!SampleAdjacency.IsValidIndex(SeedSampleIndex))
+				{
+					continue;
+				}
+
+				for (const int32 NeighborSampleIndex : SampleAdjacency[SeedSampleIndex])
+				{
+					if (!Samples.IsValidIndex(NeighborSampleIndex) ||
+						Samples[NeighborSampleIndex].ContinentalWeight < 0.5f ||
+						!OwningPlateIds.IsValidIndex(NeighborSampleIndex))
+					{
+						continue;
+					}
+
+					if (OwningPlateIds[NeighborSampleIndex] == ReceiverPlateId)
+					{
+						OpposingSupportSamples.Add(NeighborSampleIndex);
+					}
+				}
+			}
+		};
+		AccumulateOpposingSupport(PairDiagnostics.SamplesFromAInsideB, PairDiagnostics.PlateB);
+		AccumulateOpposingSupport(PairDiagnostics.SamplesFromBInsideA, PairDiagnostics.PlateA);
+
+		PairDiagnostics.OpposingContinentalSupportCount = OpposingSupportSamples.Num();
+		PairDiagnostics.bPassedMassFilter =
+			PairDiagnostics.TotalOverlapSampleCount >= MinGeometricCollisionOverlapContinentalSamples &&
+			PairDiagnostics.OpposingContinentalSupportCount >= MinGeometricCollisionOpposingContinentalSupport;
+		if (!PairDiagnostics.bPassedMassFilter && PairDiagnostics.TotalOverlapSampleCount > 0 && InOutStats != nullptr)
+		{
+			++InOutStats->GeometricCollisionRejectedByMassFilterCount;
+		}
+
+		if (PairDiagnostics.bPassedMassFilter)
+		{
+			if (InOutStats != nullptr)
+			{
+				++InOutStats->GeometricCollisionQualifiedCount;
+				++InOutStats->GeometricCollisionQualifiedPairCount;
+			}
+
+			int32 ReceiverPlateId = INDEX_NONE;
+			int32 DonorPlateId = INDEX_NONE;
+			const TArray<int32>* DonorDirectionalSeeds = nullptr;
+			const TArray<int32>* OppositeDirectionalSeeds = nullptr;
+			EGeometricCollisionDonorSelectionRule DonorRule = EGeometricCollisionDonorSelectionRule::None;
+			if (!ResolveGeometricCollisionDonorReceiver(
+					*this,
+					PairDiagnostics,
+					ReceiverPlateId,
+					DonorPlateId,
+					DonorDirectionalSeeds,
+					OppositeDirectionalSeeds,
+					DonorRule))
+			{
+				if (InOutStats != nullptr)
+				{
+					++InOutStats->GeometricCollisionQualifiedButDonorAmbiguousCount;
+				}
+			}
+			else
+			{
+				PairDiagnostics.SubductingOverlapSampleCount = DonorDirectionalSeeds != nullptr ? DonorDirectionalSeeds->Num() : 0;
+				if (InOutStats != nullptr)
+				{
+					if (IsDirectionalGeometricCollisionDonorSelectionRule(DonorRule))
+					{
+						++InOutStats->GeometricCollisionQualifiedUsingDirectionalDonorCount;
+						++InOutStats->GeometricCollisionQualifiedDirectionalCount;
+						++InOutStats->GeometricCollisionPolarityChosenFromDirectionalEvidenceCount;
+					}
+					else
+					{
+						++InOutStats->GeometricCollisionQualifiedUsingFallbackDonorRuleCount;
+						++InOutStats->GeometricCollisionPolarityChosenFromBidirectionalTieBreakCount;
+					}
+				}
+
+				if (DonorDirectionalSeeds == nullptr || DonorDirectionalSeeds->IsEmpty())
+				{
+					if (InOutStats != nullptr)
+					{
+						++InOutStats->GeometricCollisionQualifiedButDonorSeedEmptyCount;
+					}
+				}
+				else
+				{
+					PairDiagnostics.TerraneEstimate = EstimateGeometricCollisionTerraneSize(
+						*this,
+						OwningPlateIds,
+						DonorPlateId,
+						*DonorDirectionalSeeds);
+					if (InOutStats != nullptr)
+					{
+						InOutStats->GeometricCollisionLargestTerraneEstimate = FMath::Max(
+							InOutStats->GeometricCollisionLargestTerraneEstimate,
+							PairDiagnostics.TerraneEstimate);
+						if (PairDiagnostics.TerraneEstimate <= 0)
+						{
+							++InOutStats->GeometricCollisionRejectedByEmptyTerraneCount;
+						}
+					}
+
+					ComputeDirectionalOverlapDepthStatsKm(
+						*this,
+						OwningPlateIds,
+						ReceiverPlateId,
+						*DonorDirectionalSeeds,
+						PairDiagnostics.MeanOverlapDepthKm,
+						PairDiagnostics.MaxOverlapDepthKm);
+
+					const double EffectiveConvergenceMagnitudeKmPerMy =
+						GetGeometricCollisionDirectionalMeanConvergenceMagnitudeKmPerMy(
+							PairDiagnostics,
+							DonorPlateId);
+					FGeometricCollisionPairRecurrenceState& RecurrenceState =
+						GeometricCollisionPairRecurrenceByKey.FindOrAdd(PairEntry.Key);
+					const bool bRolesChanged =
+						RecurrenceState.LastReceiverPlateId != INDEX_NONE &&
+						(RecurrenceState.LastReceiverPlateId != ReceiverPlateId ||
+							RecurrenceState.LastDonorPlateId != DonorPlateId);
+					const bool bSameObservation =
+						RecurrenceState.LastObservedStep == CurrentStep;
+					if (EffectiveConvergenceMagnitudeKmPerMy <= UE_DOUBLE_SMALL_NUMBER)
+					{
+						RecurrenceState = FGeometricCollisionPairRecurrenceState{};
+					}
+					else
+					{
+						if (bRolesChanged)
+						{
+							RecurrenceState = FGeometricCollisionPairRecurrenceState{};
+						}
+						if (!bSameObservation)
+						{
+							if (RecurrenceState.LastObservedStep != INDEX_NONE &&
+								CurrentStep > RecurrenceState.LastObservedStep)
+							{
+								const double ElapsedTimeMy =
+									static_cast<double>(CurrentStep - RecurrenceState.LastObservedStep) * DeltaTimeMyears;
+								RecurrenceState.AccumulatedPenetrationKm +=
+									EffectiveConvergenceMagnitudeKmPerMy * ElapsedTimeMy;
+							}
+							++RecurrenceState.ObservationCount;
+						}
+						else if (RecurrenceState.ObservationCount <= 0)
+						{
+							RecurrenceState.ObservationCount = 1;
+						}
+
+						RecurrenceState.LastObservedStep = CurrentStep;
+						RecurrenceState.LastReceiverPlateId = ReceiverPlateId;
+						RecurrenceState.LastDonorPlateId = DonorPlateId;
+						RecurrenceState.LastOverlapSampleCount = PairDiagnostics.TotalOverlapSampleCount;
+						RecurrenceState.LastTerraneEstimate = PairDiagnostics.TerraneEstimate;
+						RecurrenceState.LastEffectiveConvergenceKmPerMy = EffectiveConvergenceMagnitudeKmPerMy;
+						RecurrenceState.LastMeanConvergenceMagnitudeKmPerMy = EffectiveConvergenceMagnitudeKmPerMy;
+						RecurrenceState.LastMaxConvergenceMagnitudeKmPerMy =
+							PairDiagnostics.MaxConvergenceMagnitudeKmPerMy;
+						RecurrenceState.LastMeanOverlapDepthKm = PairDiagnostics.MeanOverlapDepthKm;
+						RecurrenceState.LastMaxOverlapDepthKm = PairDiagnostics.MaxOverlapDepthKm;
+						ObservedPersistentPenetrationPairKeys.Add(PairEntry.Key);
+					}
+
+					if (RecurrenceState.ObservationCount > 1 &&
+						(!bHasBestRepeatedPair ||
+							IsRepeatedGeometricCollisionCandidateStronger(
+								RecurrenceState,
+								BestRepeatedPairState,
+								PairDiagnostics,
+								BestRepeatedPair)))
+					{
+						BestRepeatedPair = PairDiagnostics;
+						BestRepeatedPairState = RecurrenceState;
+						bHasBestRepeatedPair = true;
+					}
+
+					const uint64 PairKey = MakeBoundaryContactPlatePairKey(
+						PairDiagnostics.PlateA,
+						PairDiagnostics.PlateB);
+					if (const int32* LastExecutionOrdinal = CollisionLastExecutionOrdinalByPair.Find(PairKey))
+					{
+						if (InOutStats != nullptr)
+						{
+							++InOutStats->CollisionRepeatedPairCount;
+							if ((ResamplingExecutionOrdinal - *LastExecutionOrdinal) <= CollisionPairCooldownResamples)
+							{
+								++InOutStats->CollisionRepeatedPairWithinCooldownCount;
+							}
+						}
+					}
+
+					const bool bBelowLegacyDepthThreshold =
+						PairDiagnostics.MaxOverlapDepthKm < GeometricCollisionMinOverlapDepthKm;
+					if (bBelowLegacyDepthThreshold)
+					{
+						if (InOutStats != nullptr)
+						{
+							++InOutStats->GeometricCollisionRejectedByOverlapDepthCount;
+							InOutStats->GeometricCollisionRejectedByOverlapDepthTotalOverlapSampleCount +=
+								PairDiagnostics.TotalOverlapSampleCount;
+							InOutStats->GeometricCollisionRejectedByOverlapDepthMaxOverlapSampleCount =
+								FMath::Max(
+									InOutStats->GeometricCollisionRejectedByOverlapDepthMaxOverlapSampleCount,
+									PairDiagnostics.TotalOverlapSampleCount);
+							InOutStats->GeometricCollisionRejectedByOverlapDepthTotalTerraneEstimate +=
+								PairDiagnostics.TerraneEstimate;
+							InOutStats->GeometricCollisionRejectedByOverlapDepthMaxTerraneEstimate =
+								FMath::Max(
+									InOutStats->GeometricCollisionRejectedByOverlapDepthMaxTerraneEstimate,
+									PairDiagnostics.TerraneEstimate);
+							InOutStats->GeometricCollisionRejectedByOverlapDepthTotalMeanConvergenceKmPerMy +=
+								EffectiveConvergenceMagnitudeKmPerMy;
+							InOutStats->GeometricCollisionRejectedByOverlapDepthMaxConvergenceKmPerMy =
+								FMath::Max(
+									InOutStats->GeometricCollisionRejectedByOverlapDepthMaxConvergenceKmPerMy,
+									PairDiagnostics.MaxConvergenceMagnitudeKmPerMy);
+							InOutStats->GeometricCollisionRejectedByOverlapDepthTotalDepthKm +=
+								PairDiagnostics.MaxOverlapDepthKm;
+							InOutStats->GeometricCollisionRejectedByOverlapDepthMaxDepthKm =
+								FMath::Max(
+									InOutStats->GeometricCollisionRejectedByOverlapDepthMaxDepthKm,
+									PairDiagnostics.MaxOverlapDepthKm);
+						}
+						UE_LOG(
+							LogTemp,
+							Log,
+							TEXT("[GeometricCollisionLegacyDepthGate Step=%d] plate_pair=(%d,%d) overlap_samples=%d terrane_estimate=%d mean_depth_km=%.3f max_depth_km=%.3f effective_convergence_km_per_my=%.6f max_convergence_km_per_my=%.6f observation_count=%d accumulated_penetration_km=%.3f"),
+							CurrentStep,
+							PairDiagnostics.PlateA,
+							PairDiagnostics.PlateB,
+							PairDiagnostics.TotalOverlapSampleCount,
+							PairDiagnostics.TerraneEstimate,
+							PairDiagnostics.MeanOverlapDepthKm,
+							PairDiagnostics.MaxOverlapDepthKm,
+							EffectiveConvergenceMagnitudeKmPerMy,
+							PairDiagnostics.MaxConvergenceMagnitudeKmPerMy,
+							RecurrenceState.ObservationCount,
+							RecurrenceState.AccumulatedPenetrationKm);
+					}
+
+					const bool bPassedPersistentPenetrationGate =
+						RecurrenceState.AccumulatedPenetrationKm >= GeometricCollisionMinPersistentPenetrationKm;
+					if (!bPassedPersistentPenetrationGate)
+					{
+						if (InOutStats != nullptr)
+						{
+							++InOutStats->GeometricCollisionRejectedByPersistentPenetrationCount;
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalOverlapSampleCount +=
+								PairDiagnostics.TotalOverlapSampleCount;
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxOverlapSampleCount =
+								FMath::Max(
+									InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxOverlapSampleCount,
+									PairDiagnostics.TotalOverlapSampleCount);
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalTerraneEstimate +=
+								PairDiagnostics.TerraneEstimate;
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxTerraneEstimate =
+								FMath::Max(
+									InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxTerraneEstimate,
+									PairDiagnostics.TerraneEstimate);
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalObservationCount +=
+								RecurrenceState.ObservationCount;
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxObservationCount =
+								FMath::Max(
+									InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxObservationCount,
+									RecurrenceState.ObservationCount);
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalMeanConvergenceKmPerMy +=
+								EffectiveConvergenceMagnitudeKmPerMy;
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxConvergenceKmPerMy =
+								FMath::Max(
+									InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxConvergenceKmPerMy,
+									PairDiagnostics.MaxConvergenceMagnitudeKmPerMy);
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalAccumulatedPenetrationKm +=
+								RecurrenceState.AccumulatedPenetrationKm;
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxAccumulatedPenetrationKm =
+								FMath::Max(
+									InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxAccumulatedPenetrationKm,
+									RecurrenceState.AccumulatedPenetrationKm);
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationTotalDepthKm +=
+								PairDiagnostics.MaxOverlapDepthKm;
+							InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxDepthKm =
+								FMath::Max(
+									InOutStats->GeometricCollisionRejectedByPersistentPenetrationMaxDepthKm,
+									PairDiagnostics.MaxOverlapDepthKm);
+						}
+						UE_LOG(
+							LogTemp,
+							Log,
+							TEXT("[GeometricCollisionPenetrationGate Step=%d] plate_pair=(%d,%d) overlap_samples=%d terrane_estimate=%d mean_depth_km=%.3f max_depth_km=%.3f effective_convergence_km_per_my=%.6f max_convergence_km_per_my=%.6f observation_count=%d accumulated_penetration_km=%.3f threshold_km=%.3f"),
+							CurrentStep,
+							PairDiagnostics.PlateA,
+							PairDiagnostics.PlateB,
+							PairDiagnostics.TotalOverlapSampleCount,
+							PairDiagnostics.TerraneEstimate,
+							PairDiagnostics.MeanOverlapDepthKm,
+							PairDiagnostics.MaxOverlapDepthKm,
+							EffectiveConvergenceMagnitudeKmPerMy,
+							PairDiagnostics.MaxConvergenceMagnitudeKmPerMy,
+							RecurrenceState.ObservationCount,
+							RecurrenceState.AccumulatedPenetrationKm,
+							GeometricCollisionMinPersistentPenetrationKm);
+					}
+					else
+					{
+						const int32* LastExecutionOrdinal = CollisionLastExecutionOrdinalByPair.Find(PairKey);
+						const bool bWithinCooldown =
+							LastExecutionOrdinal != nullptr &&
+							(ResamplingExecutionOrdinal - *LastExecutionOrdinal) <= CollisionPairCooldownResamples;
+						if (!bWithinCooldown &&
+							PairDiagnostics.TerraneEstimate > 0 &&
+							(!bHasBestExecutablePair ||
+								IsGeometricCollisionPairStronger(PairDiagnostics, BestExecutablePair)))
+						{
+							BestExecutablePair = PairDiagnostics;
+							bHasBestExecutablePair = true;
+						}
+					}
+				}
+			}
+		}
+
+		if (!bHasBestPair || IsGeometricCollisionPairStronger(PairDiagnostics, BestPair))
+		{
+			BestPair = PairDiagnostics;
+			bHasBestPair = true;
+		}
+	}
+
+	for (auto RecurrenceIt = GeometricCollisionPairRecurrenceByKey.CreateIterator(); RecurrenceIt; ++RecurrenceIt)
+	{
+		if (!ObservedPersistentPenetrationPairKeys.Contains(RecurrenceIt.Key()))
+		{
+			RecurrenceIt.RemoveCurrent();
+		}
+	}
+
+	if (InOutStats != nullptr && bHasBestPair)
+	{
+		int32 BestReceiverPlateId = INDEX_NONE;
+		int32 BestDonorPlateId = INDEX_NONE;
+		const TArray<int32>* BestDirectionalSeeds = nullptr;
+		const TArray<int32>* BestOppositeDirectionalSeeds = nullptr;
+		EGeometricCollisionDonorSelectionRule BestDonorRule = EGeometricCollisionDonorSelectionRule::None;
+		const bool bResolvedBestDirection = ResolveGeometricCollisionDonorReceiver(
+			*this,
+			BestPair,
+			BestReceiverPlateId,
+			BestDonorPlateId,
+			BestDirectionalSeeds,
+			BestOppositeDirectionalSeeds,
+			BestDonorRule);
+		(void)BestDonorRule;
+		InOutStats->GeometricCollisionBestPlateA = BestPair.PlateA;
+		InOutStats->GeometricCollisionBestPlateB = BestPair.PlateB;
+		InOutStats->GeometricCollisionBestOverlapSampleCount = BestPair.TotalOverlapSampleCount;
+		InOutStats->GeometricCollisionBestTerraneEstimate = BestPair.TerraneEstimate;
+		InOutStats->GeometricCollisionBestSubductingOverlapSampleCount =
+			BestPair.SubductingOverlapSampleCount;
+		InOutStats->GeometricCollisionBestOpposingSupportCount =
+			BestPair.OpposingContinentalSupportCount;
+		InOutStats->bGeometricCollisionBestPassedMassFilter = BestPair.bPassedMassFilter;
+		InOutStats->GeometricCollisionDirectionalSeedCount =
+			(bResolvedBestDirection && BestDirectionalSeeds != nullptr) ? BestDirectionalSeeds->Num() : 0;
+		InOutStats->GeometricCollisionDirectionalSeedCountOpposite =
+			(bResolvedBestDirection && BestOppositeDirectionalSeeds != nullptr) ? BestOppositeDirectionalSeeds->Num() : 0;
+	}
+	if (InOutStats != nullptr && bHasBestRepeatedPair)
+	{
+		InOutStats->GeometricCollisionRepeatedCandidatePlateA = BestRepeatedPair.PlateA;
+		InOutStats->GeometricCollisionRepeatedCandidatePlateB = BestRepeatedPair.PlateB;
+		InOutStats->GeometricCollisionRepeatedCandidateObservationCount =
+			BestRepeatedPairState.ObservationCount;
+		InOutStats->GeometricCollisionRepeatedCandidateOverlapSampleCount =
+			BestRepeatedPair.TotalOverlapSampleCount;
+		InOutStats->GeometricCollisionRepeatedCandidateTerraneEstimate =
+			BestRepeatedPair.TerraneEstimate;
+		InOutStats->GeometricCollisionRepeatedCandidateAccumulatedPenetrationKm =
+			BestRepeatedPairState.AccumulatedPenetrationKm;
+		InOutStats->GeometricCollisionRepeatedCandidateEffectiveConvergenceKmPerMy =
+			BestRepeatedPairState.LastEffectiveConvergenceKmPerMy;
+		InOutStats->GeometricCollisionRepeatedCandidateMeanConvergenceKmPerMy =
+			BestRepeatedPairState.LastMeanConvergenceMagnitudeKmPerMy;
+		InOutStats->GeometricCollisionRepeatedCandidateMaxConvergenceKmPerMy =
+			BestRepeatedPairState.LastMaxConvergenceMagnitudeKmPerMy;
+		InOutStats->GeometricCollisionRepeatedCandidateMeanOverlapDepthKm =
+			BestRepeatedPairState.LastMeanOverlapDepthKm;
+		InOutStats->GeometricCollisionRepeatedCandidateMaxOverlapDepthKm =
+			BestRepeatedPairState.LastMaxOverlapDepthKm;
+	}
+
+	if (OutPendingEvent != nullptr && bHasBestExecutablePair && BestExecutablePair.bPassedMassFilter)
+	{
+		OutPendingEvent->bValid = true;
+		OutPendingEvent->PlateA = BestExecutablePair.PlateA;
+		OutPendingEvent->PlateB = BestExecutablePair.PlateB;
+		OutPendingEvent->SamplesFromAInsideB = BestExecutablePair.SamplesFromAInsideB;
+		OutPendingEvent->SamplesFromBInsideA = BestExecutablePair.SamplesFromBInsideA;
+		OutPendingEvent->OverlapSampleIndices = BestExecutablePair.SamplesFromAInsideB;
+		for (const int32 SampleIndex : BestExecutablePair.SamplesFromBInsideA)
+		{
+			OutPendingEvent->OverlapSampleIndices.AddUnique(SampleIndex);
+		}
+		OutPendingEvent->ContactCenter = ComputeSampleSetCentroidOnUnitSphere(*this, OutPendingEvent->OverlapSampleIndices);
+		OutPendingEvent->OverlapSampleCount = BestExecutablePair.TotalOverlapSampleCount;
+		OutPendingEvent->TerraneEstimate = BestExecutablePair.TerraneEstimate;
+		OutPendingEvent->TotalConvergenceMagnitudeAInsideBKmPerMy = BestExecutablePair.TotalConvergenceMagnitudeAInsideBKmPerMy;
+		OutPendingEvent->TotalConvergenceMagnitudeBInsideAKmPerMy = BestExecutablePair.TotalConvergenceMagnitudeBInsideAKmPerMy;
+		OutPendingEvent->TotalConvergenceMagnitudeKmPerMy = BestExecutablePair.TotalConvergenceMagnitudeKmPerMy;
+		OutPendingEvent->MaxConvergenceMagnitudeKmPerMy = BestExecutablePair.MaxConvergenceMagnitudeKmPerMy;
+		OutPendingEvent->MeanOverlapDepthKm = BestExecutablePair.MeanOverlapDepthKm;
+		OutPendingEvent->MaxOverlapDepthKm = BestExecutablePair.MaxOverlapDepthKm;
+		const FGeometricCollisionPairRecurrenceState* BestExecutableRecurrenceState =
+			GeometricCollisionPairRecurrenceByKey.Find(MakeBoundaryContactPlatePairKey(
+				BestExecutablePair.PlateA,
+				BestExecutablePair.PlateB));
+		if (BestExecutableRecurrenceState != nullptr)
+		{
+			OutPendingEvent->EffectiveConvergenceKmPerMy =
+				BestExecutableRecurrenceState->LastEffectiveConvergenceKmPerMy;
+			OutPendingEvent->AccumulatedPenetrationKm =
+				BestExecutableRecurrenceState->AccumulatedPenetrationKm;
+			OutPendingEvent->ObservationCount =
+				BestExecutableRecurrenceState->ObservationCount;
+		}
+		int32 ReceiverPlateId = INDEX_NONE;
+		int32 DonorPlateId = INDEX_NONE;
+		const TArray<int32>* DonorDirectionalSeeds = nullptr;
+		const TArray<int32>* OppositeDirectionalSeeds = nullptr;
+		EGeometricCollisionDonorSelectionRule DonorRule = EGeometricCollisionDonorSelectionRule::None;
+		if (ResolveGeometricCollisionDonorReceiver(
+				*this,
+				BestExecutablePair,
+				ReceiverPlateId,
+				DonorPlateId,
+				DonorDirectionalSeeds,
+				OppositeDirectionalSeeds,
+				DonorRule))
+		{
+			OutPendingEvent->OverridingPlateId = ReceiverPlateId;
+			OutPendingEvent->SubductingPlateId = DonorPlateId;
+			OutPendingEvent->PolaritySelectionRule = static_cast<uint8>(DonorRule);
+			OutPendingEvent->bPolarityChosenFromDirectionalEvidence =
+				IsDirectionalGeometricCollisionDonorSelectionRule(DonorRule);
+		}
+	}
+
+	if (bHasBestPair)
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[GeometricCollisionOverlap Step=%d] plate_pair=(%d,%d) overlap_samples=%d donor_overlap_samples=%d opposite_directional_samples=%d opposing_support=%d terrane_estimate=%d mean_overlap_depth_km=%.3f max_overlap_depth_km=%.3f passed_mass_filter=%d selected_for_execution=%d"),
+			CurrentStep,
+			BestPair.PlateA,
+			BestPair.PlateB,
+			BestPair.TotalOverlapSampleCount,
+			BestPair.SubductingOverlapSampleCount,
+			BestPair.TotalOverlapSampleCount - BestPair.SubductingOverlapSampleCount,
+			BestPair.OpposingContinentalSupportCount,
+			BestPair.TerraneEstimate,
+			BestPair.MeanOverlapDepthKm,
+			BestPair.MaxOverlapDepthKm,
+			BestPair.bPassedMassFilter ? 1 : 0,
+			(bHasBestExecutablePair &&
+			 BestPair.PlateA == BestExecutablePair.PlateA &&
+			 BestPair.PlateB == BestExecutablePair.PlateB &&
+			 BestPair.MinSampleIndex == BestExecutablePair.MinSampleIndex) ? 1 : 0);
+	}
+	if (bHasBestRepeatedPair)
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[GeometricCollisionTemporalAudit Step=%d] plate_pair=(%d,%d) observation_count=%d overlap_samples=%d terrane_estimate=%d mean_depth_km=%.3f max_depth_km=%.3f effective_convergence_km_per_my=%.6f max_convergence_km_per_my=%.6f accumulated_penetration_km=%.3f"),
+			CurrentStep,
+			BestRepeatedPair.PlateA,
+			BestRepeatedPair.PlateB,
+			BestRepeatedPairState.ObservationCount,
+			BestRepeatedPair.TotalOverlapSampleCount,
+			BestRepeatedPair.TerraneEstimate,
+			BestRepeatedPairState.LastMeanOverlapDepthKm,
+			BestRepeatedPairState.LastMaxOverlapDepthKm,
+			BestRepeatedPairState.LastEffectiveConvergenceKmPerMy,
+			BestRepeatedPairState.LastMaxConvergenceMagnitudeKmPerMy,
+			BestRepeatedPairState.AccumulatedPenetrationKm);
+	}
+
+	return true;
+}
+
 bool FTectonicPlanet::DetectBoundaryContactCollisionTrigger(
 	FResamplingStats* InOutStats,
 	FPendingBoundaryContactCollisionEvent* OutPendingEvent) const
@@ -5313,6 +9310,10 @@ bool FTectonicPlanet::DetectBoundaryContactCollisionTrigger(
 		InOutStats->BoundaryContactCollisionCandidateCount = 0;
 		InOutStats->BoundaryContactCollisionPairCount = 0;
 		InOutStats->BoundaryContactLargestZoneSize = 0;
+		InOutStats->BoundaryContactBestPlateA = INDEX_NONE;
+		InOutStats->BoundaryContactBestPlateB = INDEX_NONE;
+		InOutStats->BoundaryContactBestZoneSize = 0;
+		InOutStats->BoundaryContactBestPersistenceCount = 0;
 		InOutStats->BoundaryContactTriggerPlateA = INDEX_NONE;
 		InOutStats->BoundaryContactTriggerPlateB = INDEX_NONE;
 		InOutStats->bBoundaryContactCollisionTriggered = false;
@@ -5515,6 +9516,9 @@ bool FTectonicPlanet::DetectBoundaryContactCollisionTrigger(
 
 	if (InOutStats != nullptr && bHasBestZone)
 	{
+		InOutStats->BoundaryContactBestPlateA = BestZone.PlateA;
+		InOutStats->BoundaryContactBestPlateB = BestZone.PlateB;
+		InOutStats->BoundaryContactBestZoneSize = BestZone.CandidateCount;
 		InOutStats->BoundaryContactLargestZoneSize = BestZone.CandidateCount;
 		InOutStats->BoundaryContactTriggerPlateA = BestZone.PlateA;
 		InOutStats->BoundaryContactTriggerPlateB = BestZone.PlateB;
@@ -5557,6 +9561,7 @@ bool FTectonicPlanet::UpdateBoundaryContactCollisionPersistence(
 	InOutStats.BoundaryContactPersistencePairA = INDEX_NONE;
 	InOutStats.BoundaryContactPersistencePairB = INDEX_NONE;
 	InOutStats.BoundaryContactPersistenceCount = 0;
+	InOutStats.BoundaryContactBestPersistenceCount = 0;
 	InOutStats.bBoundaryContactPersistenceTriggered = false;
 
 	if (ResamplingPolicy != EResamplingPolicy::PreserveOwnershipPeriodic)
@@ -5622,6 +9627,7 @@ bool FTectonicPlanet::UpdateBoundaryContactCollisionPersistence(
 	InOutStats.BoundaryContactPersistencePairA = Persistence.PlateA;
 	InOutStats.BoundaryContactPersistencePairB = Persistence.PlateB;
 	InOutStats.BoundaryContactPersistenceCount = Persistence.ConsecutiveResamples;
+	InOutStats.BoundaryContactBestPersistenceCount = Persistence.ConsecutiveResamples;
 
 	// Persistence lets a thin preserve-mode contact mature into a structural event
 	// without lowering the immediate spatial threshold all the way to noisy singletons.
@@ -5665,7 +9671,7 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 	const TArray<int32>& PreviousTerraneAssignments,
 	TArray<int32>& InOutNewPlateIds,
 	FCollisionEvent& OutEvent,
-	FResamplingStats* InOutStats) const
+	FResamplingStats* InOutStats)
 {
 	OutEvent = FCollisionEvent{};
 	if (InOutStats != nullptr)
@@ -5677,14 +9683,77 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 		InOutStats->CollisionOverridingPlateId = INDEX_NONE;
 		InOutStats->CollisionSubductingPlateId = INDEX_NONE;
 		InOutStats->CollisionSurgeAffectedCount = 0;
+		InOutStats->CollisionCWBoostedCount = 0;
 		InOutStats->CollisionSurgeRadiusRad = 0.0;
 		InOutStats->CollisionSurgeMeanElevationDelta = 0.0;
 		InOutStats->bUsedCachedBoundaryContactCollision = false;
+		InOutStats->bUsedGeometricCollisionExecution = false;
 		InOutStats->CachedBoundaryContactSeedCount = 0;
 		InOutStats->CachedBoundaryContactTerraneSeedCount = 0;
 		InOutStats->CachedBoundaryContactTerraneRecoveredCount = 0;
 		InOutStats->CachedBoundaryContactPlateA = INDEX_NONE;
 		InOutStats->CachedBoundaryContactPlateB = INDEX_NONE;
+		InOutStats->GeometricCollisionExecutedPlateA = INDEX_NONE;
+		InOutStats->GeometricCollisionExecutedPlateB = INDEX_NONE;
+		InOutStats->GeometricCollisionExecutedOverlapSampleCount = 0;
+		InOutStats->GeometricCollisionExecutedTerraneEstimate = 0;
+		InOutStats->GeometricCollisionExecutedTerraneRecoveredCount = 0;
+		InOutStats->GeometricCollisionExecutedCollisionGainCount = 0;
+		InOutStats->GeometricCollisionExecutedCWBoostedCount = 0;
+		InOutStats->GeometricCollisionExecutedSurgeAffectedCount = 0;
+		InOutStats->GeometricCollisionExecutedFromDirectionalPolarityCount = 0;
+		InOutStats->BoundaryContactFallbackCollisionGainCount = 0;
+		InOutStats->BoundaryContactFallbackTerraneRecoveredCount = 0;
+		InOutStats->BoundaryContactFallbackCWBoostedCount = 0;
+		InOutStats->BoundaryContactFallbackSurgeAffectedCount = 0;
+		InOutStats->GeometricCollisionExecutedOverlapDepthKm = 0.0;
+		InOutStats->GeometricCollisionExecutedMaxOverlapDepthKm = 0.0;
+		InOutStats->GeometricCollisionExecutedMeanConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionExecutedMaxConvergenceKmPerMy = 0.0;
+		InOutStats->GeometricCollisionExecutedAccumulatedPenetrationKm = 0.0;
+		InOutStats->GeometricCollisionExecutedDonorTerraneLocalityLimitedCount = 0;
+		InOutStats->GeometricCollisionExecutedObservationCount = 0;
+		InOutStats->CollisionRepeatedPairCount = 0;
+		InOutStats->CollisionRepeatedPairWithinCooldownCount = 0;
+		InOutStats->GeometricCollisionQualifiedDirectionalCount = 0;
+		InOutStats->GeometricCollisionDirectionalSeedCount = 0;
+		InOutStats->GeometricCollisionDirectionalSeedCountOpposite = 0;
+		InOutStats->GeometricCollisionFallbackUsedCount = 0;
+		InOutStats->CollisionProposedGlobalMaxComponentsAfter = 0;
+		InOutStats->CollisionProposedDonorComponentsBefore = 0;
+		InOutStats->CollisionProposedDonorComponentsAfter = 0;
+		InOutStats->CollisionProposedReceiverComponentsBefore = 0;
+		InOutStats->CollisionProposedReceiverComponentsAfter = 0;
+		InOutStats->CollisionProposedDonorLargestRemainingComponentSize = 0;
+		InOutStats->CollisionProposedDonorNewFragmentCount = 0;
+		InOutStats->CollisionProposedDonorSmallestNewFragmentSize = 0;
+		InOutStats->CollisionProposedDonorLargestNewFragmentSize = 0;
+		InOutStats->CollisionProposedDonorMeanNewFragmentSize = 0.0;
+		InOutStats->CollisionProposedReceiverDisconnectedFragmentCount = 0;
+		InOutStats->CollisionProposedReceiverLargestNewDisconnectedFragmentSize = 0;
+		InOutStats->CollisionProposedTerraneSampleCount = 0;
+		InOutStats->CollisionDonorComponentsBefore = 0;
+		InOutStats->CollisionDonorComponentsAfter = 0;
+		InOutStats->CollisionDonorLargestRemainingComponentSize = 0;
+		InOutStats->CollisionDonorNewFragmentCount = 0;
+		InOutStats->CollisionDonorSmallestNewFragmentSize = 0;
+		InOutStats->CollisionDonorLargestNewFragmentSize = 0;
+		InOutStats->CollisionDonorMeanNewFragmentSize = 0.0;
+		InOutStats->CollisionAcceptedTerraneSampleCount = 0;
+		InOutStats->CollisionReceiverComponentsBefore = 0;
+		InOutStats->CollisionReceiverComponentsAfter = 0;
+		InOutStats->CollisionReceiverDisconnectedFragmentCount = 0;
+		InOutStats->CollisionReceiverLargestNewDisconnectedFragmentSize = 0;
+		InOutStats->CollisionTrimmedByDonorProtectionCount = 0;
+		InOutStats->CollisionRejectedByDonorProtectionCount = 0;
+		InOutStats->CollisionTrimmedByDonorComponentCapCount = 0;
+		InOutStats->CollisionTrimmedByDonorFragmentFloorCount = 0;
+		InOutStats->CollisionRejectedByDonorComponentCapCount = 0;
+		InOutStats->CollisionRejectedByDonorFragmentFloorCount = 0;
+		InOutStats->CollisionTrimmedByReceiverProtectionCount = 0;
+		InOutStats->CollisionRejectedByReceiverProtectionCount = 0;
+		InOutStats->CollisionTransferTrimRatio = 0.0;
+		InOutStats->bCollisionReceiverTransferContiguousWithExistingTerritory = false;
 	}
 
 	if (!bEnableContinentalCollision ||
@@ -5698,25 +9767,360 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 		return false;
 	}
 
+	bool bGeometricCollisionExecutionFailed = false;
 	if (TriggerReason == EResampleTriggerReason::CollisionFollowup &&
+		PendingGeometricCollisionEvent.bValid)
+	{
+		FGeometricCollisionPairDiagnostics PendingPairDiagnostics;
+		PendingPairDiagnostics.PlateA = PendingGeometricCollisionEvent.PlateA;
+		PendingPairDiagnostics.PlateB = PendingGeometricCollisionEvent.PlateB;
+		PendingPairDiagnostics.SamplesFromAInsideB = PendingGeometricCollisionEvent.SamplesFromAInsideB;
+		PendingPairDiagnostics.SamplesFromBInsideA = PendingGeometricCollisionEvent.SamplesFromBInsideA;
+		PendingPairDiagnostics.TotalConvergenceMagnitudeAInsideBKmPerMy =
+			PendingGeometricCollisionEvent.TotalConvergenceMagnitudeAInsideBKmPerMy;
+		PendingPairDiagnostics.TotalConvergenceMagnitudeBInsideAKmPerMy =
+			PendingGeometricCollisionEvent.TotalConvergenceMagnitudeBInsideAKmPerMy;
+		PendingPairDiagnostics.TotalConvergenceMagnitudeKmPerMy =
+			PendingGeometricCollisionEvent.TotalConvergenceMagnitudeKmPerMy;
+		PendingPairDiagnostics.MaxConvergenceMagnitudeKmPerMy =
+			PendingGeometricCollisionEvent.MaxConvergenceMagnitudeKmPerMy;
+
+		int32 OverridingPlateId = INDEX_NONE;
+		int32 SubductingPlateId = INDEX_NONE;
+		const TArray<int32>* DirectionalSeedSamples = nullptr;
+		const TArray<int32>* OppositeDirectionalSamples = nullptr;
+		int32 TerraneSeedCount = 0;
+		int32 TerraneRecoveredCount = 0;
+		int32 LocalityLimitedCount = 0;
+		const TCHAR* FailureReason = TEXT("none");
+		FCollisionTransferProtectionDiagnostics ProtectionDiagnostics;
+		EGeometricCollisionDonorSelectionRule DonorRule = EGeometricCollisionDonorSelectionRule::None;
+		const bool bResolvedDirectionalBuckets = ResolveGeometricCollisionDonorReceiver(
+			*this,
+			PendingPairDiagnostics,
+			OverridingPlateId,
+			SubductingPlateId,
+			DirectionalSeedSamples,
+			OppositeDirectionalSamples,
+			DonorRule);
+		if (InOutStats != nullptr)
+		{
+			InOutStats->GeometricCollisionExecutedPlateA = PendingGeometricCollisionEvent.PlateA;
+			InOutStats->GeometricCollisionExecutedPlateB = PendingGeometricCollisionEvent.PlateB;
+			InOutStats->GeometricCollisionExecutedOverlapSampleCount =
+				PendingGeometricCollisionEvent.OverlapSampleCount > 0
+					? PendingGeometricCollisionEvent.OverlapSampleCount
+					: PendingGeometricCollisionEvent.OverlapSampleIndices.Num();
+			InOutStats->GeometricCollisionExecutedTerraneEstimate =
+				PendingGeometricCollisionEvent.TerraneEstimate;
+			InOutStats->GeometricCollisionDirectionalSeedCount =
+				(bResolvedDirectionalBuckets && DirectionalSeedSamples != nullptr) ? DirectionalSeedSamples->Num() : 0;
+			InOutStats->GeometricCollisionDirectionalSeedCountOpposite =
+				(bResolvedDirectionalBuckets && OppositeDirectionalSamples != nullptr) ? OppositeDirectionalSamples->Num() : 0;
+			InOutStats->GeometricCollisionExecutedFromDirectionalPolarityCount =
+				(bResolvedDirectionalBuckets && IsDirectionalGeometricCollisionDonorSelectionRule(DonorRule)) ? 1 : 0;
+			InOutStats->GeometricCollisionExecutedMeanConvergenceKmPerMy =
+				PendingGeometricCollisionEvent.EffectiveConvergenceKmPerMy;
+			InOutStats->GeometricCollisionExecutedMaxConvergenceKmPerMy =
+				PendingGeometricCollisionEvent.MaxConvergenceMagnitudeKmPerMy;
+			InOutStats->GeometricCollisionExecutedAccumulatedPenetrationKm =
+				PendingGeometricCollisionEvent.AccumulatedPenetrationKm;
+			InOutStats->GeometricCollisionExecutedObservationCount =
+				PendingGeometricCollisionEvent.ObservationCount;
+		}
+
+		const uint64 CollisionPairKey = MakeBoundaryContactPlatePairKey(
+			PendingGeometricCollisionEvent.PlateA,
+			PendingGeometricCollisionEvent.PlateB);
+		if (const int32* LastExecutionOrdinal = CollisionLastExecutionOrdinalByPair.Find(CollisionPairKey))
+		{
+			if (InOutStats != nullptr)
+			{
+				InOutStats->CollisionRepeatedPairCount = 1;
+			}
+			if ((ResamplingExecutionOrdinal - *LastExecutionOrdinal) <= CollisionPairCooldownResamples)
+			{
+				if (InOutStats != nullptr)
+				{
+					InOutStats->CollisionRepeatedPairWithinCooldownCount = 1;
+				}
+				FailureReason = TEXT("pair_cooldown");
+			}
+		}
+
+		double MeanOverlapDepthKm = PendingGeometricCollisionEvent.MeanOverlapDepthKm;
+		double MaxOverlapDepthKm = PendingGeometricCollisionEvent.MaxOverlapDepthKm;
+		if (bResolvedDirectionalBuckets && DirectionalSeedSamples != nullptr && DirectionalSeedSamples->Num() > 0)
+		{
+			double RecomputedMeanOverlapDepthKm = 0.0;
+			double RecomputedMaxOverlapDepthKm = 0.0;
+			if (ComputeDirectionalOverlapDepthStatsKm(
+					*this,
+					PreviousPlateIds,
+					OverridingPlateId,
+					*DirectionalSeedSamples,
+					RecomputedMeanOverlapDepthKm,
+					RecomputedMaxOverlapDepthKm))
+			{
+				MeanOverlapDepthKm = RecomputedMeanOverlapDepthKm;
+				MaxOverlapDepthKm = RecomputedMaxOverlapDepthKm;
+			}
+		}
+		if (InOutStats != nullptr)
+		{
+			InOutStats->GeometricCollisionExecutedOverlapDepthKm = MeanOverlapDepthKm;
+			InOutStats->GeometricCollisionExecutedMaxOverlapDepthKm = MaxOverlapDepthKm;
+		}
+
+		if (!bResolvedDirectionalBuckets)
+		{
+			FailureReason = TEXT("donor_ambiguous");
+		}
+		else if (DirectionalSeedSamples == nullptr || DirectionalSeedSamples->IsEmpty())
+		{
+			FailureReason = TEXT("donor_seed_empty");
+		}
+		else if (PendingGeometricCollisionEvent.AccumulatedPenetrationKm <
+			GeometricCollisionMinPersistentPenetrationKm)
+		{
+			FailureReason = TEXT("persistent_penetration_below_threshold");
+		}
+		else if (TryBuildCollisionEventFromSeedSamples(
+					*this,
+					*DirectionalSeedSamples,
+					OverridingPlateId,
+					SubductingPlateId,
+					PendingGeometricCollisionEvent.ContactCenter,
+					PreviousPlateIds,
+					PreviousContinentalWeights,
+					PreviousTerraneAssignments,
+					InOutNewPlateIds,
+					OutEvent,
+					TerraneSeedCount,
+					TerraneRecoveredCount,
+					LocalityLimitedCount,
+					FailureReason,
+					&ProtectionDiagnostics))
+		{
+			if (InOutStats != nullptr)
+			{
+				InOutStats->CollisionCount = 1;
+				InOutStats->CollisionTerraneId = OutEvent.TerraneId;
+				InOutStats->CollisionTerraneSampleCount = OutEvent.TerraneSampleIndices.Num();
+				InOutStats->CollisionOverridingPlateId = OutEvent.OverridingPlateId;
+				InOutStats->CollisionSubductingPlateId = OutEvent.SubductingPlateId;
+				InOutStats->bUsedGeometricCollisionExecution = true;
+				InOutStats->GeometricCollisionExecutedTerraneRecoveredCount = TerraneRecoveredCount;
+				InOutStats->GeometricCollisionExecutedDonorTerraneLocalityLimitedCount = LocalityLimitedCount;
+				InOutStats->CollisionProposedGlobalMaxComponentsAfter =
+					ProtectionDiagnostics.Proposed.GlobalMaxComponentsAfter;
+				InOutStats->CollisionProposedDonorComponentsBefore =
+					ProtectionDiagnostics.Proposed.DonorComponentsBefore;
+				InOutStats->CollisionProposedDonorComponentsAfter =
+					ProtectionDiagnostics.Proposed.DonorComponentsAfter;
+				InOutStats->CollisionProposedReceiverComponentsBefore =
+					ProtectionDiagnostics.Proposed.ReceiverComponentsBefore;
+				InOutStats->CollisionProposedReceiverComponentsAfter =
+					ProtectionDiagnostics.Proposed.ReceiverComponentsAfter;
+				InOutStats->CollisionProposedDonorLargestRemainingComponentSize =
+					ProtectionDiagnostics.Proposed.DonorLargestRemainingComponentSize;
+				InOutStats->CollisionProposedDonorNewFragmentCount =
+					ProtectionDiagnostics.Proposed.DonorNewFragmentCount;
+				InOutStats->CollisionProposedDonorSmallestNewFragmentSize =
+					ProtectionDiagnostics.Proposed.DonorSmallestNewFragmentSize;
+				InOutStats->CollisionProposedDonorLargestNewFragmentSize =
+					ProtectionDiagnostics.Proposed.DonorLargestNewFragmentSize;
+				InOutStats->CollisionProposedDonorMeanNewFragmentSize =
+					ProtectionDiagnostics.Proposed.DonorMeanNewFragmentSize;
+				InOutStats->CollisionProposedReceiverDisconnectedFragmentCount =
+					ProtectionDiagnostics.Proposed.ReceiverDisconnectedFragmentCount;
+				InOutStats->CollisionProposedReceiverLargestNewDisconnectedFragmentSize =
+					ProtectionDiagnostics.Proposed.ReceiverLargestNewDisconnectedFragmentSize;
+				InOutStats->CollisionProposedTerraneSampleCount =
+					ProtectionDiagnostics.ProposedTerraneSampleCount;
+				InOutStats->CollisionAcceptedTerraneSampleCount =
+					ProtectionDiagnostics.AppliedTerraneSampleCount;
+				InOutStats->CollisionTransferTrimRatio =
+					ProtectionDiagnostics.AppliedTrimRatio;
+				InOutStats->CollisionTrimmedByDonorProtectionCount =
+					ProtectionDiagnostics.bTrimmedByDonorProtection ? 1 : 0;
+				InOutStats->CollisionTrimmedByDonorComponentCapCount =
+					ProtectionDiagnostics.bTrimmedByDonorComponentCap ? 1 : 0;
+				InOutStats->CollisionTrimmedByDonorFragmentFloorCount =
+					ProtectionDiagnostics.bTrimmedByDonorFragmentFloor ? 1 : 0;
+				InOutStats->CollisionTrimmedByReceiverProtectionCount =
+					ProtectionDiagnostics.bTrimmedByReceiverProtection ? 1 : 0;
+			}
+
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[GeometricCollisionExecution Step=%d] pair=(%d,%d) overlap_samples=%d directional_seed_count=%d opposite_directional_seed_count=%d terrane_seed_count=%d terrane_recovered=%d overlap_depth_km=%.3f max_overlap_depth_km=%.3f accumulated_penetration_km=%.3f observation_count=%d locality_limited_count=%d over_plate=%d sub_plate=%d donor_rule=%s proposed_terrane_size=%d accepted_terrane_size=%d trim_ratio=%.3f proposed_donor_delta=%d accepted_donor_delta=%d proposed_receiver_delta=%d proposed_donor_new_fragments=%d accepted_donor_new_fragments=%d proposed_donor_fragment_size_min=%d proposed_donor_fragment_size_max=%d proposed_donor_fragment_size_mean=%.3f trimmed_by_donor=%d trimmed_by_donor_component_cap=%d trimmed_by_donor_fragment_floor=%d trimmed_by_receiver=%d"),
+				CurrentStep,
+				PendingGeometricCollisionEvent.PlateA,
+				PendingGeometricCollisionEvent.PlateB,
+				PendingGeometricCollisionEvent.OverlapSampleCount > 0
+					? PendingGeometricCollisionEvent.OverlapSampleCount
+					: PendingGeometricCollisionEvent.OverlapSampleIndices.Num(),
+				DirectionalSeedSamples != nullptr ? DirectionalSeedSamples->Num() : 0,
+				OppositeDirectionalSamples != nullptr ? OppositeDirectionalSamples->Num() : 0,
+				TerraneSeedCount,
+				TerraneRecoveredCount,
+				MeanOverlapDepthKm,
+				MaxOverlapDepthKm,
+				PendingGeometricCollisionEvent.AccumulatedPenetrationKm,
+				PendingGeometricCollisionEvent.ObservationCount,
+				LocalityLimitedCount,
+				OutEvent.OverridingPlateId,
+				OutEvent.SubductingPlateId,
+				GetGeometricCollisionDonorSelectionRuleName(DonorRule),
+				ProtectionDiagnostics.ProposedTerraneSampleCount,
+				ProtectionDiagnostics.AppliedTerraneSampleCount,
+				ProtectionDiagnostics.AppliedTrimRatio,
+				ProtectionDiagnostics.Proposed.DonorComponentsAfter -
+					ProtectionDiagnostics.Proposed.DonorComponentsBefore,
+				ProtectionDiagnostics.Applied.DonorComponentsAfter -
+					ProtectionDiagnostics.Applied.DonorComponentsBefore,
+				ProtectionDiagnostics.Proposed.ReceiverComponentsAfter -
+					ProtectionDiagnostics.Proposed.ReceiverComponentsBefore,
+				ProtectionDiagnostics.Proposed.DonorNewFragmentCount,
+				ProtectionDiagnostics.Applied.DonorNewFragmentCount,
+				ProtectionDiagnostics.Proposed.DonorSmallestNewFragmentSize,
+				ProtectionDiagnostics.Proposed.DonorLargestNewFragmentSize,
+				ProtectionDiagnostics.Proposed.DonorMeanNewFragmentSize,
+				ProtectionDiagnostics.bTrimmedByDonorProtection ? 1 : 0,
+				ProtectionDiagnostics.bTrimmedByDonorComponentCap ? 1 : 0,
+				ProtectionDiagnostics.bTrimmedByDonorFragmentFloor ? 1 : 0,
+				ProtectionDiagnostics.bTrimmedByReceiverProtection ? 1 : 0);
+			return true;
+		}
+
+		bGeometricCollisionExecutionFailed = true;
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[GeometricCollisionExecutionRejected Step=%d] pair=(%d,%d) overlap_samples=%d directional_seed_count=%d opposite_directional_seed_count=%d overlap_depth_km=%.3f max_overlap_depth_km=%.3f accumulated_penetration_km=%.3f observation_count=%d rejection_reason=%s donor_rule=%s proposed_terrane_size=%d accepted_terrane_size=%d trim_ratio=%.3f proposed_donor_delta=%d proposed_donor_new_fragments=%d proposed_donor_fragment_size_min=%d proposed_donor_fragment_size_max=%d proposed_donor_fragment_size_mean=%.3f rejected_by_donor_component_cap=%d rejected_by_donor_fragment_floor=%d"),
+			CurrentStep,
+			PendingGeometricCollisionEvent.PlateA,
+			PendingGeometricCollisionEvent.PlateB,
+			PendingGeometricCollisionEvent.OverlapSampleCount > 0
+				? PendingGeometricCollisionEvent.OverlapSampleCount
+				: PendingGeometricCollisionEvent.OverlapSampleIndices.Num(),
+			DirectionalSeedSamples != nullptr ? DirectionalSeedSamples->Num() : 0,
+			OppositeDirectionalSamples != nullptr ? OppositeDirectionalSamples->Num() : 0,
+			MeanOverlapDepthKm,
+			MaxOverlapDepthKm,
+			PendingGeometricCollisionEvent.AccumulatedPenetrationKm,
+			PendingGeometricCollisionEvent.ObservationCount,
+			FailureReason,
+			GetGeometricCollisionDonorSelectionRuleName(DonorRule),
+			ProtectionDiagnostics.ProposedTerraneSampleCount,
+			ProtectionDiagnostics.AppliedTerraneSampleCount,
+			ProtectionDiagnostics.AppliedTrimRatio,
+			ProtectionDiagnostics.Proposed.DonorComponentsAfter -
+				ProtectionDiagnostics.Proposed.DonorComponentsBefore,
+			ProtectionDiagnostics.Proposed.DonorNewFragmentCount,
+			ProtectionDiagnostics.Proposed.DonorSmallestNewFragmentSize,
+			ProtectionDiagnostics.Proposed.DonorLargestNewFragmentSize,
+			ProtectionDiagnostics.Proposed.DonorMeanNewFragmentSize,
+			ProtectionDiagnostics.bRejectedByDonorComponentCap ? 1 : 0,
+			ProtectionDiagnostics.bRejectedByDonorFragmentFloor ? 1 : 0);
+		if (InOutStats != nullptr)
+		{
+			InOutStats->CollisionProposedGlobalMaxComponentsAfter =
+				ProtectionDiagnostics.Proposed.GlobalMaxComponentsAfter;
+			InOutStats->CollisionProposedDonorComponentsBefore =
+				ProtectionDiagnostics.Proposed.DonorComponentsBefore;
+			InOutStats->CollisionProposedDonorComponentsAfter =
+				ProtectionDiagnostics.Proposed.DonorComponentsAfter;
+			InOutStats->CollisionProposedReceiverComponentsBefore =
+				ProtectionDiagnostics.Proposed.ReceiverComponentsBefore;
+			InOutStats->CollisionProposedReceiverComponentsAfter =
+				ProtectionDiagnostics.Proposed.ReceiverComponentsAfter;
+			InOutStats->CollisionProposedDonorLargestRemainingComponentSize =
+				ProtectionDiagnostics.Proposed.DonorLargestRemainingComponentSize;
+			InOutStats->CollisionProposedDonorNewFragmentCount =
+				ProtectionDiagnostics.Proposed.DonorNewFragmentCount;
+			InOutStats->CollisionProposedDonorSmallestNewFragmentSize =
+				ProtectionDiagnostics.Proposed.DonorSmallestNewFragmentSize;
+			InOutStats->CollisionProposedDonorLargestNewFragmentSize =
+				ProtectionDiagnostics.Proposed.DonorLargestNewFragmentSize;
+			InOutStats->CollisionProposedDonorMeanNewFragmentSize =
+				ProtectionDiagnostics.Proposed.DonorMeanNewFragmentSize;
+			InOutStats->CollisionProposedReceiverDisconnectedFragmentCount =
+				ProtectionDiagnostics.Proposed.ReceiverDisconnectedFragmentCount;
+			InOutStats->CollisionProposedReceiverLargestNewDisconnectedFragmentSize =
+				ProtectionDiagnostics.Proposed.ReceiverLargestNewDisconnectedFragmentSize;
+			InOutStats->CollisionProposedTerraneSampleCount =
+				ProtectionDiagnostics.ProposedTerraneSampleCount;
+			InOutStats->CollisionAcceptedTerraneSampleCount =
+				ProtectionDiagnostics.AppliedTerraneSampleCount;
+			InOutStats->CollisionTransferTrimRatio =
+				ProtectionDiagnostics.AppliedTrimRatio;
+			InOutStats->CollisionRejectedByDonorProtectionCount =
+				ProtectionDiagnostics.bRejectedByDonorProtection ? 1 : 0;
+			InOutStats->CollisionRejectedByDonorComponentCapCount =
+				ProtectionDiagnostics.bRejectedByDonorComponentCap ? 1 : 0;
+			InOutStats->CollisionRejectedByDonorFragmentFloorCount =
+				ProtectionDiagnostics.bRejectedByDonorFragmentFloor ? 1 : 0;
+			InOutStats->CollisionRejectedByReceiverProtectionCount =
+				ProtectionDiagnostics.bRejectedByReceiverProtection ? 1 : 0;
+			AccumulateGeometricCollisionFailureReason(*InOutStats, FailureReason);
+		}
+	}
+
+	if (TriggerReason == EResampleTriggerReason::CollisionFollowup &&
+		(!PendingGeometricCollisionEvent.bValid || bGeometricCollisionExecutionFailed) &&
 		PendingBoundaryContactCollisionEvent.bValid)
 	{
 		int32 TerraneSeedCount = 0;
 		int32 TerraneRecoveredCount = 0;
+		int32 LocalityLimitedCount = 0;
 		const TCHAR* FailureReason = TEXT("none");
+		FCollisionTransferProtectionDiagnostics ProtectionDiagnostics;
 		if (InOutStats != nullptr)
 		{
+			InOutStats->GeometricCollisionFallbackUsedCount = 1;
 			InOutStats->CachedBoundaryContactSeedCount =
 				PendingBoundaryContactCollisionEvent.BoundarySeedSampleIndices.Num();
 			InOutStats->CachedBoundaryContactPlateA = PendingBoundaryContactCollisionEvent.PlateA;
 			InOutStats->CachedBoundaryContactPlateB = PendingBoundaryContactCollisionEvent.PlateB;
 		}
 
-		if (TryBuildCollisionEventFromBoundaryContactSeeds(
+		const int32 OverridingPlateId =
+			IsOverridingPlate(*this, PendingBoundaryContactCollisionEvent.PlateA, PendingBoundaryContactCollisionEvent.PlateB)
+				? PendingBoundaryContactCollisionEvent.PlateA
+				: PendingBoundaryContactCollisionEvent.PlateB;
+		const int32 SubductingPlateId =
+			OverridingPlateId == PendingBoundaryContactCollisionEvent.PlateA
+				? PendingBoundaryContactCollisionEvent.PlateB
+				: PendingBoundaryContactCollisionEvent.PlateA;
+
+		const uint64 CollisionPairKey = MakeBoundaryContactPlatePairKey(
+			PendingBoundaryContactCollisionEvent.PlateA,
+			PendingBoundaryContactCollisionEvent.PlateB);
+		if (const int32* LastExecutionOrdinal = CollisionLastExecutionOrdinalByPair.Find(CollisionPairKey))
+		{
+			if (InOutStats != nullptr)
+			{
+				InOutStats->CollisionRepeatedPairCount = 1;
+			}
+			if ((ResamplingExecutionOrdinal - *LastExecutionOrdinal) <= CollisionPairCooldownResamples)
+			{
+				if (InOutStats != nullptr)
+				{
+					InOutStats->CollisionRepeatedPairWithinCooldownCount = 1;
+				}
+				FailureReason = TEXT("pair_cooldown");
+			}
+		}
+
+		if (FCString::Strcmp(FailureReason, TEXT("pair_cooldown")) != 0 &&
+			TryBuildCollisionEventFromSeedSamples(
 				*this,
 				PendingBoundaryContactCollisionEvent.BoundarySeedSampleIndices,
-				PendingBoundaryContactCollisionEvent.PlateA,
-				PendingBoundaryContactCollisionEvent.PlateB,
+				OverridingPlateId,
+				SubductingPlateId,
 				PendingBoundaryContactCollisionEvent.ContactCenter,
 				PreviousPlateIds,
 				PreviousContinentalWeights,
@@ -5725,7 +10129,9 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 				OutEvent,
 				TerraneSeedCount,
 				TerraneRecoveredCount,
-				FailureReason))
+				LocalityLimitedCount,
+				FailureReason,
+				&ProtectionDiagnostics))
 		{
 			if (InOutStats != nullptr)
 			{
@@ -5737,12 +10143,50 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 				InOutStats->bUsedCachedBoundaryContactCollision = true;
 				InOutStats->CachedBoundaryContactTerraneSeedCount = TerraneSeedCount;
 				InOutStats->CachedBoundaryContactTerraneRecoveredCount = TerraneRecoveredCount;
+				InOutStats->CollisionProposedGlobalMaxComponentsAfter =
+					ProtectionDiagnostics.Proposed.GlobalMaxComponentsAfter;
+				InOutStats->CollisionProposedDonorComponentsBefore =
+					ProtectionDiagnostics.Proposed.DonorComponentsBefore;
+				InOutStats->CollisionProposedDonorComponentsAfter =
+					ProtectionDiagnostics.Proposed.DonorComponentsAfter;
+				InOutStats->CollisionProposedReceiverComponentsBefore =
+					ProtectionDiagnostics.Proposed.ReceiverComponentsBefore;
+				InOutStats->CollisionProposedReceiverComponentsAfter =
+					ProtectionDiagnostics.Proposed.ReceiverComponentsAfter;
+				InOutStats->CollisionProposedDonorLargestRemainingComponentSize =
+					ProtectionDiagnostics.Proposed.DonorLargestRemainingComponentSize;
+				InOutStats->CollisionProposedDonorNewFragmentCount =
+					ProtectionDiagnostics.Proposed.DonorNewFragmentCount;
+				InOutStats->CollisionProposedDonorSmallestNewFragmentSize =
+					ProtectionDiagnostics.Proposed.DonorSmallestNewFragmentSize;
+				InOutStats->CollisionProposedDonorLargestNewFragmentSize =
+					ProtectionDiagnostics.Proposed.DonorLargestNewFragmentSize;
+				InOutStats->CollisionProposedDonorMeanNewFragmentSize =
+					ProtectionDiagnostics.Proposed.DonorMeanNewFragmentSize;
+				InOutStats->CollisionProposedReceiverDisconnectedFragmentCount =
+					ProtectionDiagnostics.Proposed.ReceiverDisconnectedFragmentCount;
+				InOutStats->CollisionProposedReceiverLargestNewDisconnectedFragmentSize =
+					ProtectionDiagnostics.Proposed.ReceiverLargestNewDisconnectedFragmentSize;
+				InOutStats->CollisionProposedTerraneSampleCount =
+					ProtectionDiagnostics.ProposedTerraneSampleCount;
+				InOutStats->CollisionAcceptedTerraneSampleCount =
+					ProtectionDiagnostics.AppliedTerraneSampleCount;
+				InOutStats->CollisionTransferTrimRatio =
+					ProtectionDiagnostics.AppliedTrimRatio;
+				InOutStats->CollisionTrimmedByDonorProtectionCount =
+					ProtectionDiagnostics.bTrimmedByDonorProtection ? 1 : 0;
+				InOutStats->CollisionTrimmedByDonorComponentCapCount =
+					ProtectionDiagnostics.bTrimmedByDonorComponentCap ? 1 : 0;
+				InOutStats->CollisionTrimmedByDonorFragmentFloorCount =
+					ProtectionDiagnostics.bTrimmedByDonorFragmentFloor ? 1 : 0;
+				InOutStats->CollisionTrimmedByReceiverProtectionCount =
+					ProtectionDiagnostics.bTrimmedByReceiverProtection ? 1 : 0;
 			}
 
 			UE_LOG(
 				LogTemp,
 				Log,
-				TEXT("[CachedBoundaryContactCollision Step=%d] pair=(%d,%d) seed_count=%d terrane_seed_count=%d terrane_recovered=%d over_plate=%d sub_plate=%d"),
+				TEXT("[CachedBoundaryContactCollision Step=%d] pair=(%d,%d) seed_count=%d terrane_seed_count=%d terrane_recovered=%d over_plate=%d sub_plate=%d proposed_terrane_size=%d accepted_terrane_size=%d trim_ratio=%.3f proposed_donor_delta=%d accepted_donor_delta=%d proposed_donor_new_fragments=%d proposed_donor_fragment_size_min=%d proposed_donor_fragment_size_max=%d proposed_donor_fragment_size_mean=%.3f trimmed_by_donor=%d trimmed_by_donor_component_cap=%d trimmed_by_donor_fragment_floor=%d trimmed_by_receiver=%d"),
 				CurrentStep,
 				PendingBoundaryContactCollisionEvent.PlateA,
 				PendingBoundaryContactCollisionEvent.PlateB,
@@ -5750,7 +10194,22 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 				TerraneSeedCount,
 				TerraneRecoveredCount,
 				OutEvent.OverridingPlateId,
-				OutEvent.SubductingPlateId);
+				OutEvent.SubductingPlateId,
+				ProtectionDiagnostics.ProposedTerraneSampleCount,
+				ProtectionDiagnostics.AppliedTerraneSampleCount,
+				ProtectionDiagnostics.AppliedTrimRatio,
+				ProtectionDiagnostics.Proposed.DonorComponentsAfter -
+					ProtectionDiagnostics.Proposed.DonorComponentsBefore,
+				ProtectionDiagnostics.Applied.DonorComponentsAfter -
+					ProtectionDiagnostics.Applied.DonorComponentsBefore,
+				ProtectionDiagnostics.Proposed.DonorNewFragmentCount,
+				ProtectionDiagnostics.Proposed.DonorSmallestNewFragmentSize,
+				ProtectionDiagnostics.Proposed.DonorLargestNewFragmentSize,
+				ProtectionDiagnostics.Proposed.DonorMeanNewFragmentSize,
+				ProtectionDiagnostics.bTrimmedByDonorProtection ? 1 : 0,
+				ProtectionDiagnostics.bTrimmedByDonorComponentCap ? 1 : 0,
+				ProtectionDiagnostics.bTrimmedByDonorFragmentFloor ? 1 : 0,
+				ProtectionDiagnostics.bTrimmedByReceiverProtection ? 1 : 0);
 			return true;
 		}
 
@@ -5758,17 +10217,67 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 		{
 			InOutStats->CachedBoundaryContactTerraneSeedCount = TerraneSeedCount;
 			InOutStats->CachedBoundaryContactTerraneRecoveredCount = TerraneRecoveredCount;
+			InOutStats->CollisionProposedGlobalMaxComponentsAfter =
+				ProtectionDiagnostics.Proposed.GlobalMaxComponentsAfter;
+			InOutStats->CollisionProposedDonorComponentsBefore =
+				ProtectionDiagnostics.Proposed.DonorComponentsBefore;
+			InOutStats->CollisionProposedDonorComponentsAfter =
+				ProtectionDiagnostics.Proposed.DonorComponentsAfter;
+			InOutStats->CollisionProposedReceiverComponentsBefore =
+				ProtectionDiagnostics.Proposed.ReceiverComponentsBefore;
+			InOutStats->CollisionProposedReceiverComponentsAfter =
+				ProtectionDiagnostics.Proposed.ReceiverComponentsAfter;
+			InOutStats->CollisionProposedDonorLargestRemainingComponentSize =
+				ProtectionDiagnostics.Proposed.DonorLargestRemainingComponentSize;
+			InOutStats->CollisionProposedDonorNewFragmentCount =
+				ProtectionDiagnostics.Proposed.DonorNewFragmentCount;
+			InOutStats->CollisionProposedDonorSmallestNewFragmentSize =
+				ProtectionDiagnostics.Proposed.DonorSmallestNewFragmentSize;
+			InOutStats->CollisionProposedDonorLargestNewFragmentSize =
+				ProtectionDiagnostics.Proposed.DonorLargestNewFragmentSize;
+			InOutStats->CollisionProposedDonorMeanNewFragmentSize =
+				ProtectionDiagnostics.Proposed.DonorMeanNewFragmentSize;
+			InOutStats->CollisionProposedReceiverDisconnectedFragmentCount =
+				ProtectionDiagnostics.Proposed.ReceiverDisconnectedFragmentCount;
+			InOutStats->CollisionProposedReceiverLargestNewDisconnectedFragmentSize =
+				ProtectionDiagnostics.Proposed.ReceiverLargestNewDisconnectedFragmentSize;
+			InOutStats->CollisionProposedTerraneSampleCount =
+				ProtectionDiagnostics.ProposedTerraneSampleCount;
+			InOutStats->CollisionAcceptedTerraneSampleCount =
+				ProtectionDiagnostics.AppliedTerraneSampleCount;
+			InOutStats->CollisionTransferTrimRatio =
+				ProtectionDiagnostics.AppliedTrimRatio;
+			InOutStats->CollisionRejectedByDonorProtectionCount =
+				ProtectionDiagnostics.bRejectedByDonorProtection ? 1 : 0;
+			InOutStats->CollisionRejectedByDonorComponentCapCount =
+				ProtectionDiagnostics.bRejectedByDonorComponentCap ? 1 : 0;
+			InOutStats->CollisionRejectedByDonorFragmentFloorCount =
+				ProtectionDiagnostics.bRejectedByDonorFragmentFloor ? 1 : 0;
+			InOutStats->CollisionRejectedByReceiverProtectionCount =
+				ProtectionDiagnostics.bRejectedByReceiverProtection ? 1 : 0;
 		}
 
 		UE_LOG(
 			LogTemp,
 			Log,
-			TEXT("[CachedBoundaryContactCollisionRejected Step=%d] pair=(%d,%d) seed_count=%d rejection_reason=%s"),
+			TEXT("[CachedBoundaryContactCollisionRejected Step=%d] pair=(%d,%d) seed_count=%d rejection_reason=%s proposed_terrane_size=%d accepted_terrane_size=%d trim_ratio=%.3f proposed_donor_delta=%d proposed_donor_new_fragments=%d proposed_donor_fragment_size_min=%d proposed_donor_fragment_size_max=%d proposed_donor_fragment_size_mean=%.3f rejected_by_donor_component_cap=%d rejected_by_donor_fragment_floor=%d"),
 			CurrentStep,
 			PendingBoundaryContactCollisionEvent.PlateA,
 			PendingBoundaryContactCollisionEvent.PlateB,
 			PendingBoundaryContactCollisionEvent.BoundarySeedSampleIndices.Num(),
-			FailureReason);
+			FailureReason,
+			ProtectionDiagnostics.ProposedTerraneSampleCount,
+			ProtectionDiagnostics.AppliedTerraneSampleCount,
+			ProtectionDiagnostics.AppliedTrimRatio,
+			ProtectionDiagnostics.Proposed.DonorComponentsAfter -
+				ProtectionDiagnostics.Proposed.DonorComponentsBefore,
+			ProtectionDiagnostics.Proposed.DonorNewFragmentCount,
+			ProtectionDiagnostics.Proposed.DonorSmallestNewFragmentSize,
+			ProtectionDiagnostics.Proposed.DonorLargestNewFragmentSize,
+			ProtectionDiagnostics.Proposed.DonorMeanNewFragmentSize,
+			ProtectionDiagnostics.bRejectedByDonorComponentCap ? 1 : 0,
+			ProtectionDiagnostics.bRejectedByDonorFragmentFloor ? 1 : 0);
+		(void)LocalityLimitedCount;
 	}
 
 	TArray<FCollisionCandidate> Candidates;
@@ -5882,8 +10391,10 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 
 	int32 TerraneSeedCount = 0;
 	int32 TerraneRecoveredCount = 0;
+	int32 LocalityLimitedCount = 0;
 	const TCHAR* FailureReason = TEXT("none");
-	if (!TryBuildCollisionEventFromBoundaryContactSeeds(
+	FCollisionTransferProtectionDiagnostics ProtectionDiagnostics;
+	if (!TryBuildCollisionEventFromSeedSamples(
 			*this,
 			SelectedComponent.SampleIndices,
 			SelectedComponent.OverridingPlateId,
@@ -5896,7 +10407,9 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 			OutEvent,
 			TerraneSeedCount,
 			TerraneRecoveredCount,
-			FailureReason))
+			LocalityLimitedCount,
+			FailureReason,
+			&ProtectionDiagnostics))
 	{
 		LogCollisionDiag(
 			Candidates.Num(),
@@ -5908,6 +10421,7 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 			FailureReason);
 		return false;
 	}
+	(void)LocalityLimitedCount;
 
 	if (InOutStats != nullptr)
 	{
@@ -5916,6 +10430,30 @@ bool FTectonicPlanet::DetectAndApplyCollision(
 		InOutStats->CollisionTerraneSampleCount = OutEvent.TerraneSampleIndices.Num();
 		InOutStats->CollisionOverridingPlateId = OutEvent.OverridingPlateId;
 		InOutStats->CollisionSubductingPlateId = OutEvent.SubductingPlateId;
+		InOutStats->CollisionProposedGlobalMaxComponentsAfter =
+			ProtectionDiagnostics.Proposed.GlobalMaxComponentsAfter;
+		InOutStats->CollisionProposedDonorComponentsBefore =
+			ProtectionDiagnostics.Proposed.DonorComponentsBefore;
+		InOutStats->CollisionProposedDonorComponentsAfter =
+			ProtectionDiagnostics.Proposed.DonorComponentsAfter;
+		InOutStats->CollisionProposedReceiverComponentsBefore =
+			ProtectionDiagnostics.Proposed.ReceiverComponentsBefore;
+		InOutStats->CollisionProposedReceiverComponentsAfter =
+			ProtectionDiagnostics.Proposed.ReceiverComponentsAfter;
+		InOutStats->CollisionProposedDonorLargestRemainingComponentSize =
+			ProtectionDiagnostics.Proposed.DonorLargestRemainingComponentSize;
+		InOutStats->CollisionProposedDonorNewFragmentCount =
+			ProtectionDiagnostics.Proposed.DonorNewFragmentCount;
+		InOutStats->CollisionProposedDonorLargestNewFragmentSize =
+			ProtectionDiagnostics.Proposed.DonorLargestNewFragmentSize;
+		InOutStats->CollisionProposedReceiverDisconnectedFragmentCount =
+			ProtectionDiagnostics.Proposed.ReceiverDisconnectedFragmentCount;
+		InOutStats->CollisionProposedReceiverLargestNewDisconnectedFragmentSize =
+			ProtectionDiagnostics.Proposed.ReceiverLargestNewDisconnectedFragmentSize;
+		InOutStats->CollisionTrimmedByDonorProtectionCount =
+			ProtectionDiagnostics.bTrimmedByDonorProtection ? 1 : 0;
+		InOutStats->CollisionTrimmedByReceiverProtectionCount =
+			ProtectionDiagnostics.bTrimmedByReceiverProtection ? 1 : 0;
 	}
 
 	LogCollisionDiag(
@@ -5975,9 +10513,16 @@ void FTectonicPlanet::ApplyCollisionElevationSurge(
 		FMath::Sqrt(FMath::Max(RelativeSpeedKmPerMy, 0.0) / FMath::Max(MaxPlateSpeedKmPerMy, UE_DOUBLE_SMALL_NUMBER)) *
 		static_cast<double>(CollisionEvent.TerraneSampleIndices.Num()) *
 		AverageSampleAreaSr;
-	const double SurgeRadiusRad = FMath::Max(
+	const bool bGeometricExecution = InOutStats != nullptr && InOutStats->bUsedGeometricCollisionExecution;
+	double SurgeRadiusRad = FMath::Max(
 		CollisionGlobalDistanceRad * FMath::Min(Xi, 1.0),
 		MinCollisionRadiusRad);
+	if (bGeometricExecution)
+	{
+		SurgeRadiusRad = FMath::Min(
+			CollisionGlobalDistanceRad,
+			SurgeRadiusRad * FMath::Max(GeometricCollisionInfluenceRadiusScale, 1.0));
+	}
 
 	TArray<int32> AffectedSampleIndices;
 	AffectedSampleIndices.Reserve(Samples.Num() / 8);
@@ -6036,11 +10581,17 @@ void FTectonicPlanet::ApplyCollisionElevationSurge(
 	if (InOutStats != nullptr)
 	{
 		InOutStats->CollisionSurgeAffectedCount = SurgeAffectedCount;
+		InOutStats->CollisionCWBoostedCount = CWBoostedCount;
 		InOutStats->CollisionSurgeRadiusRad = SurgeRadiusRad;
 		InOutStats->CollisionSurgeMeanElevationDelta =
 			SurgeAffectedCount > 0
 				? TotalElevationDelta / static_cast<double>(SurgeAffectedCount)
 				: 0.0;
+		if (InOutStats->bUsedGeometricCollisionExecution)
+		{
+			InOutStats->GeometricCollisionExecutedCWBoostedCount = CWBoostedCount;
+			InOutStats->GeometricCollisionExecutedSurgeAffectedCount = SurgeAffectedCount;
+		}
 	}
 
 	UE_LOG(
@@ -6085,6 +10636,7 @@ void FTectonicPlanet::PerformResampling(
 	const EResampleTriggerReason TriggerReason)
 {
 	ComputePlateScores();
+	++ResamplingExecutionOrdinal;
 	const int32 ResampleInterval = ComputeResampleInterval();
 	LastComputedResampleInterval = ResampleInterval;
 	const double AverageSampleSpacingKm =
@@ -6100,8 +10652,71 @@ void FTectonicPlanet::PerformResampling(
 	const double MaxDisplacementKmPerStep = MaxAngularSpeed * PlanetRadiusKm;
 
 	FResamplingStats Stats;
+	Stats.TriggerReason = TriggerReason;
+	Stats.OwnershipMode = OwnershipMode;
 	Stats.Step = CurrentStep;
 	Stats.Interval = ResampleInterval;
+	Stats.GeometricCollisionDonorLocalityClampKm = GeometricCollisionDonorLocalityClampKm;
+	Stats.GeometricCollisionInfluenceRadiusScale = GeometricCollisionInfluenceRadiusScale;
+	Stats.GeometricCollisionPersistentPenetrationThresholdKm =
+		GeometricCollisionMinPersistentPenetrationKm;
+	Stats.ContinentalSamplesBefore = 0;
+	Stats.ContinentalSamplesAfter = 0;
+	Stats.ContinentalSamplesLost = 0;
+	Stats.FormerContinentalSamplesTurnedOceanic = 0;
+	Stats.FormerContinentalDivergentGapCount = 0;
+	Stats.FormerContinentalNonDivergentGapCount = 0;
+	Stats.FormerContinentalNonDivergentGapProjectionResolvedCount = 0;
+	Stats.FormerContinentalNonDivergentGapNearestCopyResolvedCount = 0;
+	Stats.FormerContinentalNonDivergentFallbackOceanizedCount = 0;
+	Stats.FormerContinentalDivergentOceanizedCount = 0;
+	Stats.FormerContinentalProjectionRecoveredNonContinentalFinalCount = 0;
+	Stats.FormerContinentalProjectionRecoveredSamePlateNonContinentalFinalCount = 0;
+	Stats.FormerContinentalProjectionRecoveredChangedPlateNonContinentalFinalCount = 0;
+	Stats.FormerContinentalProjectionRecoveredPreserveModeNonContinentalFinalCount = 0;
+	Stats.FormerContinentalProjectionRecoveredFullResolutionNonContinentalFinalCount = 0;
+	Stats.FormerContinentalNearestCopyRecoveredNonContinentalFinalCount = 0;
+	Stats.FormerContinentalNonGapReclassifiedNonContinentalFinalCount = 0;
+	Stats.FormerContinentalChangedPlateNonContinentalFinalCount = 0;
+	Stats.FormerContinentalFullResolutionNonContinentalFinalCount = 0;
+	Stats.FullResolutionSamePlateNonContinentalFinalCount = 0;
+	Stats.FullResolutionChangedPlateNonContinentalFinalCount = 0;
+	Stats.FullResolutionCollisionFollowupSamePlateNonContinentalCount = 0;
+	Stats.FullResolutionCollisionFollowupChangedPlateNonContinentalCount = 0;
+	Stats.FullResolutionRiftFollowupSamePlateNonContinentalCount = 0;
+	Stats.FullResolutionRiftFollowupChangedPlateNonContinentalCount = 0;
+	Stats.FullResolutionOtherTriggerSamePlateNonContinentalCount = 0;
+	Stats.FullResolutionOtherTriggerChangedPlateNonContinentalCount = 0;
+	Stats.FormerContinentalPreserveModeNonGapNonContinentalFinalCount = 0;
+	Stats.FormerContinentalFallbackQueryNonContinentalFinalCount = 0;
+	Stats.FullResolutionSamePlateCWRetainedCount = 0;
+	Stats.FullResolutionSamePlateCWThresholdCrossingPreventedCount = 0;
+	Stats.FullResolutionCollisionFollowupSamePlateCWRetainedCount = 0;
+	Stats.FullResolutionRiftFollowupSamePlateCWRetainedCount = 0;
+	Stats.FullResolutionOtherTriggerSamePlateCWRetainedCount = 0;
+	Stats.AndeanContinentalGainCount = 0;
+	Stats.CollisionContinentalGainCount = 0;
+	Stats.NetContinentalSampleDelta = 0;
+	Stats.PreserveOwnershipCWRetainedCount = 0;
+	Stats.PreserveOwnershipCWThresholdCrossingPreventedCount = 0;
+	Stats.PreserveOwnershipFallbackSamePlateRecontainedCount = 0;
+	Stats.PreserveOwnershipFallbackSamePlateRetainedCount = 0;
+	Stats.PreserveOwnershipFallbackChangedOwnerCount = 0;
+	Stats.PreserveOwnershipFallbackGapCount = 0;
+	Stats.PreserveOwnershipFallbackDivergentOceanizationCount = 0;
+	Stats.PreserveOwnershipContinentalLossCountAfterFallback = 0;
+	Stats.PreserveOwnershipPreviousOwnerHysteresisApplicationCount = 0;
+	Stats.PreserveOwnershipStronglyContinentalBoundarySavedCount = 0;
+	Stats.PreserveOwnershipFallbackChangedOwnerNonGapLossCount = 0;
+	Stats.PreserveOwnershipFallbackDivergentLossCount = 0;
+	Stats.PreserveOwnershipFallbackNonDivergentProjectionLossCount = 0;
+	Stats.PreserveOwnershipFallbackNonDivergentFallbackOceanizedLossCount = 0;
+	Stats.PreserveOwnershipFallbackStrongLossGE090Count = 0;
+	Stats.PreserveOwnershipFallbackStrongLossGE075Count = 0;
+	Stats.PreserveOwnershipFallbackStrongLossGE050Count = 0;
+	Stats.PreserveOwnershipFallbackLossPairPreviousPlateIds.Reset();
+	Stats.PreserveOwnershipFallbackLossPairFinalPlateIds.Reset();
+	Stats.PreserveOwnershipFallbackLossPairCounts.Reset();
 	Stats.RiftCount = 0;
 	Stats.RiftParentPlateId = INDEX_NONE;
 	Stats.RiftChildCount = 0;
@@ -6122,6 +10737,52 @@ void FTectonicPlanet::PerformResampling(
 	Stats.RiftParentContinentalSampleCount = 0;
 	Stats.RiftEventSeed = 0;
 	Stats.RiftDivergentChildBoundaryEdgeCount = 0;
+	Stats.RiftLocalizedNonChildSampleRestoreCount = 0;
+	Stats.RiftLocalizedGapSampleRestoreCount = 0;
+	Stats.RiftLocalizedCWRestoredCount = 0;
+		Stats.RiftLocalizedCWPhantomPreventedCount = 0;
+		Stats.RiftLocalizedCWContinentalPreventedCount = 0;
+		Stats.RiftInterpolationCreatedGainCount = 0;
+		Stats.RiftFinalOwnerMismatchGainCountAfterLocalization = 0;
+		Stats.RiftFinalOwnerCWReconciledCount = 0;
+		Stats.RiftFinalOwnerMismatchGainCountBeforeReconciliation = 0;
+		Stats.RiftFinalOwnerMismatchGainCountAfterReconciliation = 0;
+		Stats.RiftFinalOwnerMismatchContinentalPreventedCount = 0;
+		Stats.RiftSameOwnerChildInterpolationGainCountBeforeReconciliation = 0;
+		Stats.RiftSameOwnerChildInterpolationGainCountAfterReconciliation = 0;
+		Stats.RiftFinalGainStartedBelow025Count = 0;
+		Stats.RiftFinalGainStartedBelow040Count = 0;
+		Stats.RiftFinalGainStartedBelow050Count = 0;
+		Stats.RiftChildStrayFragmentDetectedCount = 0;
+	Stats.RiftChildStrayFragmentReassignedCount = 0;
+	Stats.RiftLargestStrayChildFragmentSize = 0;
+	Stats.RiftStrayChildFragmentReassignedToSiblingCount = 0;
+	Stats.RiftStrayChildFragmentReassignedToOtherNeighborCount = 0;
+	Stats.RiftStrayFragmentReassignedByAdjacentSiblingCount = 0;
+	Stats.RiftStrayFragmentReassignedByZeroAdjacencySiblingFallbackCount = 0;
+	Stats.RiftStrayFragmentForcedNonChildAssignmentCount = 0;
+	Stats.RiftStrayFragmentZeroSiblingAdjacencyCount = 0;
+	Stats.RiftStrayFragmentPositiveSiblingAdjacencyCount = 0;
+	Stats.RiftStrayFragmentRecipientCandidateConsideredCount = 0;
+	Stats.RiftStrayFragmentRecipientIncoherenceRejectedCount = 0;
+	Stats.RiftStrayFragmentIncoherentForcedAssignmentCount = 0;
+	Stats.RiftLargestFragmentCausingRecipientGrowthSize = 0;
+	Stats.RiftLocalizedRestoredPreviousPlateIds.Reset();
+	Stats.RiftLocalizedRestoredPreviousPlateCounts.Reset();
+	Stats.RiftChildAnchorSampleIndices.Reset();
+	Stats.RiftChildComponentCountsBeforeSuppression.Reset();
+	Stats.RiftChildComponentCountsAfterSuppression.Reset();
+	Stats.RiftStrayFragmentRecipientPlateIds.Reset();
+	Stats.RiftStrayFragmentRecipientTypeCodes.Reset();
+	Stats.RiftStrayFragmentSiblingEdgeCounts.Reset();
+	Stats.RiftStrayFragmentSizes.Reset();
+	Stats.RiftStrayFragmentRecipientComponentsBefore.Reset();
+	Stats.RiftStrayFragmentRecipientComponentsAfter.Reset();
+	Stats.RiftPositiveGrowthPlateIds.Reset();
+	Stats.RiftPositiveGrowthPlateTypeCodes.Reset();
+	Stats.RiftPositiveGrowthPlateComponentsBefore.Reset();
+	Stats.RiftPositiveGrowthPlateComponentsAfter.Reset();
+	Stats.RiftPositiveGrowthPlateLargestFragmentSizes.Reset();
 	Stats.bRiftWasAutomatic = false;
 	Stats.RiftMs = 0.0;
 	Stats.RiftParentContinentalFraction = 0.0;
@@ -6140,6 +10801,7 @@ void FTectonicPlanet::PerformResampling(
 		Stats.RiftChildSampleCountB = PendingRiftEvent.ChildSampleCountB;
 		Stats.RiftEventSeed = PendingRiftEvent.EventSeed;
 		Stats.RiftChildPlateIds = PendingRiftEvent.ChildPlateIds;
+		Stats.RiftChildAnchorSampleIndices = PendingRiftEvent.ChildAnchorSampleIndices;
 		Stats.RiftChildSampleCounts = PendingRiftEvent.ChildSampleCounts;
 		Stats.RiftParentContinentalFraction = PendingRiftEvent.ParentContinentalFraction;
 		Stats.RiftTriggerProbability = PendingRiftEvent.TriggerProbability;
@@ -6161,6 +10823,27 @@ void FTectonicPlanet::PerformResampling(
 		Stats.RiftMs = PendingRiftEvent.RiftMs;
 	}
 	const double TotalStartTime = FPlatformTime::Seconds();
+	const bool bTrackTopologyAttribution =
+		TriggerReason == EResampleTriggerReason::CollisionFollowup ||
+		TriggerReason == EResampleTriggerReason::RiftFollowup;
+	const int32 PendingCollisionPlateAAtStart =
+		TriggerReason == EResampleTriggerReason::CollisionFollowup
+			? (PendingGeometricCollisionEvent.bValid
+					? PendingGeometricCollisionEvent.PlateA
+					: (PendingBoundaryContactCollisionEvent.bValid ? PendingBoundaryContactCollisionEvent.PlateA : INDEX_NONE))
+			: INDEX_NONE;
+	const int32 PendingCollisionPlateBAtStart =
+		TriggerReason == EResampleTriggerReason::CollisionFollowup
+			? (PendingGeometricCollisionEvent.bValid
+					? PendingGeometricCollisionEvent.PlateB
+					: (PendingBoundaryContactCollisionEvent.bValid ? PendingBoundaryContactCollisionEvent.PlateB : INDEX_NONE))
+			: INDEX_NONE;
+	FPlateComponentCountSummary TopologyBeforeSummary;
+	if (bTrackTopologyAttribution)
+	{
+		ComputePlateComponentCountSummary(*this, nullptr, TopologyBeforeSummary);
+		Stats.TopologyGlobalMaxComponentsBefore = TopologyBeforeSummary.GlobalMaxComponents;
+	}
 	const TArray<FTerrane> PreviousTerranes = Terranes;
 	TArray<int32> PreviousPlateAssignments;
 	PreviousPlateAssignments.Reserve(Samples.Num());
@@ -6173,6 +10856,7 @@ void FTectonicPlanet::PerformResampling(
 		PreviousPlateAssignments.Add(Sample.PlateId);
 		PreviousContinentalWeights.Add(Sample.ContinentalWeight);
 		PreviousTerraneAssignments.Add(Sample.TerraneId);
+		Stats.ContinentalSamplesBefore += Sample.ContinentalWeight >= 0.5f ? 1 : 0;
 	}
 
 	const double SoupStartTime = FPlatformTime::Seconds();
@@ -6185,6 +10869,10 @@ void FTectonicPlanet::PerformResampling(
 	TArray<FVector3d> BarycentricCoords;
 	TArray<uint8> GapFlags;
 	TArray<uint8> OverlapFlags;
+	TArray<uint8> PreserveOwnershipCWRetainFlags;
+	TArray<uint8> PreserveOwnershipFallbackQueryFlags;
+	TArray<uint8> RiftLocalizedRestoreFlags;
+	TArray<EGapResolutionPath> GapResolutionPaths;
 	TArray<TArray<int32>> OverlapPlateIds;
 	TArray<float> InterpolatedSubductionDistances;
 	TArray<float> InterpolatedSubductionSpeeds;
@@ -6199,8 +10887,15 @@ void FTectonicPlanet::PerformResampling(
 		Stats.OverlapCount,
 		&OverlapPlateIds,
 		&Stats,
-		OwnershipMode);
+		OwnershipMode,
+		&PreserveOwnershipCWRetainFlags,
+		&PreserveOwnershipFallbackQueryFlags);
 	Stats.OwnershipQueryMs = (FPlatformTime::Seconds() - OwnershipStartTime) * 1000.0;
+	TArray<int32> InterpolationPlateIds;
+	if (TriggerReason == EResampleTriggerReason::RiftFollowup && PendingRiftEvent.bValid)
+	{
+		InterpolationPlateIds = NewPlateIds;
+	}
 	check(Stats.TrueGapCount == Stats.GapCount);
 	check(Stats.ExactMultiHitCount == Stats.OverlapCount);
 	check(Stats.ExactSingleHitCount + Stats.ExactMultiHitCount + Stats.RecoveryContainmentCount + Stats.TrueGapCount == Samples.Num());
@@ -6231,25 +10926,87 @@ void FTectonicPlanet::PerformResampling(
 		InterpolatedSubductionDistances,
 		InterpolatedSubductionSpeeds,
 		&Stats.MissingLocalCarriedLookupCount);
+	ApplyPreserveOwnershipContinentalWeightRetention(
+		PreserveOwnershipCWRetainFlags,
+		PreviousContinentalWeights,
+		OwnershipMode,
+		TriggerReason,
+		&Stats);
+	if (TriggerReason == EResampleTriggerReason::RiftFollowup && PendingRiftEvent.bValid)
+	{
+		for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+		{
+			const bool bWasContinental = PreviousContinentalWeights[SampleIndex] >= 0.5f;
+			const bool bInterpolatedContinental = Samples[SampleIndex].ContinentalWeight >= 0.5f;
+			Stats.RiftInterpolationCreatedGainCount +=
+				(!bWasContinental && bInterpolatedContinental) ? 1 : 0;
+		}
+	}
 	Stats.InterpolationMs = (FPlatformTime::Seconds() - InterpolationStartTime) * 1000.0;
 
 	const double GapResolutionStartTime = FPlatformTime::Seconds();
-	ResolveGaps(NewPlateIds, GapFlags, InterpolatedSubductionDistances, InterpolatedSubductionSpeeds, &Stats);
+	ResolveGaps(
+		NewPlateIds,
+		GapFlags,
+		InterpolatedSubductionDistances,
+		InterpolatedSubductionSpeeds,
+		&Stats,
+		&GapResolutionPaths);
+	ApplyPreserveOwnershipFallbackSamePlateRetention(
+		NewPlateIds,
+		PreviousPlateAssignments,
+		PreviousContinentalWeights,
+		PreserveOwnershipFallbackQueryFlags,
+		GapResolutionPaths,
+		OwnershipMode,
+		TriggerReason,
+		&Stats);
 	Stats.GapResolutionMs = (FPlatformTime::Seconds() - GapResolutionStartTime) * 1000.0;
 
 	if (TriggerReason == EResampleTriggerReason::RiftFollowup && PendingRiftEvent.bValid)
 	{
-		// M5a keeps the immediate topology refresh local to the freshly split parent:
-		// refresh interpolation/soups/gap handling globally, but preserve existing
-		// non-gap ownership elsewhere so plate birth does not cause broad territory churn.
-		for (int32 SampleIndex = 0; SampleIndex < NewPlateIds.Num(); ++SampleIndex)
-		{
-			if (GapFlags.IsValidIndex(SampleIndex) && GapFlags[SampleIndex] == 0)
+			ApplyRiftFollowupLocalizationOverride(
+				NewPlateIds,
+				PreviousPlateAssignments,
+				PreviousContinentalWeights,
+				&GapFlags,
+				&OverlapFlags,
+				&OverlapPlateIds,
+				&InterpolatedSubductionDistances,
+				&InterpolatedSubductionSpeeds,
+				&GapResolutionPaths,
+				&RiftLocalizedRestoreFlags,
+				&Stats);
+			ApplyRiftChildCoherenceProtection(
+				NewPlateIds,
+				PreviousPlateAssignments,
+			&GapFlags,
+			&OverlapFlags,
+			&OverlapPlateIds,
+				&GapResolutionPaths,
+				&Stats);
+			if (InterpolationPlateIds.Num() == NewPlateIds.Num())
 			{
-				NewPlateIds[SampleIndex] = PreviousPlateAssignments[SampleIndex];
+				for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+				{
+					const bool bWasContinental = PreviousContinentalWeights[SampleIndex] >= 0.5f;
+					const bool bIsContinental = Samples[SampleIndex].ContinentalWeight >= 0.5f;
+					Stats.RiftFinalOwnerMismatchGainCountAfterLocalization +=
+						(!bWasContinental &&
+							bIsContinental &&
+							InterpolationPlateIds[SampleIndex] != NewPlateIds[SampleIndex])
+							? 1
+							: 0;
+				}
 			}
+			ApplyRiftFollowupFinalOwnerContinentalWeightReconciliation(
+				InterpolationPlateIds,
+				NewPlateIds,
+				PreviousPlateAssignments,
+				PreviousContinentalWeights,
+				RiftLocalizedRestoreFlags,
+				&Stats);
 		}
-	}
 
 	const double OverlapClassificationStartTime = FPlatformTime::Seconds();
 	ClassifyOverlapsImpl(*this, OverlapFlags, NewPlateIds, &OverlapPlateIds, Stats);
@@ -6258,6 +11015,11 @@ void FTectonicPlanet::PerformResampling(
 	FCollisionEvent CollisionEvent;
 	const double CollisionStartTime = FPlatformTime::Seconds();
 	const bool bUsePreserveBoundaryContactTrigger = OwnershipMode == EResampleOwnershipMode::PreserveOwnership;
+	FPendingGeometricCollisionEvent GeometricCollisionEvent;
+	if (bUsePreserveBoundaryContactTrigger)
+	{
+		DetectGeometricCollisionOverlapDiagnostics(NewPlateIds, &Stats, &GeometricCollisionEvent);
+	}
 	if (!bUsePreserveBoundaryContactTrigger)
 	{
 		DetectAndApplyCollision(
@@ -6284,6 +11046,15 @@ void FTectonicPlanet::PerformResampling(
 		Stats.CollisionSurgeMeanElevationDelta = 0.0;
 	}
 
+	ApplyFullResolutionSamePlateContinentalWeightRetention(
+		NewPlateIds,
+		PreviousPlateAssignments,
+		PreviousContinentalWeights,
+		GapResolutionPaths,
+		OwnershipMode,
+		TriggerReason,
+		&Stats);
+
 	const double RepartitionStartTime = FPlatformTime::Seconds();
 	RepartitionMembership(NewPlateIds, &InterpolatedSubductionDistances, &InterpolatedSubductionSpeeds);
 	Stats.RepartitionMs = (FPlatformTime::Seconds() - RepartitionStartTime) * 1000.0;
@@ -6296,10 +11067,437 @@ void FTectonicPlanet::PerformResampling(
 		}
 	}
 
+	if (bTrackTopologyAttribution)
+	{
+		FPlateComponentCountSummary TopologyAfterSummary;
+		ComputePlateComponentCountSummary(*this, nullptr, TopologyAfterSummary);
+		Stats.TopologyGlobalMaxComponentsAfter = TopologyAfterSummary.GlobalMaxComponents;
+
+		const auto SetAffectedPlateMetrics = [&Stats, &TopologyBeforeSummary, &TopologyAfterSummary](
+			const int32 PrimaryPlateId,
+			const int32 SecondaryPlateId)
+		{
+			Stats.TopologyPrimaryAffectedPlateId = PrimaryPlateId;
+			Stats.TopologyPrimaryAffectedPlateComponentsBefore =
+				TopologyBeforeSummary.ComponentsByPlate.FindRef(PrimaryPlateId);
+			Stats.TopologyPrimaryAffectedPlateComponentsAfter =
+				TopologyAfterSummary.ComponentsByPlate.FindRef(PrimaryPlateId);
+			Stats.TopologySecondaryAffectedPlateId = SecondaryPlateId;
+			Stats.TopologySecondaryAffectedPlateComponentsBefore =
+				TopologyBeforeSummary.ComponentsByPlate.FindRef(SecondaryPlateId);
+			Stats.TopologySecondaryAffectedPlateComponentsAfter =
+				TopologyAfterSummary.ComponentsByPlate.FindRef(SecondaryPlateId);
+		};
+
+		if (TriggerReason == EResampleTriggerReason::CollisionFollowup)
+		{
+			int32 ReceiverPlateId = Stats.CollisionOverridingPlateId;
+			int32 DonorPlateId = Stats.CollisionSubductingPlateId;
+			if (ReceiverPlateId == INDEX_NONE || DonorPlateId == INDEX_NONE)
+			{
+				if (PendingGeometricCollisionEvent.bValid)
+				{
+					ReceiverPlateId = PendingGeometricCollisionEvent.OverridingPlateId;
+					DonorPlateId = PendingGeometricCollisionEvent.SubductingPlateId;
+				}
+				else if (PendingCollisionPlateAAtStart != INDEX_NONE && PendingCollisionPlateBAtStart != INDEX_NONE)
+				{
+					ReceiverPlateId =
+						IsOverridingPlate(*this, PendingCollisionPlateAAtStart, PendingCollisionPlateBAtStart)
+							? PendingCollisionPlateAAtStart
+							: PendingCollisionPlateBAtStart;
+					DonorPlateId =
+						ReceiverPlateId == PendingCollisionPlateAAtStart
+							? PendingCollisionPlateBAtStart
+							: PendingCollisionPlateAAtStart;
+				}
+			}
+
+			SetAffectedPlateMetrics(ReceiverPlateId, DonorPlateId);
+			Stats.CollisionDonorComponentsBefore =
+				TopologyBeforeSummary.ComponentsByPlate.FindRef(DonorPlateId);
+			Stats.CollisionDonorComponentsAfter =
+				TopologyAfterSummary.ComponentsByPlate.FindRef(DonorPlateId);
+			Stats.CollisionReceiverComponentsBefore =
+				TopologyBeforeSummary.ComponentsByPlate.FindRef(ReceiverPlateId);
+			Stats.CollisionReceiverComponentsAfter =
+				TopologyAfterSummary.ComponentsByPlate.FindRef(ReceiverPlateId);
+			if (CollisionEvent.bDetected)
+			{
+				TArray<int32> CanonicalPlateAssignments;
+				CanonicalPlateAssignments.Reserve(Samples.Num());
+				for (const FSample& Sample : Samples)
+				{
+					CanonicalPlateAssignments.Add(Sample.PlateId);
+				}
+
+				const FDonorFragmentationDiagnostics DonorDiagnostics =
+					ComputeDonorFragmentationDiagnostics(
+						*this,
+						PreviousPlateAssignments,
+						CanonicalPlateAssignments,
+						DonorPlateId);
+				Stats.CollisionDonorLargestRemainingComponentSize =
+					DonorDiagnostics.LargestRemainingComponentSize;
+				Stats.CollisionDonorNewFragmentCount = DonorDiagnostics.NewFragmentCount;
+				Stats.CollisionDonorSmallestNewFragmentSize =
+					DonorDiagnostics.SmallestNewFragmentSize;
+				Stats.CollisionDonorLargestNewFragmentSize =
+					DonorDiagnostics.LargestNewFragmentSize;
+				Stats.CollisionDonorMeanNewFragmentSize =
+					DonorDiagnostics.MeanNewFragmentSize;
+				Stats.CollisionAcceptedTerraneSampleCount =
+					CollisionEvent.TerraneSampleIndices.Num();
+
+				const FCollisionReceiverContiguityDiagnostics ReceiverDiagnostics =
+					ComputeCollisionReceiverContiguityDiagnostics(
+						*this,
+						PreviousPlateAssignments,
+						&CanonicalPlateAssignments,
+						ReceiverPlateId,
+						CollisionEvent.TerraneSampleIndices,
+						TopologyBeforeSummary,
+						TopologyAfterSummary);
+				Stats.CollisionReceiverComponentsBefore = ReceiverDiagnostics.ReceiverComponentsBefore;
+				Stats.CollisionReceiverComponentsAfter = ReceiverDiagnostics.ReceiverComponentsAfter;
+				Stats.bCollisionReceiverTransferContiguousWithExistingTerritory =
+					ReceiverDiagnostics.bContiguousWithExistingTerritory;
+				Stats.CollisionReceiverDisconnectedFragmentCount =
+					ReceiverDiagnostics.DisconnectedFragmentCount;
+				Stats.CollisionReceiverLargestNewDisconnectedFragmentSize =
+					ReceiverDiagnostics.LargestNewDisconnectedFragmentSize;
+			}
+		}
+		else if (TriggerReason == EResampleTriggerReason::RiftFollowup)
+		{
+			Stats.RiftParentComponentsBefore =
+				TopologyBeforeSummary.ComponentsByPlate.FindRef(Stats.RiftParentPlateId);
+			Stats.RiftParentComponentsAfter =
+				TopologyAfterSummary.ComponentsByPlate.FindRef(Stats.RiftParentPlateId);
+			Stats.RiftChildComponentCountsBefore.Reset();
+			Stats.RiftChildComponentCountsAfter.Reset();
+			Stats.RiftChildComponentCountsBefore.Reserve(Stats.RiftChildPlateIds.Num());
+			Stats.RiftChildComponentCountsAfter.Reserve(Stats.RiftChildPlateIds.Num());
+			TSet<int32> UniqueAffectedPlateIds;
+			if (Stats.RiftParentPlateId != INDEX_NONE)
+			{
+				UniqueAffectedPlateIds.Add(Stats.RiftParentPlateId);
+			}
+
+			for (const int32 ChildPlateId : Stats.RiftChildPlateIds)
+			{
+				const int32 ChildBefore = TopologyBeforeSummary.ComponentsByPlate.FindRef(ChildPlateId);
+				const int32 ChildAfter = TopologyAfterSummary.ComponentsByPlate.FindRef(ChildPlateId);
+				Stats.RiftChildComponentCountsBefore.Add(ChildBefore);
+				Stats.RiftChildComponentCountsAfter.Add(ChildAfter);
+				UniqueAffectedPlateIds.Add(ChildPlateId);
+			}
+
+			TMap<int32, int32> ReassignmentTypeByPlateId;
+			TMap<int32, int32> LargestReassignedFragmentByPlateId;
+			for (int32 Index = 0; Index < Stats.RiftStrayFragmentRecipientPlateIds.Num(); ++Index)
+			{
+				const int32 RecipientPlateId = Stats.RiftStrayFragmentRecipientPlateIds[Index];
+				const int32 RecipientTypeCode =
+					Stats.RiftStrayFragmentRecipientTypeCodes.IsValidIndex(Index)
+						? Stats.RiftStrayFragmentRecipientTypeCodes[Index]
+						: static_cast<int32>(ERiftRecipientTypeCode::OtherNeighbor);
+				const int32 FragmentSize =
+					Stats.RiftStrayFragmentSizes.IsValidIndex(Index)
+						? Stats.RiftStrayFragmentSizes[Index]
+						: 0;
+				ReassignmentTypeByPlateId.Add(RecipientPlateId, RecipientTypeCode);
+				LargestReassignedFragmentByPlateId.FindOrAdd(RecipientPlateId) = FMath::Max(
+					LargestReassignedFragmentByPlateId.FindRef(RecipientPlateId),
+					FragmentSize);
+			}
+
+			Stats.RiftPositiveGrowthPlateIds.Reset();
+			Stats.RiftPositiveGrowthPlateTypeCodes.Reset();
+			Stats.RiftPositiveGrowthPlateComponentsBefore.Reset();
+			Stats.RiftPositiveGrowthPlateComponentsAfter.Reset();
+			Stats.RiftPositiveGrowthPlateLargestFragmentSizes.Reset();
+
+			TSet<int32> CandidateGrowthPlateIds;
+			for (const TPair<int32, int32>& Pair : TopologyBeforeSummary.ComponentsByPlate)
+			{
+				CandidateGrowthPlateIds.Add(Pair.Key);
+			}
+			for (const TPair<int32, int32>& Pair : TopologyAfterSummary.ComponentsByPlate)
+			{
+				CandidateGrowthPlateIds.Add(Pair.Key);
+			}
+			for (const int32 PlateId : Stats.RiftStrayFragmentRecipientPlateIds)
+			{
+				CandidateGrowthPlateIds.Add(PlateId);
+			}
+
+			struct FGrowthPlateRecord
+			{
+				int32 PlateId = INDEX_NONE;
+				int32 ComponentsBefore = 0;
+				int32 ComponentsAfter = 0;
+				int32 TypeCode = static_cast<int32>(ERiftRecipientTypeCode::OtherAffectedPlate);
+				int32 LargestFragmentSize = 0;
+			};
+
+			TArray<FGrowthPlateRecord> PositiveGrowthRecords;
+			for (const int32 PlateId : CandidateGrowthPlateIds)
+			{
+				if (PlateId == INDEX_NONE)
+				{
+					continue;
+				}
+
+				const int32 ComponentsBefore = TopologyBeforeSummary.ComponentsByPlate.FindRef(PlateId);
+				const int32 ComponentsAfter = TopologyAfterSummary.ComponentsByPlate.FindRef(PlateId);
+				if (ComponentsAfter <= ComponentsBefore)
+				{
+					continue;
+				}
+
+				FGrowthPlateRecord& Record = PositiveGrowthRecords.Emplace_GetRef();
+				Record.PlateId = PlateId;
+				Record.ComponentsBefore = ComponentsBefore;
+				Record.ComponentsAfter = ComponentsAfter;
+				Record.TypeCode = ReassignmentTypeByPlateId.FindRef(PlateId);
+				if (!ReassignmentTypeByPlateId.Contains(PlateId))
+				{
+					Record.TypeCode = static_cast<int32>(ERiftRecipientTypeCode::OtherAffectedPlate);
+				}
+				Record.LargestFragmentSize = LargestReassignedFragmentByPlateId.FindRef(PlateId);
+			}
+
+			PositiveGrowthRecords.Sort([](const FGrowthPlateRecord& A, const FGrowthPlateRecord& B)
+			{
+				const int32 DeltaA = A.ComponentsAfter - A.ComponentsBefore;
+				const int32 DeltaB = B.ComponentsAfter - B.ComponentsBefore;
+				return
+					DeltaA > DeltaB ||
+					(DeltaA == DeltaB && A.PlateId < B.PlateId);
+			});
+
+			for (const FGrowthPlateRecord& Record : PositiveGrowthRecords)
+			{
+				Stats.RiftPositiveGrowthPlateIds.Add(Record.PlateId);
+				Stats.RiftPositiveGrowthPlateTypeCodes.Add(Record.TypeCode);
+				Stats.RiftPositiveGrowthPlateComponentsBefore.Add(Record.ComponentsBefore);
+				Stats.RiftPositiveGrowthPlateComponentsAfter.Add(Record.ComponentsAfter);
+				Stats.RiftPositiveGrowthPlateLargestFragmentSizes.Add(Record.LargestFragmentSize);
+			}
+
+			if (!PositiveGrowthRecords.IsEmpty())
+			{
+				Stats.TopologyPrimaryAffectedPlateId = PositiveGrowthRecords[0].PlateId;
+				Stats.TopologyPrimaryAffectedPlateComponentsBefore = PositiveGrowthRecords[0].ComponentsBefore;
+				Stats.TopologyPrimaryAffectedPlateComponentsAfter = PositiveGrowthRecords[0].ComponentsAfter;
+			}
+			else
+			{
+				Stats.TopologyPrimaryAffectedPlateId = INDEX_NONE;
+				Stats.TopologyPrimaryAffectedPlateComponentsBefore = 0;
+				Stats.TopologyPrimaryAffectedPlateComponentsAfter = 0;
+			}
+			if (PositiveGrowthRecords.Num() > 1)
+			{
+				Stats.TopologySecondaryAffectedPlateId = PositiveGrowthRecords[1].PlateId;
+				Stats.TopologySecondaryAffectedPlateComponentsBefore = PositiveGrowthRecords[1].ComponentsBefore;
+				Stats.TopologySecondaryAffectedPlateComponentsAfter = PositiveGrowthRecords[1].ComponentsAfter;
+			}
+			else
+			{
+				Stats.TopologySecondaryAffectedPlateId = INDEX_NONE;
+				Stats.TopologySecondaryAffectedPlateComponentsBefore = 0;
+				Stats.TopologySecondaryAffectedPlateComponentsAfter = 0;
+			}
+			for (const int32 AffectedPlateId : UniqueAffectedPlateIds)
+			{
+				Stats.RiftAffectedPlateCountBefore +=
+					TopologyBeforeSummary.ComponentsByPlate.FindRef(AffectedPlateId) > 0 ? 1 : 0;
+				Stats.RiftAffectedPlateCountAfter +=
+					TopologyAfterSummary.ComponentsByPlate.FindRef(AffectedPlateId) > 0 ? 1 : 0;
+			}
+		}
+	}
+
+	TArray<uint8> PostRepartitionContinentalMask;
+	PostRepartitionContinentalMask.SetNumZeroed(Samples.Num());
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		const bool bWasContinental = PreviousContinentalWeights[SampleIndex] >= 0.5f;
+		const bool bIsContinentalAfterRepartition = Samples[SampleIndex].ContinentalWeight >= 0.5f;
+		PostRepartitionContinentalMask[SampleIndex] = bIsContinentalAfterRepartition ? 1 : 0;
+		Stats.AndeanContinentalGainCount += (!bWasContinental && bIsContinentalAfterRepartition) ? 1 : 0;
+	}
+
 	if (!bUsePreserveBoundaryContactTrigger)
 	{
 		ApplyCollisionElevationSurge(CollisionEvent, &Stats);
+		if (Stats.CollisionCount > 0 &&
+			Stats.CollisionOverridingPlateId != INDEX_NONE &&
+			Stats.CollisionSubductingPlateId != INDEX_NONE)
+		{
+			const uint64 ExecutedPairKey = MakeBoundaryContactPlatePairKey(
+				Stats.CollisionOverridingPlateId,
+				Stats.CollisionSubductingPlateId);
+			CollisionLastExecutionOrdinalByPair.Add(ExecutedPairKey, ResamplingExecutionOrdinal);
+		}
 	}
+
+	TMap<uint64, int32> PreserveFallbackChangedOwnerLossPairCounts;
+	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
+	{
+		const bool bIsContinentalFinal = Samples[SampleIndex].ContinentalWeight >= 0.5f;
+		Stats.CollisionContinentalGainCount +=
+			(PostRepartitionContinentalMask[SampleIndex] == 0 && bIsContinentalFinal) ? 1 : 0;
+		Stats.ContinentalSamplesAfter += bIsContinentalFinal ? 1 : 0;
+		Stats.ContinentalSamplesLost +=
+			(PreviousContinentalWeights[SampleIndex] >= 0.5f && !bIsContinentalFinal) ? 1 : 0;
+		Stats.FormerContinentalSamplesTurnedOceanic +=
+			(PreviousContinentalWeights[SampleIndex] >= 0.5f &&
+				GapFlags.IsValidIndex(SampleIndex) &&
+				GapFlags[SampleIndex] != 0 &&
+				!bIsContinentalFinal)
+				? 1
+				: 0;
+		if (PreviousContinentalWeights[SampleIndex] >= 0.5f && !bIsContinentalFinal)
+		{
+			const EGapResolutionPath GapResolutionPath =
+				GapResolutionPaths.IsValidIndex(SampleIndex) ? GapResolutionPaths[SampleIndex] : EGapResolutionPath::None;
+			const bool bSamePlate = Samples[SampleIndex].PlateId == PreviousPlateAssignments[SampleIndex];
+			const bool bFallbackQueried =
+				PreserveOwnershipFallbackQueryFlags.IsValidIndex(SampleIndex) &&
+				PreserveOwnershipFallbackQueryFlags[SampleIndex] != 0;
+			if (OwnershipMode == EResampleOwnershipMode::PreserveOwnership && bFallbackQueried)
+			{
+				++Stats.PreserveOwnershipFallbackStrongLossGE050Count;
+				Stats.PreserveOwnershipFallbackStrongLossGE075Count +=
+					PreviousContinentalWeights[SampleIndex] >= 0.75f ? 1 : 0;
+				Stats.PreserveOwnershipFallbackStrongLossGE090Count +=
+					PreviousContinentalWeights[SampleIndex] >= 0.90f ? 1 : 0;
+
+				switch (GapResolutionPath)
+				{
+				case EGapResolutionPath::None:
+					if (!bSamePlate)
+					{
+						++Stats.PreserveOwnershipFallbackChangedOwnerNonGapLossCount;
+						const uint64 PairKey = MakeOwnerTransitionKey(
+							PreviousPlateAssignments[SampleIndex],
+							Samples[SampleIndex].PlateId);
+						PreserveFallbackChangedOwnerLossPairCounts.FindOrAdd(PairKey)++;
+					}
+					break;
+				case EGapResolutionPath::DivergentOceanized:
+					++Stats.PreserveOwnershipFallbackDivergentLossCount;
+					break;
+				case EGapResolutionPath::NonDivergentProjection:
+					++Stats.PreserveOwnershipFallbackNonDivergentProjectionLossCount;
+					break;
+				case EGapResolutionPath::NonDivergentFallbackOceanized:
+					++Stats.PreserveOwnershipFallbackNonDivergentFallbackOceanizedLossCount;
+					break;
+				default:
+					break;
+				}
+			}
+			if (GapResolutionPath == EGapResolutionPath::NonDivergentProjection)
+			{
+				++Stats.FormerContinentalProjectionRecoveredNonContinentalFinalCount;
+				Stats.FormerContinentalProjectionRecoveredSamePlateNonContinentalFinalCount += bSamePlate ? 1 : 0;
+				Stats.FormerContinentalProjectionRecoveredChangedPlateNonContinentalFinalCount += bSamePlate ? 0 : 1;
+				Stats.FormerContinentalProjectionRecoveredPreserveModeNonContinentalFinalCount +=
+					(OwnershipMode == EResampleOwnershipMode::PreserveOwnership) ? 1 : 0;
+				Stats.FormerContinentalProjectionRecoveredFullResolutionNonContinentalFinalCount +=
+					(OwnershipMode == EResampleOwnershipMode::FullResolution) ? 1 : 0;
+			}
+			else if (GapResolutionPath == EGapResolutionPath::NonDivergentNearestCopy)
+			{
+				++Stats.FormerContinentalNearestCopyRecoveredNonContinentalFinalCount;
+			}
+			else if (GapResolutionPath == EGapResolutionPath::None)
+			{
+				++Stats.FormerContinentalNonGapReclassifiedNonContinentalFinalCount;
+				Stats.FormerContinentalChangedPlateNonContinentalFinalCount += bSamePlate ? 0 : 1;
+				Stats.FormerContinentalFullResolutionNonContinentalFinalCount +=
+					(OwnershipMode == EResampleOwnershipMode::FullResolution) ? 1 : 0;
+				if (OwnershipMode == EResampleOwnershipMode::FullResolution)
+				{
+					Stats.FullResolutionSamePlateNonContinentalFinalCount += bSamePlate ? 1 : 0;
+					Stats.FullResolutionChangedPlateNonContinentalFinalCount += bSamePlate ? 0 : 1;
+					switch (TriggerReason)
+					{
+					case EResampleTriggerReason::CollisionFollowup:
+						Stats.FullResolutionCollisionFollowupSamePlateNonContinentalCount +=
+							bSamePlate ? 1 : 0;
+						Stats.FullResolutionCollisionFollowupChangedPlateNonContinentalCount +=
+							bSamePlate ? 0 : 1;
+						break;
+					case EResampleTriggerReason::RiftFollowup:
+						Stats.FullResolutionRiftFollowupSamePlateNonContinentalCount +=
+							bSamePlate ? 1 : 0;
+						Stats.FullResolutionRiftFollowupChangedPlateNonContinentalCount +=
+							bSamePlate ? 0 : 1;
+						break;
+					default:
+						Stats.FullResolutionOtherTriggerSamePlateNonContinentalCount +=
+							bSamePlate ? 1 : 0;
+						Stats.FullResolutionOtherTriggerChangedPlateNonContinentalCount +=
+							bSamePlate ? 0 : 1;
+						break;
+					}
+				}
+				Stats.FormerContinentalPreserveModeNonGapNonContinentalFinalCount +=
+					(OwnershipMode == EResampleOwnershipMode::PreserveOwnership) ? 1 : 0;
+				Stats.FormerContinentalFallbackQueryNonContinentalFinalCount += bFallbackQueried ? 1 : 0;
+			}
+		}
+	}
+	if (!PreserveFallbackChangedOwnerLossPairCounts.IsEmpty())
+	{
+		TArray<TPair<uint64, int32>> SortedLossPairs;
+		SortedLossPairs.Reserve(PreserveFallbackChangedOwnerLossPairCounts.Num());
+		for (const TPair<uint64, int32>& Pair : PreserveFallbackChangedOwnerLossPairCounts)
+		{
+			SortedLossPairs.Add(Pair);
+		}
+
+		SortedLossPairs.Sort([](const TPair<uint64, int32>& A, const TPair<uint64, int32>& B)
+		{
+			return
+				A.Value > B.Value ||
+				(A.Value == B.Value && A.Key < B.Key);
+		});
+
+		const int32 PairLimit = FMath::Min(SortedLossPairs.Num(), 5);
+		Stats.PreserveOwnershipFallbackLossPairPreviousPlateIds.Reserve(PairLimit);
+		Stats.PreserveOwnershipFallbackLossPairFinalPlateIds.Reserve(PairLimit);
+		Stats.PreserveOwnershipFallbackLossPairCounts.Reserve(PairLimit);
+		for (int32 PairIndex = 0; PairIndex < PairLimit; ++PairIndex)
+		{
+			Stats.PreserveOwnershipFallbackLossPairPreviousPlateIds.Add(
+				DecodeOwnerTransitionPreviousPlateId(SortedLossPairs[PairIndex].Key));
+			Stats.PreserveOwnershipFallbackLossPairFinalPlateIds.Add(
+				DecodeOwnerTransitionFinalPlateId(SortedLossPairs[PairIndex].Key));
+			Stats.PreserveOwnershipFallbackLossPairCounts.Add(SortedLossPairs[PairIndex].Value);
+		}
+	}
+	Stats.NetContinentalSampleDelta = Stats.ContinentalSamplesAfter - Stats.ContinentalSamplesBefore;
+	if (Stats.CollisionCount > 0)
+	{
+		if (Stats.bUsedGeometricCollisionExecution)
+		{
+			Stats.GeometricCollisionExecutedCollisionGainCount = Stats.CollisionContinentalGainCount;
+		}
+		else if (Stats.bUsedCachedBoundaryContactCollision)
+		{
+			Stats.BoundaryContactFallbackCollisionGainCount = Stats.CollisionContinentalGainCount;
+			Stats.BoundaryContactFallbackTerraneRecoveredCount = Stats.CollisionTerraneSampleCount;
+			Stats.BoundaryContactFallbackCWBoostedCount = Stats.CollisionCWBoostedCount;
+			Stats.BoundaryContactFallbackSurgeAffectedCount = Stats.CollisionSurgeAffectedCount;
+		}
+	}
+
 	ComputePlateScores();
 	if (bUsePreserveBoundaryContactTrigger)
 	{
@@ -6307,8 +11505,19 @@ void FTectonicPlanet::PerformResampling(
 		const bool bImmediateBoundaryContactTrigger =
 			DetectBoundaryContactCollisionTrigger(&Stats, &BoundaryContactCollisionEvent);
 		const bool bPersistenceBoundaryContactTrigger = UpdateBoundaryContactCollisionPersistence(Stats, ResampleInterval);
-		if (bImmediateBoundaryContactTrigger || bPersistenceBoundaryContactTrigger)
+		if (GeometricCollisionEvent.bValid)
 		{
+			PendingGeometricCollisionEvent = GeometricCollisionEvent;
+			PendingBoundaryContactCollisionEvent = FPendingBoundaryContactCollisionEvent{};
+			bPendingFullResolutionResample = true;
+			if (bPersistenceBoundaryContactTrigger)
+			{
+				bPendingBoundaryContactPersistenceReset = true;
+			}
+		}
+		else if (bImmediateBoundaryContactTrigger || bPersistenceBoundaryContactTrigger)
+		{
+			PendingGeometricCollisionEvent = FPendingGeometricCollisionEvent{};
 			if (BoundaryContactCollisionEvent.bValid)
 			{
 				BoundaryContactCollisionEvent.PeakZoneSize = Stats.BoundaryContactLargestZoneSize;
@@ -6394,6 +11603,12 @@ void FTectonicPlanet::PerformResampling(
 			*PreRiftTouchedChildCountsString);
 	}
 
+	PopulateCanonicalSampleMetrics(*this, Stats);
+	if (bTrackTopologyAttribution)
+	{
+		Stats.TopologyGlobalMaxComponentsAfter = Stats.MaxComponentsPerPlate;
+	}
+
 	for (FPlate& Plate : Plates)
 	{
 		Plate.CumulativeRotation = FQuat4d::Identity;
@@ -6401,22 +11616,436 @@ void FTectonicPlanet::PerformResampling(
 
 	Stats.TotalMs = (FPlatformTime::Seconds() - TotalStartTime) * 1000.0;
 	LastResamplingStats = Stats;
+	ResamplingHistory.Add(Stats);
 	LastResampleTriggerReason = TriggerReason;
 	LastResampleOwnershipMode = OwnershipMode;
+	const int32 ResampleIndex = ResamplingSteps.Num() + 1;
 	ResamplingSteps.Add(CurrentStep);
 
-	if (TriggerReason == EResampleTriggerReason::CollisionFollowup && bPendingBoundaryContactPersistenceReset)
+	if (TriggerReason == EResampleTriggerReason::CollisionFollowup &&
+		Stats.CollisionCount > 0 &&
+		Stats.CollisionOverridingPlateId != INDEX_NONE &&
+		Stats.CollisionSubductingPlateId != INDEX_NONE)
+	{
+		const uint64 ExecutedPairKey = MakeBoundaryContactPlatePairKey(
+			FMath::Min(Stats.CollisionOverridingPlateId, Stats.CollisionSubductingPlateId),
+			FMath::Max(Stats.CollisionOverridingPlateId, Stats.CollisionSubductingPlateId));
+		GeometricCollisionPairRecurrenceByKey.Remove(ExecutedPairKey);
+	}
+
+	if (TriggerReason == EResampleTriggerReason::CollisionFollowup &&
+		(bPendingBoundaryContactPersistenceReset || Stats.bUsedGeometricCollisionExecution))
 	{
 		ResetBoundaryContactCollisionPersistence();
+		PendingGeometricCollisionEvent = FPendingGeometricCollisionEvent{};
 	}
 	else if (TriggerReason == EResampleTriggerReason::CollisionFollowup)
 	{
 		PendingBoundaryContactCollisionEvent = FPendingBoundaryContactCollisionEvent{};
+		PendingGeometricCollisionEvent = FPendingGeometricCollisionEvent{};
 	}
 	if (TriggerReason == EResampleTriggerReason::RiftFollowup)
 	{
 		PendingRiftEvent = FPendingRiftEvent{};
 	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[ResampleMetrics R=%d Step=%d] continental_area_fraction=%.6f continental_sample_count=%d continental_samples_before=%d continental_samples_after=%d continental_samples_lost=%d former_continental_turned_oceanic=%d former_continental_divergent_gap_count=%d former_continental_non_divergent_gap_count=%d former_continental_non_divergent_gap_projection_resolved_count=%d former_continental_non_divergent_gap_nearest_copy_resolved_count=%d former_continental_non_divergent_fallback_oceanized_count=%d former_continental_divergent_oceanized_count=%d former_continental_projection_recovered_non_continental_final_count=%d former_continental_projection_recovered_same_plate_non_continental_final_count=%d former_continental_projection_recovered_changed_plate_non_continental_final_count=%d former_continental_projection_recovered_preserve_mode_non_continental_final_count=%d former_continental_projection_recovered_full_resolution_non_continental_final_count=%d former_continental_nearest_copy_recovered_non_continental_final_count=%d former_continental_non_gap_reclassified_non_continental_final_count=%d former_continental_changed_plate_non_continental_final_count=%d former_continental_full_resolution_non_continental_final_count=%d former_continental_preserve_mode_non_gap_non_continental_final_count=%d former_continental_fallback_query_non_continental_final_count=%d andean_continental_gain_count=%d collision_continental_gain_count=%d net_continental_sample_delta=%d preserve_cw_retained_count=%d preserve_cw_threshold_crossing_prevented_count=%d overlap_count=%d overlap_rate=%.6f gap_count=%d gap_rate=%.6f divergent_gap_count=%d numerical_gap_count=%d plate_count=%d max_components_per_plate=%d boundary_sample_count=%d boundary_sample_fraction=%.6f elevation_min=%.6f elevation_max=%.6f elevation_mean=%.6f subduction_front_count=%d active_collision_tracks=%d boundary_contact_best_plate_a=%d boundary_contact_best_plate_b=%d boundary_contact_best_zone_size=%d boundary_contact_best_persistence_count=%d geometric_collision_candidate_count=%d geometric_collision_qualified_count=%d geometric_collision_qualified_but_donor_ambiguous_count=%d geometric_collision_qualified_but_donor_seed_empty_count=%d geometric_collision_qualified_using_directional_donor_count=%d geometric_collision_qualified_using_fallback_donor_rule_count=%d geometric_collision_rejected_by_mass_filter_count=%d geometric_collision_rejected_by_overlap_depth_count=%d geometric_collision_rejected_by_overlap_depth_total_overlap_sample_count=%d geometric_collision_rejected_by_overlap_depth_max_overlap_sample_count=%d geometric_collision_rejected_by_overlap_depth_total_terrane_estimate=%d geometric_collision_rejected_by_overlap_depth_max_terrane_estimate=%d geometric_collision_rejected_by_overlap_depth_total_mean_convergence_km_per_my=%.6f geometric_collision_rejected_by_overlap_depth_max_convergence_km_per_my=%.6f geometric_collision_rejected_by_overlap_depth_total_depth_km=%.6f geometric_collision_rejected_by_overlap_depth_max_depth_km=%.6f geometric_collision_rejected_by_persistent_penetration_count=%d geometric_collision_rejected_by_persistent_penetration_total_overlap_sample_count=%d geometric_collision_rejected_by_persistent_penetration_max_overlap_sample_count=%d geometric_collision_rejected_by_persistent_penetration_total_terrane_estimate=%d geometric_collision_rejected_by_persistent_penetration_max_terrane_estimate=%d geometric_collision_rejected_by_persistent_penetration_total_observation_count=%d geometric_collision_rejected_by_persistent_penetration_max_observation_count=%d geometric_collision_rejected_by_persistent_penetration_total_mean_convergence_km_per_my=%.6f geometric_collision_rejected_by_persistent_penetration_max_convergence_km_per_my=%.6f geometric_collision_rejected_by_persistent_penetration_total_accumulated_penetration_km=%.6f geometric_collision_rejected_by_persistent_penetration_max_accumulated_penetration_km=%.6f geometric_collision_rejected_by_persistent_penetration_total_depth_km=%.6f geometric_collision_rejected_by_persistent_penetration_max_depth_km=%.6f geometric_collision_rejected_by_empty_terrane_count=%d geometric_collision_rejected_by_role_resolution_count=%d geometric_collision_rejected_by_seed_direction_count=%d geometric_collision_qualified_directional_count=%d geometric_collision_directional_seed_count=%d geometric_collision_directional_seed_count_opposite=%d geometric_collision_seed_direction_audit_count=%d geometric_collision_seed_direction_mismatch_count=%d geometric_collision_only_overriding_bucket_populated_count=%d geometric_collision_only_subducting_bucket_populated_count=%d geometric_collision_both_directional_buckets_populated_count=%d geometric_collision_neither_directional_buckets_populated_count=%d geometric_collision_polarity_chosen_from_directional_evidence_count=%d geometric_collision_polarity_chosen_from_bidirectional_tie_break_count=%d geometric_collision_fallback_used_count=%d geometric_collision_overlap_sample_count=%d geometric_collision_pair_count=%d geometric_collision_qualified_pair_count=%d geometric_collision_largest_terrane_estimate=%d geometric_collision_best_plate_a=%d geometric_collision_best_plate_b=%d geometric_collision_best_overlap_sample_count=%d geometric_collision_best_terrane_estimate=%d geometric_collision_best_subducting_overlap_sample_count=%d geometric_collision_best_opposing_support_count=%d geometric_collision_best_passed_mass_filter=%d collision_cw_boosted_count=%d used_geometric_collision_execution=%d geometric_collision_executed_plate_a=%d geometric_collision_executed_plate_b=%d geometric_collision_executed_overlap_sample_count=%d geometric_collision_executed_terrane_estimate=%d geometric_collision_executed_terrane_recovered_count=%d geometric_collision_executed_collision_gain_count=%d geometric_collision_executed_cw_boosted_count=%d geometric_collision_executed_surge_affected_count=%d geometric_collision_executed_from_directional_polarity_count=%d boundary_contact_fallback_collision_gain_count=%d boundary_contact_fallback_terrane_recovered_count=%d boundary_contact_fallback_cw_boosted_count=%d boundary_contact_fallback_surge_affected_count=%d geometric_collision_executed_overlap_depth_km=%.6f geometric_collision_executed_max_overlap_depth_km=%.6f geometric_collision_executed_mean_convergence_km_per_my=%.6f geometric_collision_executed_max_convergence_km_per_my=%.6f geometric_collision_executed_accumulated_penetration_km=%.6f geometric_collision_executed_observation_count=%d geometric_collision_executed_donor_terrane_locality_limited_count=%d geometric_collision_repeated_candidate_plate_a=%d geometric_collision_repeated_candidate_plate_b=%d geometric_collision_repeated_candidate_observation_count=%d geometric_collision_repeated_candidate_overlap_sample_count=%d geometric_collision_repeated_candidate_terrane_estimate=%d geometric_collision_repeated_candidate_accumulated_penetration_km=%.6f geometric_collision_repeated_candidate_effective_convergence_km_per_my=%.6f geometric_collision_repeated_candidate_mean_convergence_km_per_my=%.6f geometric_collision_repeated_candidate_max_convergence_km_per_my=%.6f geometric_collision_repeated_candidate_mean_overlap_depth_km=%.6f geometric_collision_repeated_candidate_max_overlap_depth_km=%.6f geometric_collision_donor_locality_clamp_km=%.3f geometric_collision_influence_radius_scale=%.3f geometric_collision_persistent_penetration_threshold_km=%.3f collision_repeated_pair_count=%d collision_repeated_pair_within_cooldown_count=%d collision_event_count=%d rift_event_count=%d resampling_interval_R=%d trigger_reason=%s ownership_mode=%s"),
+		ResampleIndex,
+		CurrentStep,
+		Stats.ContinentalAreaFraction,
+		Stats.ContinentalSampleCount,
+		Stats.ContinentalSamplesBefore,
+		Stats.ContinentalSamplesAfter,
+		Stats.ContinentalSamplesLost,
+		Stats.FormerContinentalSamplesTurnedOceanic,
+		Stats.FormerContinentalDivergentGapCount,
+		Stats.FormerContinentalNonDivergentGapCount,
+		Stats.FormerContinentalNonDivergentGapProjectionResolvedCount,
+		Stats.FormerContinentalNonDivergentGapNearestCopyResolvedCount,
+		Stats.FormerContinentalNonDivergentFallbackOceanizedCount,
+		Stats.FormerContinentalDivergentOceanizedCount,
+		Stats.FormerContinentalProjectionRecoveredNonContinentalFinalCount,
+		Stats.FormerContinentalProjectionRecoveredSamePlateNonContinentalFinalCount,
+		Stats.FormerContinentalProjectionRecoveredChangedPlateNonContinentalFinalCount,
+		Stats.FormerContinentalProjectionRecoveredPreserveModeNonContinentalFinalCount,
+		Stats.FormerContinentalProjectionRecoveredFullResolutionNonContinentalFinalCount,
+		Stats.FormerContinentalNearestCopyRecoveredNonContinentalFinalCount,
+		Stats.FormerContinentalNonGapReclassifiedNonContinentalFinalCount,
+		Stats.FormerContinentalChangedPlateNonContinentalFinalCount,
+		Stats.FormerContinentalFullResolutionNonContinentalFinalCount,
+		Stats.FormerContinentalPreserveModeNonGapNonContinentalFinalCount,
+		Stats.FormerContinentalFallbackQueryNonContinentalFinalCount,
+		Stats.AndeanContinentalGainCount,
+		Stats.CollisionContinentalGainCount,
+		Stats.NetContinentalSampleDelta,
+		Stats.PreserveOwnershipCWRetainedCount,
+		Stats.PreserveOwnershipCWThresholdCrossingPreventedCount,
+		Stats.OverlapCount,
+		Stats.OverlapRate,
+		Stats.GapCount,
+		Stats.GapRate,
+		Stats.DivergentGapCount,
+		Stats.NonDivergentGapCount,
+		Stats.PlateCount,
+		Stats.MaxComponentsPerPlate,
+		Stats.BoundarySampleCount,
+		Stats.BoundarySampleFraction,
+		Stats.ElevationMinKm,
+		Stats.ElevationMaxKm,
+		Stats.ElevationMeanKm,
+		Stats.SubductionSeedSampleCount,
+		Stats.ActiveCollisionTrackCount,
+		Stats.BoundaryContactBestPlateA,
+		Stats.BoundaryContactBestPlateB,
+		Stats.BoundaryContactBestZoneSize,
+		Stats.BoundaryContactBestPersistenceCount,
+		Stats.GeometricCollisionCandidateCount,
+		Stats.GeometricCollisionQualifiedCount,
+		Stats.GeometricCollisionQualifiedButDonorAmbiguousCount,
+		Stats.GeometricCollisionQualifiedButDonorSeedEmptyCount,
+		Stats.GeometricCollisionQualifiedUsingDirectionalDonorCount,
+		Stats.GeometricCollisionQualifiedUsingFallbackDonorRuleCount,
+		Stats.GeometricCollisionRejectedByMassFilterCount,
+		Stats.GeometricCollisionRejectedByOverlapDepthCount,
+		Stats.GeometricCollisionRejectedByOverlapDepthTotalOverlapSampleCount,
+		Stats.GeometricCollisionRejectedByOverlapDepthMaxOverlapSampleCount,
+		Stats.GeometricCollisionRejectedByOverlapDepthTotalTerraneEstimate,
+		Stats.GeometricCollisionRejectedByOverlapDepthMaxTerraneEstimate,
+		Stats.GeometricCollisionRejectedByOverlapDepthTotalMeanConvergenceKmPerMy,
+		Stats.GeometricCollisionRejectedByOverlapDepthMaxConvergenceKmPerMy,
+		Stats.GeometricCollisionRejectedByOverlapDepthTotalDepthKm,
+		Stats.GeometricCollisionRejectedByOverlapDepthMaxDepthKm,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationCount,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationTotalOverlapSampleCount,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationMaxOverlapSampleCount,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationTotalTerraneEstimate,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationMaxTerraneEstimate,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationTotalObservationCount,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationMaxObservationCount,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationTotalMeanConvergenceKmPerMy,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationMaxConvergenceKmPerMy,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationTotalAccumulatedPenetrationKm,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationMaxAccumulatedPenetrationKm,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationTotalDepthKm,
+		Stats.GeometricCollisionRejectedByPersistentPenetrationMaxDepthKm,
+		Stats.GeometricCollisionRejectedByEmptyTerraneCount,
+		Stats.GeometricCollisionRejectedByRoleResolutionCount,
+		Stats.GeometricCollisionRejectedBySeedDirectionCount,
+		Stats.GeometricCollisionQualifiedDirectionalCount,
+		Stats.GeometricCollisionDirectionalSeedCount,
+		Stats.GeometricCollisionDirectionalSeedCountOpposite,
+		Stats.GeometricCollisionSeedDirectionAuditCount,
+		Stats.GeometricCollisionSeedDirectionMismatchCount,
+		Stats.GeometricCollisionOnlyOverridingBucketPopulatedCount,
+		Stats.GeometricCollisionOnlySubductingBucketPopulatedCount,
+		Stats.GeometricCollisionBothDirectionalBucketsPopulatedCount,
+		Stats.GeometricCollisionNeitherDirectionalBucketPopulatedCount,
+		Stats.GeometricCollisionPolarityChosenFromDirectionalEvidenceCount,
+		Stats.GeometricCollisionPolarityChosenFromBidirectionalTieBreakCount,
+		Stats.GeometricCollisionFallbackUsedCount,
+		Stats.GeometricCollisionOverlapSampleCount,
+		Stats.GeometricCollisionPairCount,
+		Stats.GeometricCollisionQualifiedPairCount,
+		Stats.GeometricCollisionLargestTerraneEstimate,
+		Stats.GeometricCollisionBestPlateA,
+		Stats.GeometricCollisionBestPlateB,
+		Stats.GeometricCollisionBestOverlapSampleCount,
+		Stats.GeometricCollisionBestTerraneEstimate,
+		Stats.GeometricCollisionBestSubductingOverlapSampleCount,
+		Stats.GeometricCollisionBestOpposingSupportCount,
+		Stats.bGeometricCollisionBestPassedMassFilter ? 1 : 0,
+		Stats.CollisionCWBoostedCount,
+		Stats.bUsedGeometricCollisionExecution ? 1 : 0,
+		Stats.GeometricCollisionExecutedPlateA,
+		Stats.GeometricCollisionExecutedPlateB,
+			Stats.GeometricCollisionExecutedOverlapSampleCount,
+			Stats.GeometricCollisionExecutedTerraneEstimate,
+			Stats.GeometricCollisionExecutedTerraneRecoveredCount,
+			Stats.GeometricCollisionExecutedCollisionGainCount,
+			Stats.GeometricCollisionExecutedCWBoostedCount,
+			Stats.GeometricCollisionExecutedSurgeAffectedCount,
+			Stats.GeometricCollisionExecutedFromDirectionalPolarityCount,
+			Stats.BoundaryContactFallbackCollisionGainCount,
+			Stats.BoundaryContactFallbackTerraneRecoveredCount,
+			Stats.BoundaryContactFallbackCWBoostedCount,
+			Stats.BoundaryContactFallbackSurgeAffectedCount,
+			Stats.GeometricCollisionExecutedOverlapDepthKm,
+			Stats.GeometricCollisionExecutedMaxOverlapDepthKm,
+		Stats.GeometricCollisionExecutedMeanConvergenceKmPerMy,
+		Stats.GeometricCollisionExecutedMaxConvergenceKmPerMy,
+		Stats.GeometricCollisionExecutedAccumulatedPenetrationKm,
+		Stats.GeometricCollisionExecutedObservationCount,
+		Stats.GeometricCollisionExecutedDonorTerraneLocalityLimitedCount,
+		Stats.GeometricCollisionRepeatedCandidatePlateA,
+		Stats.GeometricCollisionRepeatedCandidatePlateB,
+		Stats.GeometricCollisionRepeatedCandidateObservationCount,
+		Stats.GeometricCollisionRepeatedCandidateOverlapSampleCount,
+		Stats.GeometricCollisionRepeatedCandidateTerraneEstimate,
+		Stats.GeometricCollisionRepeatedCandidateAccumulatedPenetrationKm,
+		Stats.GeometricCollisionRepeatedCandidateEffectiveConvergenceKmPerMy,
+		Stats.GeometricCollisionRepeatedCandidateMeanConvergenceKmPerMy,
+		Stats.GeometricCollisionRepeatedCandidateMaxConvergenceKmPerMy,
+		Stats.GeometricCollisionRepeatedCandidateMeanOverlapDepthKm,
+		Stats.GeometricCollisionRepeatedCandidateMaxOverlapDepthKm,
+		Stats.GeometricCollisionDonorLocalityClampKm,
+		Stats.GeometricCollisionInfluenceRadiusScale,
+		Stats.GeometricCollisionPersistentPenetrationThresholdKm,
+		Stats.CollisionRepeatedPairCount,
+		Stats.CollisionRepeatedPairWithinCooldownCount,
+		Stats.CollisionCount,
+		Stats.RiftCount,
+		Stats.Interval,
+		GetResampleTriggerReasonName(TriggerReason),
+		GetResampleOwnershipModeName(OwnershipMode));
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[ResampleFullResolutionLossMetrics R=%d Step=%d] former_continental_full_resolution_non_continental_final_count=%d full_resolution_same_plate_non_continental_final_count=%d full_resolution_changed_plate_non_continental_final_count=%d full_resolution_collision_followup_same_plate_non_continental_count=%d full_resolution_collision_followup_changed_plate_non_continental_count=%d full_resolution_rift_followup_same_plate_non_continental_count=%d full_resolution_rift_followup_changed_plate_non_continental_count=%d full_resolution_other_trigger_same_plate_non_continental_count=%d full_resolution_other_trigger_changed_plate_non_continental_count=%d full_resolution_same_plate_cw_retained_count=%d full_resolution_same_plate_cw_threshold_crossing_prevented_count=%d full_resolution_collision_followup_same_plate_cw_retained_count=%d full_resolution_rift_followup_same_plate_cw_retained_count=%d full_resolution_other_trigger_same_plate_cw_retained_count=%d trigger_reason=%s ownership_mode=%s"),
+		ResampleIndex,
+		CurrentStep,
+		Stats.FormerContinentalFullResolutionNonContinentalFinalCount,
+		Stats.FullResolutionSamePlateNonContinentalFinalCount,
+		Stats.FullResolutionChangedPlateNonContinentalFinalCount,
+		Stats.FullResolutionCollisionFollowupSamePlateNonContinentalCount,
+		Stats.FullResolutionCollisionFollowupChangedPlateNonContinentalCount,
+		Stats.FullResolutionRiftFollowupSamePlateNonContinentalCount,
+		Stats.FullResolutionRiftFollowupChangedPlateNonContinentalCount,
+		Stats.FullResolutionOtherTriggerSamePlateNonContinentalCount,
+		Stats.FullResolutionOtherTriggerChangedPlateNonContinentalCount,
+		Stats.FullResolutionSamePlateCWRetainedCount,
+		Stats.FullResolutionSamePlateCWThresholdCrossingPreventedCount,
+		Stats.FullResolutionCollisionFollowupSamePlateCWRetainedCount,
+		Stats.FullResolutionRiftFollowupSamePlateCWRetainedCount,
+		Stats.FullResolutionOtherTriggerSamePlateCWRetainedCount,
+		GetResampleTriggerReasonName(TriggerReason),
+		GetResampleOwnershipModeName(OwnershipMode));
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[PreserveFallbackRetention R=%d Step=%d] fallback_same_plate_recontained_count=%d fallback_same_plate_retained_count=%d fallback_changed_owner_count=%d fallback_gap_count=%d fallback_divergent_oceanization_count=%d fallback_continental_loss_count_after_fallback=%d"),
+		ResampleIndex,
+		CurrentStep,
+		Stats.PreserveOwnershipFallbackSamePlateRecontainedCount,
+		Stats.PreserveOwnershipFallbackSamePlateRetainedCount,
+		Stats.PreserveOwnershipFallbackChangedOwnerCount,
+		Stats.PreserveOwnershipFallbackGapCount,
+		Stats.PreserveOwnershipFallbackDivergentOceanizationCount,
+		Stats.PreserveOwnershipContinentalLossCountAfterFallback);
+	const FString PreserveFallbackLossPairsString = JoinOwnerTransitionCountsForLog(
+		Stats.PreserveOwnershipFallbackLossPairPreviousPlateIds,
+		Stats.PreserveOwnershipFallbackLossPairFinalPlateIds,
+		Stats.PreserveOwnershipFallbackLossPairCounts);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[PreserveBoundaryPolicyAudit R=%d Step=%d] previous_owner_hysteresis_application_count=%d preserved_strongly_continental_boundary_sample_count=%d changed_owner_non_gap_loss_count=%d divergent_loss_count=%d non_divergent_projection_loss_count=%d non_divergent_fallback_oceanized_loss_count=%d fallback_loss_ge_090_count=%d fallback_loss_ge_075_count=%d fallback_loss_ge_050_count=%d top_changed_owner_loss_pairs=(%s)"),
+		ResampleIndex,
+		CurrentStep,
+		Stats.PreserveOwnershipPreviousOwnerHysteresisApplicationCount,
+		Stats.PreserveOwnershipStronglyContinentalBoundarySavedCount,
+		Stats.PreserveOwnershipFallbackChangedOwnerNonGapLossCount,
+		Stats.PreserveOwnershipFallbackDivergentLossCount,
+		Stats.PreserveOwnershipFallbackNonDivergentProjectionLossCount,
+		Stats.PreserveOwnershipFallbackNonDivergentFallbackOceanizedLossCount,
+		Stats.PreserveOwnershipFallbackStrongLossGE090Count,
+		Stats.PreserveOwnershipFallbackStrongLossGE075Count,
+		Stats.PreserveOwnershipFallbackStrongLossGE050Count,
+		*PreserveFallbackLossPairsString);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[ResampleTopologyAttribution R=%d Step=%d] trigger_reason=%s ownership_mode=%s global_max_components_before=%d global_max_components_after=%d primary_affected_plate_id=%d primary_components_before=%d primary_components_after=%d secondary_affected_plate_id=%d secondary_components_before=%d secondary_components_after=%d"),
+		ResampleIndex,
+		CurrentStep,
+		GetResampleTriggerReasonName(TriggerReason),
+		GetResampleOwnershipModeName(OwnershipMode),
+		Stats.TopologyGlobalMaxComponentsBefore,
+		Stats.TopologyGlobalMaxComponentsAfter,
+		Stats.TopologyPrimaryAffectedPlateId,
+		Stats.TopologyPrimaryAffectedPlateComponentsBefore,
+		Stats.TopologyPrimaryAffectedPlateComponentsAfter,
+		Stats.TopologySecondaryAffectedPlateId,
+		Stats.TopologySecondaryAffectedPlateComponentsBefore,
+		Stats.TopologySecondaryAffectedPlateComponentsAfter);
+	if (TriggerReason == EResampleTriggerReason::RiftFollowup)
+	{
+		const FString RiftChildPlateIdsString = JoinIntArrayForLog(Stats.RiftChildPlateIds);
+		const FString RiftChildAnchorSampleIndicesString =
+			JoinIntArrayForLog(Stats.RiftChildAnchorSampleIndices);
+		const FString RiftLocalizationRestoredPlateIdsString =
+			JoinIntArrayForLog(Stats.RiftLocalizedRestoredPreviousPlateIds);
+		const FString RiftLocalizationRestoredPlateCountsString =
+			JoinIntArrayForLog(Stats.RiftLocalizedRestoredPreviousPlateCounts);
+		const FString RiftChildComponentCountsBeforeSuppressionString =
+			JoinIntArrayForLog(Stats.RiftChildComponentCountsBeforeSuppression);
+		const FString RiftChildComponentCountsAfterSuppressionString =
+			JoinIntArrayForLog(Stats.RiftChildComponentCountsAfterSuppression);
+		const FString RiftChildComponentCountsBeforeString =
+			JoinIntArrayForLog(Stats.RiftChildComponentCountsBefore);
+		const FString RiftChildComponentCountsAfterString =
+			JoinIntArrayForLog(Stats.RiftChildComponentCountsAfter);
+		const FString RiftRecipientPlateIdsString =
+			JoinIntArrayForLog(Stats.RiftStrayFragmentRecipientPlateIds);
+		const FString RiftRecipientTypeCodesString =
+			JoinRiftRecipientTypeCodesForLog(Stats.RiftStrayFragmentRecipientTypeCodes);
+		const FString RiftSiblingEdgeCountsString =
+			JoinIntArrayForLog(Stats.RiftStrayFragmentSiblingEdgeCounts);
+		const FString RiftRecipientFragmentSizesString =
+			JoinIntArrayForLog(Stats.RiftStrayFragmentSizes);
+		const FString RiftRecipientComponentsBeforeString =
+			JoinIntArrayForLog(Stats.RiftStrayFragmentRecipientComponentsBefore);
+		const FString RiftRecipientComponentsAfterString =
+			JoinIntArrayForLog(Stats.RiftStrayFragmentRecipientComponentsAfter);
+		const FString RiftPositiveGrowthPlateIdsString =
+			JoinIntArrayForLog(Stats.RiftPositiveGrowthPlateIds);
+		const FString RiftPositiveGrowthTypeCodesString =
+			JoinRiftRecipientTypeCodesForLog(Stats.RiftPositiveGrowthPlateTypeCodes);
+		const FString RiftPositiveGrowthBeforeString =
+			JoinIntArrayForLog(Stats.RiftPositiveGrowthPlateComponentsBefore);
+		const FString RiftPositiveGrowthAfterString =
+			JoinIntArrayForLog(Stats.RiftPositiveGrowthPlateComponentsAfter);
+		const FString RiftPositiveGrowthLargestFragmentSizesString =
+			JoinIntArrayForLog(Stats.RiftPositiveGrowthPlateLargestFragmentSizes);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[RiftFollowupLocalization R=%d Step=%d] parent_plate_id=%d child_plate_ids=(%s) restored_non_child_samples=%d restored_gap_samples=%d restored_previous_plate_ids=(%s) restored_previous_plate_counts=(%s)"),
+			ResampleIndex,
+			CurrentStep,
+			Stats.RiftParentPlateId,
+			*RiftChildPlateIdsString,
+			Stats.RiftLocalizedNonChildSampleRestoreCount,
+			Stats.RiftLocalizedGapSampleRestoreCount,
+			*RiftLocalizationRestoredPlateIdsString,
+			*RiftLocalizationRestoredPlateCountsString);
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[RiftFollowupCWRollback R=%d Step=%d] interpolation_created_gains=%d localized_cw_restored_count=%d localized_cw_phantom_prevented_count=%d localized_cw_continental_prevented_count=%d final_owner_mismatch_gain_count_after_localization=%d"),
+				ResampleIndex,
+			CurrentStep,
+			Stats.RiftInterpolationCreatedGainCount,
+			Stats.RiftLocalizedCWRestoredCount,
+				Stats.RiftLocalizedCWPhantomPreventedCount,
+				Stats.RiftLocalizedCWContinentalPreventedCount,
+				Stats.RiftFinalOwnerMismatchGainCountAfterLocalization);
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[RiftFollowupCWReconciliation R=%d Step=%d] final_owner_cw_reconciled_count=%d mismatch_gain_count_before_reconciliation=%d mismatch_gain_count_after_reconciliation=%d mismatch_continental_prevented_count=%d same_owner_child_interpolation_gain_count_before_reconciliation=%d same_owner_child_interpolation_gain_count_after_reconciliation=%d final_gain_started_below_025_count=%d final_gain_started_below_040_count=%d final_gain_started_below_050_count=%d"),
+				ResampleIndex,
+				CurrentStep,
+				Stats.RiftFinalOwnerCWReconciledCount,
+				Stats.RiftFinalOwnerMismatchGainCountBeforeReconciliation,
+				Stats.RiftFinalOwnerMismatchGainCountAfterReconciliation,
+				Stats.RiftFinalOwnerMismatchContinentalPreventedCount,
+				Stats.RiftSameOwnerChildInterpolationGainCountBeforeReconciliation,
+				Stats.RiftSameOwnerChildInterpolationGainCountAfterReconciliation,
+				Stats.RiftFinalGainStartedBelow025Count,
+				Stats.RiftFinalGainStartedBelow040Count,
+				Stats.RiftFinalGainStartedBelow050Count);
+				UE_LOG(
+					LogTemp,
+					Log,
+				TEXT("[RiftChildCoherence R=%d Step=%d] child_plate_ids=(%s) child_anchor_samples=(%s) child_components_before_suppression=(%s) child_components_after_suppression=(%s) stray_fragments_detected=%d stray_fragments_reassigned=%d largest_stray_fragment_size=%d reassigned_to_sibling=%d reassigned_to_other_neighbor=%d"),
+			ResampleIndex,
+			CurrentStep,
+			*RiftChildPlateIdsString,
+			*RiftChildAnchorSampleIndicesString,
+			*RiftChildComponentCountsBeforeSuppressionString,
+			*RiftChildComponentCountsAfterSuppressionString,
+			Stats.RiftChildStrayFragmentDetectedCount,
+			Stats.RiftChildStrayFragmentReassignedCount,
+			Stats.RiftLargestStrayChildFragmentSize,
+			Stats.RiftStrayChildFragmentReassignedToSiblingCount,
+			Stats.RiftStrayChildFragmentReassignedToOtherNeighborCount);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[RiftRecipientCoherence R=%d Step=%d] recipient_plate_ids=(%s) recipient_types=(%s) sibling_edge_counts=(%s) fragment_sizes=(%s) recipient_components_before=(%s) recipient_components_after=(%s) reassigned_by_adjacent_sibling=%d reassigned_by_zero_adjacency_sibling_fallback=%d reassigned_to_non_child_fallback=%d zero_sibling_adjacency_count=%d positive_sibling_adjacency_count=%d candidate_destinations_considered=%d incoherence_rejections=%d incoherent_forced_assignments=%d largest_fragment_causing_recipient_growth=%d positive_growth_plate_ids=(%s) positive_growth_plate_types=(%s) positive_growth_components_before=(%s) positive_growth_components_after=(%s) positive_growth_largest_fragment_sizes=(%s)"),
+			ResampleIndex,
+			CurrentStep,
+			*RiftRecipientPlateIdsString,
+			*RiftRecipientTypeCodesString,
+			*RiftSiblingEdgeCountsString,
+			*RiftRecipientFragmentSizesString,
+			*RiftRecipientComponentsBeforeString,
+			*RiftRecipientComponentsAfterString,
+			Stats.RiftStrayFragmentReassignedByAdjacentSiblingCount,
+			Stats.RiftStrayFragmentReassignedByZeroAdjacencySiblingFallbackCount,
+			Stats.RiftStrayFragmentForcedNonChildAssignmentCount,
+			Stats.RiftStrayFragmentZeroSiblingAdjacencyCount,
+			Stats.RiftStrayFragmentPositiveSiblingAdjacencyCount,
+			Stats.RiftStrayFragmentRecipientCandidateConsideredCount,
+			Stats.RiftStrayFragmentRecipientIncoherenceRejectedCount,
+			Stats.RiftStrayFragmentIncoherentForcedAssignmentCount,
+			Stats.RiftLargestFragmentCausingRecipientGrowthSize,
+			*RiftPositiveGrowthPlateIdsString,
+			*RiftPositiveGrowthTypeCodesString,
+			*RiftPositiveGrowthBeforeString,
+			*RiftPositiveGrowthAfterString,
+			*RiftPositiveGrowthLargestFragmentSizesString);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[RiftTopologyAttribution R=%d Step=%d] parent_plate_id=%d child_count=%d child_plate_ids=(%s) global_max_components_before=%d global_max_components_after=%d topology_component_delta=%d parent_components_before=%d parent_components_after=%d affected_plate_count_before=%d affected_plate_count_after=%d child_components_before=(%s) child_components_after=(%s) min_child_samples=%d max_child_samples=%d mean_child_samples=%.2f"),
+			ResampleIndex,
+			CurrentStep,
+			Stats.RiftParentPlateId,
+			Stats.RiftChildCount,
+			*RiftChildPlateIdsString,
+			Stats.TopologyGlobalMaxComponentsBefore,
+			Stats.TopologyGlobalMaxComponentsAfter,
+			FMath::Max(
+				0,
+				Stats.TopologyGlobalMaxComponentsAfter - Stats.TopologyGlobalMaxComponentsBefore),
+			Stats.RiftParentComponentsBefore,
+			Stats.RiftParentComponentsAfter,
+			Stats.RiftAffectedPlateCountBefore,
+			Stats.RiftAffectedPlateCountAfter,
+			*RiftChildComponentCountsBeforeString,
+			*RiftChildComponentCountsAfterString,
+			Stats.RiftMinChildSampleCount,
+			Stats.RiftMaxChildSampleCount,
+			Stats.RiftMeanChildSampleCount);
+	}
+	if (Stats.CollisionCount > 0 && Stats.bUsedGeometricCollisionExecution)
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[CollisionReceiverContiguity Step=%d] receiver_plate=%d donor_plate=%d transferred_terrane_size=%d receiver_components_before=%d receiver_components_after=%d contiguous_with_existing=%d disconnected_fragments_created=%d largest_new_disconnected_fragment_size=%d"),
+			CurrentStep,
+			Stats.CollisionOverridingPlateId,
+			Stats.CollisionSubductingPlateId,
+			Stats.CollisionTerraneSampleCount,
+			Stats.CollisionReceiverComponentsBefore,
+			Stats.CollisionReceiverComponentsAfter,
+			Stats.bCollisionReceiverTransferContiguousWithExistingTerritory ? 1 : 0,
+			Stats.CollisionReceiverDisconnectedFragmentCount,
+			Stats.CollisionReceiverLargestNewDisconnectedFragmentSize);
+	}
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[ResamplePhaseTiming R=%d Step=%d] soup_build_ms=%.3f ownership_query_ms=%.3f interpolation_ms=%.3f gap_resolution_ms=%.3f overlap_classification_ms=%.3f repartition_ms=%.3f collision_ms=%.3f subduction_distance_field_ms=%.3f slab_pull_ms=%.3f terrane_detection_ms=%.3f rift_ms=%.3f total_ms=%.3f"),
+		ResampleIndex,
+		CurrentStep,
+		Stats.SoupBuildMs,
+		Stats.OwnershipQueryMs,
+		Stats.InterpolationMs,
+		Stats.GapResolutionMs,
+		Stats.OverlapClassificationMs,
+		Stats.RepartitionMs,
+		Stats.CollisionMs,
+		Stats.SubductionDistanceFieldMs,
+		Stats.SlabPullMs,
+		Stats.TerraneDetectionMs,
+		Stats.RiftMs,
+		Stats.TotalMs);
 
 	UE_LOG(
 		LogTemp,

@@ -24,12 +24,15 @@ enum class EResampleTriggerReason : uint8
 // `PeriodicFull` remains the legacy baseline/default for regression comparison.
 // `EventDrivenOnly` and `HybridStablePeriodic` are retained for experiment coverage.
 // `PreserveOwnershipPeriodic` is the current preferred maintenance architecture.
+// `PeriodicGlobalAuthoritativeSpike` is the isolated architecture-spike path for
+// periodic global authoritative resampling without preserve ownership.
 enum class EResamplingPolicy : uint8
 {
 	PeriodicFull,
 	EventDrivenOnly,
 	HybridStablePeriodic,
 	PreserveOwnershipPeriodic,
+	PeriodicGlobalAuthoritativeSpike,
 };
 
 // Internal ownership behavior used by a specific resample invocation.
@@ -39,6 +42,15 @@ enum class EResampleOwnershipMode : uint8
 	FullResolution,
 	StableOverlaps,
 	PreserveOwnership,
+};
+
+enum class EGapResolutionPath : uint8
+{
+	None,
+	NonDivergentProjection,
+	NonDivergentNearestCopy,
+	NonDivergentFallbackOceanized,
+	DivergentOceanized,
 };
 
 struct FSample
@@ -129,6 +141,50 @@ struct FPendingBoundaryContactCollisionEvent
 	int32 ConsecutiveResamples = 0;
 };
 
+struct FPendingGeometricCollisionEvent
+{
+	// Cached preserve-mode geometric overlap evidence consumed by same-step follow-up.
+	bool bValid = false;
+	int32 PlateA = INDEX_NONE;
+	int32 PlateB = INDEX_NONE;
+	int32 OverridingPlateId = INDEX_NONE;
+	int32 SubductingPlateId = INDEX_NONE;
+	TArray<int32> SamplesFromAInsideB;
+	TArray<int32> SamplesFromBInsideA;
+	TArray<int32> OverlapSampleIndices;
+	FVector3d ContactCenter = FVector3d::ZeroVector;
+	int32 OverlapSampleCount = 0;
+	int32 TerraneEstimate = 0;
+	uint8 PolaritySelectionRule = 0;
+	bool bPolarityChosenFromDirectionalEvidence = false;
+	double TotalConvergenceMagnitudeAInsideBKmPerMy = 0.0;
+	double TotalConvergenceMagnitudeBInsideAKmPerMy = 0.0;
+	double TotalConvergenceMagnitudeKmPerMy = 0.0;
+	double MaxConvergenceMagnitudeKmPerMy = 0.0;
+	double EffectiveConvergenceKmPerMy = 0.0;
+	double AccumulatedPenetrationKm = 0.0;
+	double MeanOverlapDepthKm = 0.0;
+	double MaxOverlapDepthKm = 0.0;
+	int32 ObservationCount = 0;
+};
+
+struct FGeometricCollisionPairRecurrenceState
+{
+	// Persistent preserve-mode penetration tracking for normalized geometric candidate pairs.
+	int32 ObservationCount = 0;
+	int32 LastObservedStep = INDEX_NONE;
+	int32 LastReceiverPlateId = INDEX_NONE;
+	int32 LastDonorPlateId = INDEX_NONE;
+	int32 LastOverlapSampleCount = 0;
+	int32 LastTerraneEstimate = 0;
+	double AccumulatedPenetrationKm = 0.0;
+	double LastEffectiveConvergenceKmPerMy = 0.0;
+	double LastMeanConvergenceMagnitudeKmPerMy = 0.0;
+	double LastMaxConvergenceMagnitudeKmPerMy = 0.0;
+	double LastMeanOverlapDepthKm = 0.0;
+	double LastMaxOverlapDepthKm = 0.0;
+};
+
 struct FPendingRiftEvent
 {
 	bool bValid = false;
@@ -143,6 +199,7 @@ struct FPendingRiftEvent
 	int32 ChildSampleCountB = 0;
 	int32 EventSeed = 0;
 	TArray<int32> ChildPlateIds;
+	TArray<int32> ChildAnchorSampleIndices;
 	TArray<int32> ChildSampleCounts;
 	TArray<int32> FormerParentSampleIndices;
 	TArray<int32> FormerParentTerraneIds;
@@ -153,8 +210,52 @@ struct FPendingRiftEvent
 
 struct FResamplingStats
 {
+	EResampleTriggerReason TriggerReason = EResampleTriggerReason::None;
+	EResampleOwnershipMode OwnershipMode = EResampleOwnershipMode::FullResolution;
 	int32 Step = 0;
 	int32 Interval = 0;
+	int32 PlateCount = 0;
+	int32 ContinentalSampleCount = 0;
+	int32 ContinentalSamplesBefore = 0;
+	int32 ContinentalSamplesAfter = 0;
+	int32 ContinentalSamplesLost = 0;
+	int32 FormerContinentalSamplesTurnedOceanic = 0;
+	int32 FormerContinentalDivergentGapCount = 0;
+	int32 FormerContinentalNonDivergentGapCount = 0;
+	int32 FormerContinentalNonDivergentGapProjectionResolvedCount = 0;
+	int32 FormerContinentalNonDivergentGapNearestCopyResolvedCount = 0;
+	int32 FormerContinentalNonDivergentFallbackOceanizedCount = 0;
+	int32 FormerContinentalDivergentOceanizedCount = 0;
+	int32 FormerContinentalProjectionRecoveredNonContinentalFinalCount = 0;
+	int32 FormerContinentalProjectionRecoveredSamePlateNonContinentalFinalCount = 0;
+	int32 FormerContinentalProjectionRecoveredChangedPlateNonContinentalFinalCount = 0;
+	int32 FormerContinentalProjectionRecoveredPreserveModeNonContinentalFinalCount = 0;
+	int32 FormerContinentalProjectionRecoveredFullResolutionNonContinentalFinalCount = 0;
+	int32 FormerContinentalNearestCopyRecoveredNonContinentalFinalCount = 0;
+	int32 FormerContinentalNonGapReclassifiedNonContinentalFinalCount = 0;
+	int32 FormerContinentalChangedPlateNonContinentalFinalCount = 0;
+	int32 FormerContinentalFullResolutionNonContinentalFinalCount = 0;
+	int32 FullResolutionSamePlateNonContinentalFinalCount = 0;
+	int32 FullResolutionChangedPlateNonContinentalFinalCount = 0;
+	int32 FullResolutionCollisionFollowupSamePlateNonContinentalCount = 0;
+	int32 FullResolutionCollisionFollowupChangedPlateNonContinentalCount = 0;
+	int32 FullResolutionRiftFollowupSamePlateNonContinentalCount = 0;
+	int32 FullResolutionRiftFollowupChangedPlateNonContinentalCount = 0;
+	int32 FullResolutionOtherTriggerSamePlateNonContinentalCount = 0;
+	int32 FullResolutionOtherTriggerChangedPlateNonContinentalCount = 0;
+	int32 FormerContinentalPreserveModeNonGapNonContinentalFinalCount = 0;
+	int32 FormerContinentalFallbackQueryNonContinentalFinalCount = 0;
+	int32 FullResolutionSamePlateCWRetainedCount = 0;
+	int32 FullResolutionSamePlateCWThresholdCrossingPreventedCount = 0;
+	int32 FullResolutionCollisionFollowupSamePlateCWRetainedCount = 0;
+	int32 FullResolutionRiftFollowupSamePlateCWRetainedCount = 0;
+	int32 FullResolutionOtherTriggerSamePlateCWRetainedCount = 0;
+	int32 AndeanContinentalGainCount = 0;
+	int32 CollisionContinentalGainCount = 0;
+	int32 NetContinentalSampleDelta = 0;
+	int32 BoundarySampleCount = 0;
+	int32 MaxComponentsPerPlate = 0;
+	int32 ActiveCollisionTrackCount = 0;
 	int32 ExactSingleHitCount = 0;
 	int32 ExactMultiHitCount = 0;
 	int32 RecoveryContainmentCount = 0;
@@ -188,6 +289,26 @@ struct FResamplingStats
 	int32 PreserveOwnershipSamePlateRecoveryCount = 0;
 	int32 PreserveOwnershipFallbackQueryCount = 0;
 	int32 PreserveOwnershipPlateChangedCount = 0;
+	int32 PreserveOwnershipCWRetainedCount = 0;
+	int32 PreserveOwnershipCWThresholdCrossingPreventedCount = 0;
+	int32 PreserveOwnershipFallbackSamePlateRecontainedCount = 0;
+	int32 PreserveOwnershipFallbackSamePlateRetainedCount = 0;
+	int32 PreserveOwnershipFallbackChangedOwnerCount = 0;
+	int32 PreserveOwnershipFallbackGapCount = 0;
+	int32 PreserveOwnershipFallbackDivergentOceanizationCount = 0;
+	int32 PreserveOwnershipContinentalLossCountAfterFallback = 0;
+	int32 PreserveOwnershipPreviousOwnerHysteresisApplicationCount = 0;
+	int32 PreserveOwnershipStronglyContinentalBoundarySavedCount = 0;
+	int32 PreserveOwnershipFallbackChangedOwnerNonGapLossCount = 0;
+	int32 PreserveOwnershipFallbackDivergentLossCount = 0;
+	int32 PreserveOwnershipFallbackNonDivergentProjectionLossCount = 0;
+	int32 PreserveOwnershipFallbackNonDivergentFallbackOceanizedLossCount = 0;
+	int32 PreserveOwnershipFallbackStrongLossGE090Count = 0;
+	int32 PreserveOwnershipFallbackStrongLossGE075Count = 0;
+	int32 PreserveOwnershipFallbackStrongLossGE050Count = 0;
+	TArray<int32> PreserveOwnershipFallbackLossPairPreviousPlateIds;
+	TArray<int32> PreserveOwnershipFallbackLossPairFinalPlateIds;
+	TArray<int32> PreserveOwnershipFallbackLossPairCounts;
 	int32 TerraneCount = 0;
 	int32 NewTerraneCount = 0;
 	int32 MergedTerraneCount = 0;
@@ -203,6 +324,7 @@ struct FResamplingStats
 	int32 CollisionOverridingPlateId = INDEX_NONE;
 	int32 CollisionSubductingPlateId = INDEX_NONE;
 	int32 CollisionSurgeAffectedCount = 0;
+	int32 CollisionCWBoostedCount = 0;
 	int32 RiftCount = 0;
 	int32 RiftParentPlateId = INDEX_NONE;
 	int32 RiftChildCount = 0;
@@ -223,9 +345,57 @@ struct FResamplingStats
 	int32 RiftParentContinentalSampleCount = 0;
 	int32 RiftEventSeed = 0;
 	int32 RiftDivergentChildBoundaryEdgeCount = 0;
+	int32 RiftLocalizedNonChildSampleRestoreCount = 0;
+	int32 RiftLocalizedGapSampleRestoreCount = 0;
+	int32 RiftLocalizedCWRestoredCount = 0;
+	int32 RiftLocalizedCWPhantomPreventedCount = 0;
+	int32 RiftLocalizedCWContinentalPreventedCount = 0;
+	int32 RiftInterpolationCreatedGainCount = 0;
+	int32 RiftFinalOwnerMismatchGainCountAfterLocalization = 0;
+	int32 RiftFinalOwnerCWReconciledCount = 0;
+	int32 RiftFinalOwnerMismatchGainCountBeforeReconciliation = 0;
+	int32 RiftFinalOwnerMismatchGainCountAfterReconciliation = 0;
+	int32 RiftFinalOwnerMismatchContinentalPreventedCount = 0;
+	int32 RiftSameOwnerChildInterpolationGainCountBeforeReconciliation = 0;
+	int32 RiftSameOwnerChildInterpolationGainCountAfterReconciliation = 0;
+	int32 RiftFinalGainStartedBelow025Count = 0;
+	int32 RiftFinalGainStartedBelow040Count = 0;
+	int32 RiftFinalGainStartedBelow050Count = 0;
+	int32 RiftChildStrayFragmentDetectedCount = 0;
+	int32 RiftChildStrayFragmentReassignedCount = 0;
+	int32 RiftLargestStrayChildFragmentSize = 0;
+	int32 RiftStrayChildFragmentReassignedToSiblingCount = 0;
+	int32 RiftStrayChildFragmentReassignedToOtherNeighborCount = 0;
+	int32 RiftStrayFragmentReassignedByAdjacentSiblingCount = 0;
+	int32 RiftStrayFragmentReassignedByZeroAdjacencySiblingFallbackCount = 0;
+	int32 RiftStrayFragmentForcedNonChildAssignmentCount = 0;
+	int32 RiftStrayFragmentZeroSiblingAdjacencyCount = 0;
+	int32 RiftStrayFragmentPositiveSiblingAdjacencyCount = 0;
+	int32 RiftStrayFragmentRecipientCandidateConsideredCount = 0;
+	int32 RiftStrayFragmentRecipientIncoherenceRejectedCount = 0;
+	int32 RiftStrayFragmentIncoherentForcedAssignmentCount = 0;
+	int32 RiftLargestFragmentCausingRecipientGrowthSize = 0;
 	TArray<int32> RiftChildPlateIds;
+	TArray<int32> RiftChildAnchorSampleIndices;
 	TArray<int32> RiftChildSampleCounts;
+	TArray<int32> RiftLocalizedRestoredPreviousPlateIds;
+	TArray<int32> RiftLocalizedRestoredPreviousPlateCounts;
+	TArray<int32> RiftChildComponentCountsBeforeSuppression;
+	TArray<int32> RiftChildComponentCountsAfterSuppression;
+	TArray<int32> RiftChildComponentCountsBefore;
+	TArray<int32> RiftChildComponentCountsAfter;
 	TArray<int32> RiftChildTerraneFragmentCounts;
+	TArray<int32> RiftStrayFragmentRecipientPlateIds;
+	TArray<int32> RiftStrayFragmentRecipientTypeCodes;
+	TArray<int32> RiftStrayFragmentSiblingEdgeCounts;
+	TArray<int32> RiftStrayFragmentSizes;
+	TArray<int32> RiftStrayFragmentRecipientComponentsBefore;
+	TArray<int32> RiftStrayFragmentRecipientComponentsAfter;
+	TArray<int32> RiftPositiveGrowthPlateIds;
+	TArray<int32> RiftPositiveGrowthPlateTypeCodes;
+	TArray<int32> RiftPositiveGrowthPlateComponentsBefore;
+	TArray<int32> RiftPositiveGrowthPlateComponentsAfter;
+	TArray<int32> RiftPositiveGrowthPlateLargestFragmentSizes;
 	TArray<int32> RiftPreTerraneIds;
 	TArray<int32> RiftPreTerraneTouchedChildCounts;
 	bool bRiftWasAutomatic = false;
@@ -234,17 +404,167 @@ struct FResamplingStats
 	int32 BoundaryContactLargestZoneSize = 0;
 	int32 BoundaryContactTriggerPlateA = INDEX_NONE;
 	int32 BoundaryContactTriggerPlateB = INDEX_NONE;
+	int32 BoundaryContactBestPlateA = INDEX_NONE;
+	int32 BoundaryContactBestPlateB = INDEX_NONE;
+	int32 BoundaryContactBestZoneSize = 0;
+	int32 BoundaryContactBestPersistenceCount = 0;
 	int32 BoundaryContactPersistencePairA = INDEX_NONE;
 	int32 BoundaryContactPersistencePairB = INDEX_NONE;
 	int32 BoundaryContactPersistenceCount = 0;
+	int32 GeometricCollisionCandidateCount = 0;
+	int32 GeometricCollisionQualifiedCount = 0;
+	int32 GeometricCollisionQualifiedButDonorAmbiguousCount = 0;
+	int32 GeometricCollisionQualifiedButDonorSeedEmptyCount = 0;
+	int32 GeometricCollisionQualifiedUsingDirectionalDonorCount = 0;
+	int32 GeometricCollisionQualifiedUsingFallbackDonorRuleCount = 0;
+	int32 GeometricCollisionRejectedByMassFilterCount = 0;
+	int32 GeometricCollisionRejectedByOverlapDepthCount = 0;
+	int32 GeometricCollisionRejectedByPersistentPenetrationCount = 0;
+	int32 GeometricCollisionRejectedByOverlapDepthTotalOverlapSampleCount = 0;
+	int32 GeometricCollisionRejectedByOverlapDepthMaxOverlapSampleCount = 0;
+	int32 GeometricCollisionRejectedByOverlapDepthTotalTerraneEstimate = 0;
+	int32 GeometricCollisionRejectedByOverlapDepthMaxTerraneEstimate = 0;
+	int32 GeometricCollisionRejectedByPersistentPenetrationTotalOverlapSampleCount = 0;
+	int32 GeometricCollisionRejectedByPersistentPenetrationMaxOverlapSampleCount = 0;
+	int32 GeometricCollisionRejectedByPersistentPenetrationTotalTerraneEstimate = 0;
+	int32 GeometricCollisionRejectedByPersistentPenetrationMaxTerraneEstimate = 0;
+	int32 GeometricCollisionRejectedByPersistentPenetrationTotalObservationCount = 0;
+	int32 GeometricCollisionRejectedByPersistentPenetrationMaxObservationCount = 0;
+	double GeometricCollisionRejectedByOverlapDepthTotalMeanConvergenceKmPerMy = 0.0;
+	double GeometricCollisionRejectedByOverlapDepthMaxConvergenceKmPerMy = 0.0;
+	double GeometricCollisionRejectedByPersistentPenetrationTotalMeanConvergenceKmPerMy = 0.0;
+	double GeometricCollisionRejectedByPersistentPenetrationMaxConvergenceKmPerMy = 0.0;
+	double GeometricCollisionRejectedByPersistentPenetrationTotalAccumulatedPenetrationKm = 0.0;
+	double GeometricCollisionRejectedByPersistentPenetrationMaxAccumulatedPenetrationKm = 0.0;
+	int32 GeometricCollisionRejectedByEmptyTerraneCount = 0;
+	int32 GeometricCollisionRejectedByRoleResolutionCount = 0;
+	int32 GeometricCollisionRejectedBySeedDirectionCount = 0;
+	int32 GeometricCollisionQualifiedDirectionalCount = 0;
+	int32 GeometricCollisionDirectionalSeedCount = 0;
+	int32 GeometricCollisionDirectionalSeedCountOpposite = 0;
+	int32 GeometricCollisionSeedDirectionAuditCount = 0;
+	int32 GeometricCollisionSeedDirectionMismatchCount = 0;
+	int32 GeometricCollisionOnlyOverridingBucketPopulatedCount = 0;
+	int32 GeometricCollisionOnlySubductingBucketPopulatedCount = 0;
+	int32 GeometricCollisionBothDirectionalBucketsPopulatedCount = 0;
+	int32 GeometricCollisionNeitherDirectionalBucketPopulatedCount = 0;
+	int32 GeometricCollisionPolarityChosenFromDirectionalEvidenceCount = 0;
+	int32 GeometricCollisionPolarityChosenFromBidirectionalTieBreakCount = 0;
+	int32 GeometricCollisionFallbackUsedCount = 0;
+	int32 GeometricCollisionOverlapSampleCount = 0;
+	int32 GeometricCollisionPairCount = 0;
+	int32 GeometricCollisionQualifiedPairCount = 0;
+	int32 GeometricCollisionLargestTerraneEstimate = 0;
+	int32 GeometricCollisionBestPlateA = INDEX_NONE;
+	int32 GeometricCollisionBestPlateB = INDEX_NONE;
+	int32 GeometricCollisionBestOverlapSampleCount = 0;
+	int32 GeometricCollisionBestTerraneEstimate = 0;
+	int32 GeometricCollisionBestSubductingOverlapSampleCount = 0;
+	int32 GeometricCollisionBestOpposingSupportCount = 0;
 	int32 CachedBoundaryContactSeedCount = 0;
 	int32 CachedBoundaryContactTerraneSeedCount = 0;
 	int32 CachedBoundaryContactTerraneRecoveredCount = 0;
 	int32 CachedBoundaryContactPlateA = INDEX_NONE;
 	int32 CachedBoundaryContactPlateB = INDEX_NONE;
+	int32 GeometricCollisionExecutedPlateA = INDEX_NONE;
+	int32 GeometricCollisionExecutedPlateB = INDEX_NONE;
+	int32 GeometricCollisionExecutedOverlapSampleCount = 0;
+	int32 GeometricCollisionExecutedTerraneEstimate = 0;
+	int32 GeometricCollisionExecutedTerraneRecoveredCount = 0;
+	int32 GeometricCollisionExecutedCollisionGainCount = 0;
+	int32 GeometricCollisionExecutedCWBoostedCount = 0;
+	int32 GeometricCollisionExecutedSurgeAffectedCount = 0;
+	int32 GeometricCollisionExecutedFromDirectionalPolarityCount = 0;
+	int32 BoundaryContactFallbackCollisionGainCount = 0;
+	int32 BoundaryContactFallbackTerraneRecoveredCount = 0;
+	int32 BoundaryContactFallbackCWBoostedCount = 0;
+	int32 BoundaryContactFallbackSurgeAffectedCount = 0;
+	double GeometricCollisionExecutedOverlapDepthKm = 0.0;
+	double GeometricCollisionExecutedMaxOverlapDepthKm = 0.0;
+	double GeometricCollisionExecutedMeanConvergenceKmPerMy = 0.0;
+	double GeometricCollisionExecutedMaxConvergenceKmPerMy = 0.0;
+	double GeometricCollisionExecutedAccumulatedPenetrationKm = 0.0;
+	double GeometricCollisionRejectedByOverlapDepthTotalDepthKm = 0.0;
+	double GeometricCollisionRejectedByOverlapDepthMaxDepthKm = 0.0;
+	double GeometricCollisionRejectedByPersistentPenetrationTotalDepthKm = 0.0;
+	double GeometricCollisionRejectedByPersistentPenetrationMaxDepthKm = 0.0;
+	int32 GeometricCollisionExecutedDonorTerraneLocalityLimitedCount = 0;
+	int32 GeometricCollisionExecutedObservationCount = 0;
+	int32 TopologyGlobalMaxComponentsBefore = 0;
+	int32 TopologyGlobalMaxComponentsAfter = 0;
+	int32 TopologyPrimaryAffectedPlateId = INDEX_NONE;
+	int32 TopologyPrimaryAffectedPlateComponentsBefore = 0;
+	int32 TopologyPrimaryAffectedPlateComponentsAfter = 0;
+	int32 TopologySecondaryAffectedPlateId = INDEX_NONE;
+	int32 TopologySecondaryAffectedPlateComponentsBefore = 0;
+	int32 TopologySecondaryAffectedPlateComponentsAfter = 0;
+	int32 RiftParentComponentsBefore = 0;
+	int32 RiftParentComponentsAfter = 0;
+	int32 RiftAffectedPlateCountBefore = 0;
+	int32 RiftAffectedPlateCountAfter = 0;
+	int32 CollisionProposedGlobalMaxComponentsAfter = 0;
+	int32 CollisionProposedDonorComponentsBefore = 0;
+	int32 CollisionProposedDonorComponentsAfter = 0;
+	int32 CollisionProposedReceiverComponentsBefore = 0;
+	int32 CollisionProposedReceiverComponentsAfter = 0;
+	int32 CollisionProposedDonorLargestRemainingComponentSize = 0;
+	int32 CollisionProposedDonorNewFragmentCount = 0;
+	int32 CollisionProposedDonorSmallestNewFragmentSize = 0;
+	int32 CollisionProposedDonorLargestNewFragmentSize = 0;
+	double CollisionProposedDonorMeanNewFragmentSize = 0.0;
+	int32 CollisionProposedReceiverDisconnectedFragmentCount = 0;
+	int32 CollisionProposedReceiverLargestNewDisconnectedFragmentSize = 0;
+	int32 CollisionProposedTerraneSampleCount = 0;
+	int32 CollisionDonorComponentsBefore = 0;
+	int32 CollisionDonorComponentsAfter = 0;
+	int32 CollisionDonorLargestRemainingComponentSize = 0;
+	int32 CollisionDonorNewFragmentCount = 0;
+	int32 CollisionDonorSmallestNewFragmentSize = 0;
+	int32 CollisionDonorLargestNewFragmentSize = 0;
+	double CollisionDonorMeanNewFragmentSize = 0.0;
+	int32 CollisionAcceptedTerraneSampleCount = 0;
+	int32 CollisionReceiverComponentsBefore = 0;
+	int32 CollisionReceiverComponentsAfter = 0;
+	int32 CollisionReceiverDisconnectedFragmentCount = 0;
+	int32 CollisionReceiverLargestNewDisconnectedFragmentSize = 0;
+	int32 CollisionTrimmedByDonorProtectionCount = 0;
+	int32 CollisionRejectedByDonorProtectionCount = 0;
+	int32 CollisionTrimmedByDonorComponentCapCount = 0;
+	int32 CollisionTrimmedByDonorFragmentFloorCount = 0;
+	int32 CollisionRejectedByDonorComponentCapCount = 0;
+	int32 CollisionRejectedByDonorFragmentFloorCount = 0;
+	int32 CollisionTrimmedByReceiverProtectionCount = 0;
+	int32 CollisionRejectedByReceiverProtectionCount = 0;
+	double CollisionTransferTrimRatio = 0.0;
+	int32 GeometricCollisionRepeatedCandidatePlateA = INDEX_NONE;
+	int32 GeometricCollisionRepeatedCandidatePlateB = INDEX_NONE;
+	int32 GeometricCollisionRepeatedCandidateObservationCount = 0;
+	int32 GeometricCollisionRepeatedCandidateOverlapSampleCount = 0;
+	int32 GeometricCollisionRepeatedCandidateTerraneEstimate = 0;
+	double GeometricCollisionRepeatedCandidateAccumulatedPenetrationKm = 0.0;
+	double GeometricCollisionRepeatedCandidateEffectiveConvergenceKmPerMy = 0.0;
+	double GeometricCollisionRepeatedCandidateMeanConvergenceKmPerMy = 0.0;
+	double GeometricCollisionRepeatedCandidateMaxConvergenceKmPerMy = 0.0;
+	double GeometricCollisionRepeatedCandidateMeanOverlapDepthKm = 0.0;
+	double GeometricCollisionRepeatedCandidateMaxOverlapDepthKm = 0.0;
+	double GeometricCollisionDonorLocalityClampKm = 0.0;
+	double GeometricCollisionInfluenceRadiusScale = 1.0;
+	double GeometricCollisionPersistentPenetrationThresholdKm = 0.0;
+	int32 CollisionRepeatedPairCount = 0;
+	int32 CollisionRepeatedPairWithinCooldownCount = 0;
 	bool bBoundaryContactCollisionTriggered = false;
 	bool bBoundaryContactPersistenceTriggered = false;
+	bool bGeometricCollisionBestPassedMassFilter = false;
 	bool bUsedCachedBoundaryContactCollision = false;
+	bool bUsedGeometricCollisionExecution = false;
+	bool bCollisionReceiverTransferContiguousWithExistingTerritory = false;
+	double ContinentalAreaFraction = 0.0;
+	double BoundarySampleFraction = 0.0;
+	double GapRate = 0.0;
+	double OverlapRate = 0.0;
+	double ElevationMinKm = 0.0;
+	double ElevationMaxKm = 0.0;
+	double ElevationMeanKm = 0.0;
 	double RecoveryMeanDistance = 0.0;
 	double RecoveryP95Distance = 0.0;
 	double RecoveryMaxDistance = 0.0;
@@ -391,6 +711,21 @@ struct FPlate
 	FPlateTriangleSoupBVH SoupBVH;
 };
 
+struct AUROUS_API FTectonicPlanetRuntimeConfig
+{
+	EResamplingPolicy ResamplingPolicy = EResamplingPolicy::PeriodicFull;
+	bool bEnableAutomaticRifting = true;
+	bool bEnableWarpedRiftBoundaries = true;
+	int32 AutomaticRiftMinParentSamples = 2048;
+	int32 AutomaticRiftMinContinentalSamples = 256;
+	int32 AutomaticRiftCooldownSteps = 20;
+	double AutomaticRiftBaseRatePerMy = 0.01;
+	double AutomaticRiftMinContinentalFraction = 0.10;
+	double RiftBoundaryWarpAmplitude = 0.18;
+	double RiftBoundaryWarpFrequency = 1.5;
+	double AndeanContinentalConversionRatePerMy = 0.005;
+};
+
 struct AUROUS_API FTectonicPlanet
 {
 	TArray<FSample> Samples;
@@ -403,6 +738,7 @@ struct AUROUS_API FTectonicPlanet
 	double ContainmentRecoveryTolerance = 0.003;
 	int32 SampleCountConfig = 0;
 	int32 PlateCountConfig = 0;
+	int32 InitialPlateCountConfig = 0;
 	int32 SimulationSeed = 0;
 	int32 NextPlateId = 0;
 	int32 NextTerraneId = 0;
@@ -413,16 +749,23 @@ struct AUROUS_API FTectonicPlanet
 	int32 AutomaticRiftMinParentSamples = 2048;
 	int32 AutomaticRiftMinContinentalSamples = 256;
 	int32 AutomaticRiftCooldownSteps = 20;
-	double AutomaticRiftBaseLambdaPerStep = 0.01;
-	double AutomaticRiftParentSizeExponent = 1.0;
-	double AutomaticRiftContinentalExponent = 1.0;
+	int32 CollisionPairCooldownResamples = 1;
+	double AutomaticRiftBaseRatePerMy = 0.01;
 	double AutomaticRiftMinContinentalFraction = 0.10;
+	double AndeanContinentalConversionRatePerMy = 0.005;
+	double GeometricCollisionMinOverlapDepthKm = 300.0;
+	double GeometricCollisionMinPersistentPenetrationKm = 300.0;
+	double GeometricCollisionDonorLocalityClampKm = 2250.0;
+	double GeometricCollisionInfluenceRadiusScale = 2.1;
+	int32 GeometricCollisionDonorMaxComponentIncrease = 10;
+	int32 GeometricCollisionDonorMinNewFragmentSampleCount = 0;
 	bool bEnableSlabPull = true;
 	bool bEnableAndeanContinentalConversion = true;
 	bool bEnableOverlapHysteresis = false; // Legacy experiment path retained for tests.
 	bool bEnableContinentalCollision = true;
 	bool bEnableAutomaticRifting = true;
 	bool bEnableWarpedRiftBoundaries = true;
+	bool bUseVertexLevelSoupInclusionForTest = false; // Spike: include triangle in every plate that owns >= 1 vertex.
 	double RiftBoundaryWarpAmplitude = 0.18;
 	double RiftBoundaryWarpFrequency = 1.5;
 	EResamplingPolicy ResamplingPolicy = EResamplingPolicy::PeriodicFull;
@@ -431,11 +774,16 @@ struct AUROUS_API FTectonicPlanet
 	bool bPendingFullResolutionResample = false;
 	bool bPendingBoundaryContactPersistenceReset = false;
 	FResamplingStats LastResamplingStats;
+	TArray<FResamplingStats> ResamplingHistory;
 	TArray<int32> ResamplingSteps;
 	// Preserve-mode collision triggering state. Cleared after follow-up execution.
 	TMap<uint64, FBoundaryContactPersistence> BoundaryContactPersistenceByPair;
+	TMap<uint64, int32> CollisionLastExecutionOrdinalByPair;
+	TMap<uint64, FGeometricCollisionPairRecurrenceState> GeometricCollisionPairRecurrenceByKey;
 	FPendingBoundaryContactCollisionEvent PendingBoundaryContactCollisionEvent;
+	FPendingGeometricCollisionEvent PendingGeometricCollisionEvent;
 	FPendingRiftEvent PendingRiftEvent;
+	int32 ResamplingExecutionOrdinal = 0;
 
 	void Initialize(int32 InSampleCount, double InPlanetRadiusKm);
 	void InitializePlates(int32 InPlateCount, int32 InRandomSeed, float InBoundaryWarpAmplitude, float InContinentalFraction);
@@ -443,6 +791,10 @@ struct AUROUS_API FTectonicPlanet
 	void TriggerEventResampling(EResampleTriggerReason Reason);
 	bool TriggerForcedRift(int32 ParentPlateId, int32 ChildCount, int32 Seed = 0);
 	int32 FindPlateArrayIndexById(int32 PlateId) const;
+	int32 FindLargestEligibleAutomaticRiftParentId(
+		int32* OutContinentalSampleCount = nullptr,
+		double* OutContinentalFraction = nullptr) const;
+	double ComputeAutomaticRiftProbabilityForSampleCount(int32 ParentSampleCount, double ContinentalFraction) const;
 	void ComputePlateScores();
 	void BuildContainmentSoups();
 	void QueryOwnership(
@@ -455,7 +807,9 @@ struct AUROUS_API FTectonicPlanet
 		int32& OutOverlapCount,
 		TArray<TArray<int32>>* OutOverlapPlateIds = nullptr,
 		FResamplingStats* OutStats = nullptr,
-		EResampleOwnershipMode OwnershipMode = EResampleOwnershipMode::FullResolution) const;
+		EResampleOwnershipMode OwnershipMode = EResampleOwnershipMode::FullResolution,
+		TArray<uint8>* OutPreserveOwnershipCWRetainFlags = nullptr,
+		TArray<uint8>* OutPreserveOwnershipFallbackQueryFlags = nullptr) const;
 	void InterpolateFromCarried(
 		const TArray<int32>& NewPlateIds,
 		const TArray<int32>& ContainingTriangles,
@@ -463,12 +817,69 @@ struct AUROUS_API FTectonicPlanet
 		TArray<float>& OutSubductionDistances,
 		TArray<float>& OutSubductionSpeeds,
 		int32* OutMissingLocalCarriedLookupCount = nullptr);
+	// Testable seam for the narrow M6d fix: preserve CW only on same-plate preserve refreshes.
+	void ApplyPreserveOwnershipContinentalWeightRetention(
+		const TArray<uint8>& PreserveOwnershipCWRetainFlags,
+		const TArray<float>& PreviousContinentalWeights,
+		EResampleOwnershipMode OwnershipMode,
+		EResampleTriggerReason TriggerReason,
+		FResamplingStats* InOutStats = nullptr);
+	// Testable seam for the narrow M6ah fix: preserve CW when a preserve-mode
+	// fallback path resolves back onto the same owner after query/gap handling.
+	void ApplyPreserveOwnershipFallbackSamePlateRetention(
+		const TArray<int32>& NewPlateIds,
+		const TArray<int32>& PreviousPlateAssignments,
+		const TArray<float>& PreviousContinentalWeights,
+		const TArray<uint8>& PreserveOwnershipFallbackQueryFlags,
+		const TArray<EGapResolutionPath>& GapResolutionPaths,
+		EResampleOwnershipMode OwnershipMode,
+		EResampleTriggerReason TriggerReason,
+		FResamplingStats* InOutStats = nullptr);
+	// Testable seam for the narrow M6u fix: preserve CW only for same-plate
+	// full-resolution non-gap refreshes when interpolation alone would extinguish
+	// formerly continental crust.
+	void ApplyFullResolutionSamePlateContinentalWeightRetention(
+		const TArray<int32>& NewPlateIds,
+		const TArray<int32>& PreviousPlateAssignments,
+		const TArray<float>& PreviousContinentalWeights,
+		const TArray<EGapResolutionPath>& GapResolutionPaths,
+		EResampleOwnershipMode OwnershipMode,
+		EResampleTriggerReason TriggerReason,
+		FResamplingStats* InOutStats = nullptr);
+	void ApplyRiftFollowupLocalizationOverride(
+		TArray<int32>& InOutNewPlateIds,
+		const TArray<int32>& PreviousPlateAssignments,
+		const TArray<float>& PreviousContinentalWeights,
+		TArray<uint8>* InOutGapFlags = nullptr,
+		TArray<uint8>* InOutOverlapFlags = nullptr,
+		TArray<TArray<int32>>* InOutOverlapPlateIds = nullptr,
+		TArray<float>* InOutSubductionDistances = nullptr,
+		TArray<float>* InOutSubductionSpeeds = nullptr,
+		TArray<EGapResolutionPath>* InOutGapResolutionPaths = nullptr,
+		TArray<uint8>* OutLocalizedRestoreFlags = nullptr,
+		FResamplingStats* InOutStats = nullptr);
+	void ApplyRiftFollowupFinalOwnerContinentalWeightReconciliation(
+		const TArray<int32>& InterpolationPlateIds,
+		const TArray<int32>& FinalPlateIds,
+		const TArray<int32>& PreviousPlateAssignments,
+		const TArray<float>& PreviousContinentalWeights,
+		const TArray<uint8>& LocalizedRestoreFlags,
+		FResamplingStats* InOutStats = nullptr);
+	void ApplyRiftChildCoherenceProtection(
+		TArray<int32>& InOutNewPlateIds,
+		const TArray<int32>& PreviousPlateAssignments,
+		TArray<uint8>* InOutGapFlags = nullptr,
+		TArray<uint8>* InOutOverlapFlags = nullptr,
+		TArray<TArray<int32>>* InOutOverlapPlateIds = nullptr,
+		TArray<EGapResolutionPath>* InOutGapResolutionPaths = nullptr,
+		FResamplingStats* InOutStats = nullptr) const;
 	void ResolveGaps(
 		TArray<int32>& NewPlateIds,
 		const TArray<uint8>& GapFlags,
 		TArray<float>& InOutSubductionDistances,
 		TArray<float>& InOutSubductionSpeeds,
-		FResamplingStats* InOutStats = nullptr);
+		FResamplingStats* InOutStats = nullptr,
+		TArray<EGapResolutionPath>* OutGapResolutionPaths = nullptr);
 	void RepartitionMembership(
 		const TArray<int32>& NewPlateIds,
 		const TArray<float>* InSubductionDistances = nullptr,
@@ -477,6 +888,10 @@ struct AUROUS_API FTectonicPlanet
 		const TArray<uint8>& OverlapFlags,
 		const TArray<TArray<int32>>& OverlapPlateIds,
 		TArray<FCollisionCandidate>& OutCandidates) const;
+	bool DetectGeometricCollisionOverlapDiagnostics(
+		const TArray<int32>& OwningPlateIds,
+		FResamplingStats* InOutStats = nullptr,
+		FPendingGeometricCollisionEvent* OutPendingEvent = nullptr);
 	bool DetectBoundaryContactCollisionTrigger(
 		FResamplingStats* InOutStats = nullptr,
 		FPendingBoundaryContactCollisionEvent* OutPendingEvent = nullptr) const;
@@ -493,7 +908,7 @@ struct AUROUS_API FTectonicPlanet
 		const TArray<int32>& PreviousTerraneAssignments,
 		TArray<int32>& InOutNewPlateIds,
 		FCollisionEvent& OutEvent,
-		FResamplingStats* InOutStats = nullptr) const;
+		FResamplingStats* InOutStats = nullptr);
 	void ApplyCollisionElevationSurge(
 		const FCollisionEvent& CollisionEvent,
 		FResamplingStats* InOutStats = nullptr);
@@ -524,5 +939,12 @@ struct AUROUS_API FTectonicPlanet
 		int32 ChildCount,
 		int32& OutContinentalSampleCount,
 		double& OutContinentalFraction) const;
-	double ComputeAutomaticRiftProbability(const FPlate& Plate, double ContinentalFraction) const;
 };
+
+AUROUS_API FTectonicPlanetRuntimeConfig GetM6BaselineRuntimeConfig();
+AUROUS_API FTectonicPlanetRuntimeConfig GetArchitectureSpikeARuntimeConfig();
+AUROUS_API FTectonicPlanetRuntimeConfig CaptureTectonicPlanetRuntimeConfig(const FTectonicPlanet& Planet);
+AUROUS_API void ApplyTectonicPlanetRuntimeConfig(
+	FTectonicPlanet& Planet,
+	const FTectonicPlanetRuntimeConfig& Config);
+AUROUS_API FString DescribeTectonicPlanetRuntimeConfig(const FTectonicPlanetRuntimeConfig& Config);

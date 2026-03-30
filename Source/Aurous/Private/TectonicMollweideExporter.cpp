@@ -562,3 +562,208 @@ bool TectonicMollweideExporter::ExportPlanet(
 
 	return true;
 }
+
+bool TectonicMollweideExporter::ExportScalarOverlay(
+	const FTectonicPlanet& Planet,
+	const TArray<float>& PerSampleValues,
+	const float MinValue,
+	const float MaxValue,
+	const FString& OutputPath,
+	const int32 Width,
+	const int32 Height,
+	FString& OutError)
+{
+	if (Planet.Samples.IsEmpty() || Planet.TriangleIndices.IsEmpty())
+	{
+		OutError = TEXT("Planet has no canonical mesh data to export.");
+		return false;
+	}
+
+	if (PerSampleValues.Num() != Planet.Samples.Num())
+	{
+		OutError = FString::Printf(
+			TEXT("PerSampleValues size (%d) does not match Samples size (%d)."),
+			PerSampleValues.Num(), Planet.Samples.Num());
+		return false;
+	}
+
+	if (Width <= 0 || Height <= 0)
+	{
+		OutError = TEXT("Export dimensions must be positive.");
+		return false;
+	}
+
+	const FString OutputDirectory = FPaths::GetPath(OutputPath);
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	if (!PlatformFile.CreateDirectoryTree(*OutputDirectory))
+	{
+		OutError = FString::Printf(TEXT("Failed to create output directory: %s"), *OutputDirectory);
+		return false;
+	}
+
+	const int32 PixelCount = Width * Height;
+	TArray<float> ScalarBuffer;
+	TArray<uint8> CoverageBuffer;
+	ScalarBuffer.Init(0.0f, PixelCount);
+	CoverageBuffer.Init(0, PixelCount);
+
+	// Project samples
+	TArray<FVector2d> ProjectedPixels;
+	ProjectedPixels.SetNum(Planet.Samples.Num());
+	for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+	{
+		ProjectedPixels[SampleIndex] = ProjectMollweidePixel(
+			Planet.Samples[SampleIndex].Position, Width, Height);
+	}
+
+	// Rasterize triangles
+	for (const FIntVector& Triangle : Planet.TriangleIndices)
+	{
+		if (!Planet.Samples.IsValidIndex(Triangle.X) ||
+			!Planet.Samples.IsValidIndex(Triangle.Y) ||
+			!Planet.Samples.IsValidIndex(Triangle.Z))
+		{
+			continue;
+		}
+
+		FVector2d P0 = ProjectedPixels[Triangle.X];
+		FVector2d P1 = ProjectedPixels[Triangle.Y];
+		FVector2d P2 = ProjectedPixels[Triangle.Z];
+		UnwrapTriangleX(P0, P1, P2, static_cast<double>(Width));
+
+		const double TwiceArea = EdgeFunction(P0, P1, P2);
+		if (FMath::Abs(TwiceArea) <= RasterEpsilon)
+		{
+			continue;
+		}
+
+		const int32 MinPixelX = FMath::FloorToInt(FMath::Min3(P0.X, P1.X, P2.X));
+		const int32 MaxPixelX = FMath::CeilToInt(FMath::Max3(P0.X, P1.X, P2.X));
+		const double ExpectedEdgePx = static_cast<double>(Width) *
+			FMath::Sqrt(4.0 * PI / FMath::Max(Planet.Samples.Num(), 1)) / PI;
+		const int32 MaxTriangleWidthPx = FMath::Max(FMath::CeilToInt(ExpectedEdgePx * 30.0), 50);
+		if ((MaxPixelX - MinPixelX) > MaxTriangleWidthPx)
+		{
+			continue;
+		}
+
+		const int32 MinPixelY = FMath::Clamp(FMath::FloorToInt(FMath::Min3(P0.Y, P1.Y, P2.Y)), 0, Height - 1);
+		const int32 MaxPixelY = FMath::Clamp(FMath::CeilToInt(FMath::Max3(P0.Y, P1.Y, P2.Y)), 0, Height - 1);
+		if (MinPixelY > MaxPixelY)
+		{
+			continue;
+		}
+
+		const float V0 = PerSampleValues[Triangle.X];
+		const float V1 = PerSampleValues[Triangle.Y];
+		const float V2 = PerSampleValues[Triangle.Z];
+
+		for (int32 PixelY = MinPixelY; PixelY <= MaxPixelY; ++PixelY)
+		{
+			for (int32 PixelX = MinPixelX; PixelX <= MaxPixelX; ++PixelX)
+			{
+				const FVector2d PixelCenter(
+					static_cast<double>(PixelX) + 0.5,
+					static_cast<double>(PixelY) + 0.5);
+				const double W0 = EdgeFunction(P1, P2, PixelCenter) / TwiceArea;
+				const double W1 = EdgeFunction(P2, P0, PixelCenter) / TwiceArea;
+				const double W2 = EdgeFunction(P0, P1, PixelCenter) / TwiceArea;
+				if (W0 < -RasterEpsilon || W1 < -RasterEpsilon || W2 < -RasterEpsilon)
+				{
+					continue;
+				}
+
+				const int32 WrappedX = WrapPixelX(PixelX, Width);
+				const int32 BufferIndex = PixelY * Width + WrappedX;
+				ScalarBuffer[BufferIndex] = static_cast<float>(W0 * V0 + W1 * V1 + W2 * V2);
+				CoverageBuffer[BufferIndex] = 1;
+			}
+		}
+	}
+
+	// Gap fill (iterative nearest-neighbor, same logic as core exporter)
+	constexpr int32 MaxGapFillIterations = 16;
+	for (int32 Iteration = 0; Iteration < MaxGapFillIterations; ++Iteration)
+	{
+		TArray<float> PreviousScalar = ScalarBuffer;
+		TArray<uint8> PreviousCoverage = CoverageBuffer;
+		int32 FilledCount = 0;
+
+		for (int32 PixelY = 0; PixelY < Height; ++PixelY)
+		{
+			for (int32 PixelX = 0; PixelX < Width; ++PixelX)
+			{
+				const int32 PixelIndex = PixelY * Width + PixelX;
+				if (PreviousCoverage[PixelIndex] != 0)
+				{
+					continue;
+				}
+				if (!IsInsideMollweideEllipse(PixelX, PixelY, Width, Height))
+				{
+					continue;
+				}
+
+				int32 BestNeighborIndex = INDEX_NONE;
+				for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY)
+				{
+					const int32 NeighborY = PixelY + OffsetY;
+					if (NeighborY < 0 || NeighborY >= Height)
+					{
+						continue;
+					}
+					for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX)
+					{
+						if (OffsetX == 0 && OffsetY == 0) { continue; }
+						const int32 NeighborX = WrapPixelX(PixelX + OffsetX, Width);
+						const int32 NeighborIndex = NeighborY * Width + NeighborX;
+						if (PreviousCoverage[NeighborIndex] != 0 &&
+							(BestNeighborIndex == INDEX_NONE || NeighborIndex < BestNeighborIndex))
+						{
+							BestNeighborIndex = NeighborIndex;
+						}
+					}
+				}
+
+				if (BestNeighborIndex != INDEX_NONE)
+				{
+					ScalarBuffer[PixelIndex] = PreviousScalar[BestNeighborIndex];
+					CoverageBuffer[PixelIndex] = 1;
+					++FilledCount;
+				}
+			}
+		}
+
+		if (FilledCount == 0)
+		{
+			break;
+		}
+	}
+
+	// Build grayscale image
+	const float Range = FMath::Max(MaxValue - MinValue, UE_SMALL_NUMBER);
+	TArray<FColor> Pixels;
+	Pixels.SetNum(PixelCount);
+	for (int32 PixelIndex = 0; PixelIndex < PixelCount; ++PixelIndex)
+	{
+		const int32 PixelX = PixelIndex % Width;
+		const int32 PixelY = PixelIndex / Width;
+		if (CoverageBuffer[PixelIndex] == 0 || !IsInsideMollweideEllipse(PixelX, PixelY, Width, Height))
+		{
+			Pixels[PixelIndex] = FColor::Black;
+			continue;
+		}
+
+		const float Normalized = FMath::Clamp((ScalarBuffer[PixelIndex] - MinValue) / Range, 0.0f, 1.0f);
+		const uint8 Intensity = static_cast<uint8>(Normalized * 255.0f);
+		Pixels[PixelIndex] = FColor(Intensity, Intensity, Intensity, 255);
+	}
+
+	FString WriteError;
+	if (!WritePng(OutputPath, Pixels, Width, Height, WriteError))
+	{
+		OutError = WriteError;
+		return false;
+	}
+
+	return true;
+}

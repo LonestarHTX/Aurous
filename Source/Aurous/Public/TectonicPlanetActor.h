@@ -66,12 +66,15 @@ public:
 	double GetConfiguredPlanetRadiusKm() const { return PlanetRadiusKm; }
 	float GetConfiguredBoundaryWarpAmplitude() const { return BoundaryWarpAmplitude; }
 	float GetConfiguredContinentalFraction() const { return ContinentalFraction; }
+	bool GetUseM6BaselineRuntimePreset() const { return bUseM6BaselineRuntimePreset; }
 	int32 GetConfiguredExportWidth() const { return ExportWidth; }
 	ETectonicMapExportMode GetVisualizationMode() const { return VisualizationMode; }
 	double GetLastAdvanceStepMs() const { return LastAdvanceStepMs; }
 	bool GetShowPlateVelocities() const { return bShowPlateVelocities; }
 	bool GetShowPlateBoundaries() const { return bShowPlateBoundaries; }
 	bool GetShowBoundaryTypes() const { return bShowBoundaryTypes; }
+	FString GetActiveRuntimePresetLabel() const;
+	FString GetRuntimeConfigSummary() const;
 
 protected:
 	virtual void BeginPlay() override;
@@ -94,6 +97,9 @@ protected:
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Planet|Initialization", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float ContinentalFraction = 0.30f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Planet|Runtime")
+	bool bUseM6BaselineRuntimePreset = true;
 
 private:
 #if WITH_EDITOR
