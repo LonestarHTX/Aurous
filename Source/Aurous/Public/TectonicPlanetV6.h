@@ -855,6 +855,81 @@ struct AUROUS_API FTectonicPlanetV6ActiveZoneDiagnostic
 	int32 OwnershipChangeUnknownOtherCount = 0;
 };
 
+struct AUROUS_API FTectonicPlanetV6CollisionShadowTopPair
+{
+	int32 PlateA = INDEX_NONE;
+	int32 PlateB = INDEX_NONE;
+	int32 ObservationCount = 0;
+	double AccumulatedPenetrationKm = 0.0;
+	double MeanConvergenceKmPerMy = 0.0;
+	double MaxConvergenceKmPerMy = 0.0;
+	int32 SupportSampleCount = 0;
+	int32 SupportTriangleCount = 0;
+	int32 ContinentalSupportPlateACount = 0;
+	int32 ContinentalSupportPlateBCount = 0;
+	int32 ContinentalQualifiedSampleCount = 0;
+	int32 SubductionSampleCount = 0;
+	int32 CollisionSampleCount = 0;
+	bool bQualified = false;
+};
+
+struct AUROUS_API FTectonicPlanetV6CollisionShadowDiagnostic
+{
+	int32 TrackedConvergentPairCount = 0;
+	int32 TrackedConvergentRegionCount = 0;
+	int32 TrackedSubductionSampleCount = 0;
+	int32 TrackedSubductionTriangleCount = 0;
+	int32 TrackedCollisionSampleCount = 0;
+	int32 TrackedCollisionTriangleCount = 0;
+	int32 CollisionShadowCandidateCount = 0;
+	int32 CollisionShadowQualifiedCount = 0;
+	int32 PersistentObservedPairCount = 0;
+	int32 ContinentalQualifiedCandidateCount = 0;
+	int32 CandidateRejectedBySupportCount = 0;
+	int32 CandidateRejectedByThresholdCount = 0;
+	int32 CandidateRejectedByContinentalityCount = 0;
+	int32 CandidateRejectedByPersistenceCount = 0;
+	int32 BestCandidatePlateA = INDEX_NONE;
+	int32 BestCandidatePlateB = INDEX_NONE;
+	int32 BestCandidateObservationCount = 0;
+	double BestCandidateAccumulatedPenetrationKm = 0.0;
+	double BestCandidateMeanConvergenceKmPerMy = 0.0;
+	double BestCandidateMaxConvergenceKmPerMy = 0.0;
+	int32 BestCandidateSupportSampleCount = 0;
+	int32 BestCandidateSupportTriangleCount = 0;
+	int32 BestCandidateContinentalQualifiedSampleCount = 0;
+	TArray<FTectonicPlanetV6CollisionShadowTopPair> TopPairs;
+};
+
+struct AUROUS_API FTectonicPlanetV6CollisionExecutionDiagnostic
+{
+	int32 ExecutedCollisionCount = 0;
+	int32 CumulativeExecutedCollisionCount = 0;
+	int32 ExecutedPlateA = INDEX_NONE;
+	int32 ExecutedPlateB = INDEX_NONE;
+	int32 ExecutedOverridingPlateId = INDEX_NONE;
+	int32 ExecutedSubductingPlateId = INDEX_NONE;
+	int32 ExecutedObservationCount = 0;
+	double ExecutedAccumulatedPenetrationKm = 0.0;
+	double ExecutedMeanConvergenceKmPerMy = 0.0;
+	double ExecutedMaxConvergenceKmPerMy = 0.0;
+	int32 ExecutedSupportSampleCount = 0;
+	int32 ExecutedSupportTriangleCount = 0;
+	int32 ExecutedContinentalSupportPlateACount = 0;
+	int32 ExecutedContinentalSupportPlateBCount = 0;
+	int32 ExecutedContinentalQualifiedSampleCount = 0;
+	int32 ExecutedSeedSampleCount = 0;
+	int32 ExecutedCollisionSeedSampleCount = 0;
+	int32 CollisionAffectedSampleCount = 0;
+	int32 CollisionDrivenContinentalGainCount = 0;
+	int32 CollisionDrivenOwnershipChangeCount = 0;
+	int32 CooldownSuppressedQualifiedCount = 0;
+	int32 QualifiedButUnexecutedCount = 0;
+	double ExecutedInfluenceRadiusRad = 0.0;
+	double ExecutedMeanElevationDeltaKm = 0.0;
+	bool bExecutedFromShadowQualifiedState = false;
+};
+
 struct AUROUS_API FTectonicPlanetV6
 {
 	void Initialize(
@@ -890,8 +965,18 @@ struct AUROUS_API FTectonicPlanetV6
 	FTectonicPlanetV6FrontRetreatDiagnostic ComputeFrontRetreatDiagnosticForTest() const;
 	FTectonicPlanetV6OwnerCoverageAudit ComputeCurrentOwnerCoverageAuditForTest() const;
 	FTectonicPlanetV6ActiveZoneDiagnostic ComputeActiveZoneDiagnosticForTest() const;
+	FTectonicPlanetV6CollisionShadowDiagnostic ComputeCollisionShadowDiagnosticForTest() const;
+	FTectonicPlanetV6CollisionExecutionDiagnostic ComputeCollisionExecutionDiagnosticForTest() const;
 	const TArray<FTectonicPlanetV6ResolvedSample>& GetLastResolvedSamplesForTest() const { return LastResolvedSamples; }
 	const TArray<uint8>& GetMissLineageCountsForTest() const { return MissLineageCounts; }
+	const TArray<uint8>& GetCollisionShadowPersistenceMaskForTest() const
+	{
+		return CurrentSolveCollisionShadowPersistenceMask;
+	}
+	const TArray<uint8>& GetCollisionExecutionMaskForTest() const
+	{
+		return CurrentSolveCollisionExecutionMask;
+	}
 
 	const FTectonicPlanet& GetPlanet() const;
 	FTectonicPlanet& GetPlanetMutable();
@@ -908,6 +993,8 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetV9Phase1AuthorityForTest(bool bEnable, int32 InActiveBoundaryRingCount = 1);
 	void SetV9Phase1ActiveZoneClassifierModeForTest(ETectonicPlanetV6ActiveZoneClassifierMode InMode);
 	void SetV9Phase1PersistentActivePairHorizonForTest(int32 InPersistenceHorizon);
+	void SetV9CollisionShadowForTest(bool bEnable);
+	void SetV9CollisionExecutionForTest(bool bEnable);
 
 	static FTectonicPlanetV6ResolvedSample ResolvePhase1OwnershipForTest(
 		const TArray<FTectonicPlanetV6OwnerCandidate>& OwnerCandidates,
@@ -1023,11 +1110,22 @@ private:
 	int32 CurrentSolveFreshPairAdmittedRiftCount = 0;
 	TArray<uint8> CurrentSolveOutsideActiveZoneQueryMissFlags;
 	TArray<uint8> CurrentSolveOutsideActiveZoneCoverageDeficitFlags;
+	TArray<uint8> CurrentSolveCollisionShadowTrackedFlags;
+	TArray<uint8> CurrentSolveCollisionShadowQualifiedFlags;
+	TArray<uint8> CurrentSolveCollisionShadowPersistenceMask;
+	FTectonicPlanetV6CollisionShadowDiagnostic CurrentSolveCollisionShadowDiagnostic;
+	TArray<uint8> CurrentSolveCollisionExecutionMask;
+	FTectonicPlanetV6CollisionExecutionDiagnostic CurrentSolveCollisionExecutionDiagnostic;
+	TMap<uint64, FGeometricCollisionPairRecurrenceState> V9CollisionShadowPairRecurrenceByKey;
+	TMap<uint64, int32> V9CollisionExecutionLastSolveIndexByKey;
+	int32 V9CollisionExecutionCumulativeCount = 0;
 	bool bEnableSyntheticCoverageRetentionForTest = false;
 	bool bForceWholeTriangleBoundaryDuplicationForTest = false;
 	bool bForceExcludeMixedTrianglesForTest = false;
 	bool bForcePerTimestepContainmentSoupRebuildForTest = false;
 	bool bEnableV9Phase1AuthorityForTest = false;
+	bool bEnableV9CollisionShadowForTest = false;
+	bool bEnableV9CollisionExecutionForTest = false;
 	int32 V9Phase1ActiveBoundaryRingCountForTest = 1;
 	int32 V9Phase1PersistentActivePairHorizonForTest = 2;
 	ETectonicPlanetV6ActiveZoneClassifierMode V9Phase1ActiveZoneClassifierModeForTest =

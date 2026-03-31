@@ -112,6 +112,8 @@ namespace
 		FTectonicPlanetV6SyntheticCoveragePersistenceDiagnostic SyntheticCoveragePersistence;
 		FTectonicPlanetV6FrontRetreatDiagnostic FrontRetreat;
 		FTectonicPlanetV6ActiveZoneDiagnostic ActiveZone;
+		FTectonicPlanetV6CollisionShadowDiagnostic CollisionShadow;
+		FTectonicPlanetV6CollisionExecutionDiagnostic CollisionExecution;
 	};
 
 	struct FV6BaselineSummary
@@ -419,6 +421,8 @@ namespace
 		Snapshot.SyntheticCoveragePersistence = Planet.ComputeSyntheticCoveragePersistenceDiagnosticForTest();
 		Snapshot.FrontRetreat = Planet.ComputeFrontRetreatDiagnosticForTest();
 		Snapshot.ActiveZone = Planet.ComputeActiveZoneDiagnosticForTest();
+		Snapshot.CollisionShadow = Planet.ComputeCollisionShadowDiagnosticForTest();
+		Snapshot.CollisionExecution = Planet.ComputeCollisionExecutionDiagnosticForTest();
 		return Snapshot;
 	}
 
@@ -951,6 +955,112 @@ namespace
 		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
 	}
 
+	void AddV6CollisionShadowInfo(
+		FAutomationTestBase& Test,
+		const FString& SummaryTag,
+		const FV6CheckpointSnapshot& Snapshot)
+	{
+		const FTectonicPlanetV6CollisionShadowDiagnostic& CS = Snapshot.CollisionShadow;
+		const auto FormatTopPairs = [](const TArray<FTectonicPlanetV6CollisionShadowTopPair>& TopPairs) -> FString
+		{
+			if (TopPairs.IsEmpty())
+			{
+				return TEXT("none");
+			}
+
+			TArray<FString> Parts;
+			Parts.Reserve(TopPairs.Num());
+			for (const FTectonicPlanetV6CollisionShadowTopPair& Pair : TopPairs)
+			{
+				Parts.Add(FString::Printf(
+					TEXT("(%d,%d):obs=%d pen=%.1f conv=%.2f/%.2f support=%d tris=%d cont=%d/%d qualified=%d"),
+					Pair.PlateA,
+					Pair.PlateB,
+					Pair.ObservationCount,
+					Pair.AccumulatedPenetrationKm,
+					Pair.MeanConvergenceKmPerMy,
+					Pair.MaxConvergenceKmPerMy,
+					Pair.SupportSampleCount,
+					Pair.SupportTriangleCount,
+					Pair.ContinentalSupportPlateACount,
+					Pair.ContinentalSupportPlateBCount,
+					Pair.bQualified ? 1 : 0));
+			}
+
+			return FString::Join(Parts, TEXT(" | "));
+		};
+
+		const FString Message = FString::Printf(
+			TEXT("%s step=%d shadow_tracked_pairs=%d shadow_regions=%d shadow_subduction_samples=%d shadow_subduction_triangles=%d shadow_collision_samples=%d shadow_collision_triangles=%d shadow_candidates=%d shadow_qualified=%d shadow_persistent_pairs=%d shadow_continental_qualified=%d shadow_reject_support=%d shadow_reject_threshold=%d shadow_reject_continentality=%d shadow_reject_persistence=%d shadow_best_pair=(%d,%d) shadow_best_obs=%d shadow_best_penetration_km=%.1f shadow_best_mean_convergence_km_per_my=%.3f shadow_best_max_convergence_km_per_my=%.3f shadow_best_support=%d shadow_best_triangles=%d shadow_best_continental_samples=%d top_pairs=%s"),
+			*SummaryTag,
+			Snapshot.Step,
+			CS.TrackedConvergentPairCount,
+			CS.TrackedConvergentRegionCount,
+			CS.TrackedSubductionSampleCount,
+			CS.TrackedSubductionTriangleCount,
+			CS.TrackedCollisionSampleCount,
+			CS.TrackedCollisionTriangleCount,
+			CS.CollisionShadowCandidateCount,
+			CS.CollisionShadowQualifiedCount,
+			CS.PersistentObservedPairCount,
+			CS.ContinentalQualifiedCandidateCount,
+			CS.CandidateRejectedBySupportCount,
+			CS.CandidateRejectedByThresholdCount,
+			CS.CandidateRejectedByContinentalityCount,
+			CS.CandidateRejectedByPersistenceCount,
+			CS.BestCandidatePlateA,
+			CS.BestCandidatePlateB,
+			CS.BestCandidateObservationCount,
+			CS.BestCandidateAccumulatedPenetrationKm,
+			CS.BestCandidateMeanConvergenceKmPerMy,
+			CS.BestCandidateMaxConvergenceKmPerMy,
+			CS.BestCandidateSupportSampleCount,
+			CS.BestCandidateSupportTriangleCount,
+			CS.BestCandidateContinentalQualifiedSampleCount,
+			*FormatTopPairs(CS.TopPairs));
+		Test.AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	}
+
+	void AddV6CollisionExecutionInfo(
+		FAutomationTestBase& Test,
+		const FString& SummaryTag,
+		const FV6CheckpointSnapshot& Snapshot)
+	{
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& CE = Snapshot.CollisionExecution;
+		const FString Message = FString::Printf(
+			TEXT("%s step=%d exec_collision_count=%d exec_collision_cumulative=%d exec_pair=(%d,%d) exec_over_plate=%d exec_sub_plate=%d exec_obs=%d exec_penetration_km=%.1f exec_mean_convergence_km_per_my=%.3f exec_max_convergence_km_per_my=%.3f exec_support=%d exec_triangles=%d exec_continental_support=%d/%d exec_qualified_samples=%d exec_seed_samples=%d exec_collision_seed_samples=%d exec_affected=%d exec_continental_gain=%d exec_ownership_change=%d exec_cooldown_suppressed=%d exec_qualified_unexecuted=%d exec_radius_rad=%.6f exec_mean_elev_delta_km=%.6f exec_from_shadow=%d"),
+			*SummaryTag,
+			Snapshot.Step,
+			CE.ExecutedCollisionCount,
+			CE.CumulativeExecutedCollisionCount,
+			CE.ExecutedPlateA,
+			CE.ExecutedPlateB,
+			CE.ExecutedOverridingPlateId,
+			CE.ExecutedSubductingPlateId,
+			CE.ExecutedObservationCount,
+			CE.ExecutedAccumulatedPenetrationKm,
+			CE.ExecutedMeanConvergenceKmPerMy,
+			CE.ExecutedMaxConvergenceKmPerMy,
+			CE.ExecutedSupportSampleCount,
+			CE.ExecutedSupportTriangleCount,
+			CE.ExecutedContinentalSupportPlateACount,
+			CE.ExecutedContinentalSupportPlateBCount,
+			CE.ExecutedContinentalQualifiedSampleCount,
+			CE.ExecutedSeedSampleCount,
+			CE.ExecutedCollisionSeedSampleCount,
+			CE.CollisionAffectedSampleCount,
+			CE.CollisionDrivenContinentalGainCount,
+			CE.CollisionDrivenOwnershipChangeCount,
+			CE.CooldownSuppressedQualifiedCount,
+			CE.QualifiedButUnexecutedCount,
+			CE.ExecutedInfluenceRadiusRad,
+			CE.ExecutedMeanElevationDeltaKm,
+			CE.bExecutedFromShadowQualifiedState ? 1 : 0);
+		Test.AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	}
+
 	void AddV6TectonicInteractionInfo(
 		FAutomationTestBase& Test,
 		const FString& SummaryTag,
@@ -1416,6 +1526,66 @@ namespace
 					PlanetData, LineageValues, 0.0f, 5.0f, OutputPath, TestExportWidth, TestExportHeight, Error))
 				{
 					Test.AddError(FString::Printf(TEXT("MissLineageMask export step %d failed: %s"), Step, *Error));
+					bAllSucceeded = false;
+				}
+			}
+		}
+
+		// 3. ConvergentPersistenceMask: current shadow persistence count for convergent/collision samples
+		{
+			const TArray<uint8>& PersistenceCounts = Planet.GetCollisionShadowPersistenceMaskForTest();
+			if (PersistenceCounts.Num() == SampleCount)
+			{
+				TArray<float> PersistenceValues;
+				PersistenceValues.SetNum(SampleCount);
+				float MaxPersistence = 1.0f;
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					PersistenceValues[I] = static_cast<float>(PersistenceCounts[I]);
+					MaxPersistence = FMath::Max(MaxPersistence, PersistenceValues[I]);
+				}
+
+				const FString OutputPath = FPaths::Combine(OutputDirectory, TEXT("ConvergentPersistenceMask.png"));
+				if (!TectonicMollweideExporter::ExportScalarOverlay(
+					PlanetData,
+					PersistenceValues,
+					0.0f,
+					MaxPersistence,
+					OutputPath,
+					TestExportWidth,
+					TestExportHeight,
+					Error))
+				{
+					Test.AddError(FString::Printf(TEXT("ConvergentPersistenceMask export step %d failed: %s"), Step, *Error));
+					bAllSucceeded = false;
+				}
+			}
+		}
+
+		// 4. CollisionExecutedMask: samples affected by the current solve's collision execution slice
+		{
+			const TArray<uint8>& CollisionExecutionMask = Planet.GetCollisionExecutionMaskForTest();
+			if (CollisionExecutionMask.Num() == SampleCount)
+			{
+				TArray<float> CollisionExecutionValues;
+				CollisionExecutionValues.SetNum(SampleCount);
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					CollisionExecutionValues[I] = CollisionExecutionMask[I] != 0 ? 1.0f : 0.0f;
+				}
+
+				const FString OutputPath = FPaths::Combine(OutputDirectory, TEXT("CollisionExecutedMask.png"));
+				if (!TectonicMollweideExporter::ExportScalarOverlay(
+					PlanetData,
+					CollisionExecutionValues,
+					0.0f,
+					1.0f,
+					OutputPath,
+					TestExportWidth,
+					TestExportHeight,
+					Error))
+				{
+					Test.AddError(FString::Printf(TEXT("CollisionExecutedMask export step %d failed: %s"), Step, *Error));
 					bAllSucceeded = false;
 				}
 			}
@@ -5900,6 +6070,140 @@ bool FTectonicPlanetV6V9Phase1dStep200ValidationTest::RunTest(const FString& Par
 		AddV6BoundaryCoherenceInfo(*this, *Tag, Snapshot);
 		AddV6InteriorInstabilityInfo(*this, *Tag, Snapshot);
 		AddV6SyntheticCoveragePersistenceInfo(*this, *Tag, Snapshot);
+	};
+
+	Planet.AdvanceSteps(25);
+	LogCheckpoint(25);
+
+	Planet.AdvanceSteps(75);
+	LogCheckpoint(100);
+
+	Planet.AdvanceSteps(100);
+	LogCheckpoint(200);
+
+	TestTrue(TEXT("Reached step 200"), Planet.GetPlanet().CurrentStep == 200);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9Phase1dCollisionShadowValidationTest,
+	"Aurous.TectonicPlanet.V6V9Phase1dCollisionShadowValidationTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9Phase1dCollisionShadowValidationTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	const FString RunId = TEXT("V9Phase1dCollisionShadowValidation");
+
+	FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+		ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+		FixedIntervalSteps,
+		INDEX_NONE,
+		SampleCount,
+		PlateCount,
+		TestRandomSeed);
+	Planet.SetSyntheticCoverageRetentionForTest(false);
+	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+	Planet.SetExcludeMixedTrianglesForTest(false);
+	Planet.SetV9Phase1AuthorityForTest(true, 1);
+	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+	Planet.SetV9CollisionShadowForTest(true);
+
+	const FString ExportRoot = FPaths::Combine(
+		FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*ExportRoot);
+	ExportV6CheckpointMaps(*this, Planet, ExportRoot, 0);
+	ExportV6DebugOverlays(*this, Planet, ExportRoot, 0);
+
+	const auto LogCheckpoint = [this, &Planet, &ExportRoot](const int32 Step)
+	{
+		ExportV6CheckpointMaps(*this, Planet, ExportRoot, Step);
+		ExportV6DebugOverlays(*this, Planet, ExportRoot, Step);
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+		const FString Tag = FString::Printf(TEXT("[V9Phase1dCollisionShadow step=%d]"), Step);
+		AddV6ThesisRemeshInfo(*this, *Tag, Snapshot);
+		AddV6DiagnosticsPackageInfo(*this, *Tag, Snapshot);
+		AddV6BoundaryCoherenceInfo(*this, *Tag, Snapshot);
+		AddV6InteriorInstabilityInfo(*this, *Tag, Snapshot);
+		AddV6SyntheticCoveragePersistenceInfo(*this, *Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, *Tag, Snapshot);
+		AddV6TectonicInteractionInfo(*this, *Tag, Snapshot);
+		AddV6CollisionShadowInfo(*this, *Tag, Snapshot);
+	};
+
+	Planet.AdvanceSteps(25);
+	LogCheckpoint(25);
+
+	Planet.AdvanceSteps(75);
+	LogCheckpoint(100);
+
+	Planet.AdvanceSteps(100);
+	LogCheckpoint(200);
+
+	const FV6CheckpointSnapshot FinalSnapshot = BuildV6CheckpointSnapshot(Planet);
+	TestTrue(TEXT("Reached step 200"), Planet.GetPlanet().CurrentStep == 200);
+	TestEqual(TEXT("Collision execution remains disabled in shadow mode"), FinalSnapshot.CollisionCount, 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9Phase1dCollisionExecutionValidationTest,
+	"Aurous.TectonicPlanet.V6V9Phase1dCollisionExecutionValidationTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9Phase1dCollisionExecutionValidationTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	const FString RunId = TEXT("V9Phase1dCollisionExecutionValidation");
+
+	FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+		ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+		FixedIntervalSteps,
+		INDEX_NONE,
+		SampleCount,
+		PlateCount,
+		TestRandomSeed);
+	Planet.SetSyntheticCoverageRetentionForTest(false);
+	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+	Planet.SetExcludeMixedTrianglesForTest(false);
+	Planet.SetV9Phase1AuthorityForTest(true, 1);
+	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+	Planet.SetV9CollisionShadowForTest(true);
+	Planet.SetV9CollisionExecutionForTest(true);
+
+	const FString ExportRoot = FPaths::Combine(
+		FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*ExportRoot);
+	ExportV6CheckpointMaps(*this, Planet, ExportRoot, 0);
+	ExportV6DebugOverlays(*this, Planet, ExportRoot, 0);
+
+	const auto LogCheckpoint = [this, &Planet, &ExportRoot](const int32 Step)
+	{
+		ExportV6CheckpointMaps(*this, Planet, ExportRoot, Step);
+		ExportV6DebugOverlays(*this, Planet, ExportRoot, Step);
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+		const FString Tag = FString::Printf(TEXT("[V9Phase1dCollisionExecution step=%d]"), Step);
+		AddV6ThesisRemeshInfo(*this, *Tag, Snapshot);
+		AddV6DiagnosticsPackageInfo(*this, *Tag, Snapshot);
+		AddV6BoundaryCoherenceInfo(*this, *Tag, Snapshot);
+		AddV6InteriorInstabilityInfo(*this, *Tag, Snapshot);
+		AddV6SyntheticCoveragePersistenceInfo(*this, *Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, *Tag, Snapshot);
+		AddV6TectonicInteractionInfo(*this, *Tag, Snapshot);
+		AddV6CollisionShadowInfo(*this, *Tag, Snapshot);
+		AddV6CollisionExecutionInfo(*this, *Tag, Snapshot);
 	};
 
 	Planet.AdvanceSteps(25);
