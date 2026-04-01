@@ -151,6 +151,27 @@ namespace
 		double MaxAllowedInteriorLeakage = 0.0;
 	};
 
+	struct FV9CollisionStructuralGateResult
+	{
+		bool bOwnershipChangePass = false;
+		bool bTransferPass = false;
+		bool bTransferredContinentalPass = false;
+		bool bTransferFootprintPass = false;
+		bool bShareDeltaPass = false;
+		bool bBoundaryLocalityPass = false;
+		bool bChurnPass = false;
+		bool bCoherencePass = false;
+		bool bLeakagePass = false;
+		bool bAllowStep200 = false;
+		int32 RequiredCumulativeTransferFootprint = 0;
+		double RequiredMinPlateShareDelta = 0.0;
+		double RequiredMaxPlateShareDelta = 0.0;
+		double RequiredBoundaryLocalFraction = 0.0;
+		double MaxAllowedChurn = 0.0;
+		double MinAllowedCoherence = 0.0;
+		double MaxAllowedInteriorLeakage = 0.0;
+	};
+
 	FV6CheckpointSnapshot BuildV6CheckpointSnapshot(const FTectonicPlanetV6& Planet);
 
 	FTectonicPlanetV6 CreateInitializedPlanetV6WithConfig(
@@ -1047,7 +1068,7 @@ namespace
 	{
 		const FTectonicPlanetV6CollisionExecutionDiagnostic& CE = Snapshot.CollisionExecution;
 		const FString Message = FString::Printf(
-			TEXT("%s step=%d exec_collision_count=%d exec_collision_cumulative=%d exec_cumulative_affected=%d exec_cumulative_affected_visits=%d exec_cumulative_continental_gain=%d exec_pair=(%d,%d) exec_over_plate=%d exec_sub_plate=%d exec_obs=%d exec_penetration_km=%.1f exec_mean_convergence_km_per_my=%.3f exec_max_convergence_km_per_my=%.3f exec_support=%d exec_triangles=%d exec_continental_support=%d/%d exec_qualified_samples=%d exec_seed_samples=%d exec_collision_seed_samples=%d exec_effective_mass=%d exec_affected=%d exec_continental_gain=%d exec_ownership_change=%d exec_cooldown_suppressed=%d exec_qualified_unexecuted=%d exec_radius_rad=%.6f exec_mean_elev_delta_km=%.6f exec_max_elev_delta_km=%.6f exec_cumulative_mean_elev_delta_km=%.6f exec_cumulative_max_elev_delta_km=%.6f exec_strength_scale=%.6f exec_from_shadow=%d"),
+			TEXT("%s step=%d exec_collision_count=%d exec_collision_cumulative=%d exec_cumulative_affected=%d exec_cumulative_affected_visits=%d exec_cumulative_continental_gain=%d exec_cumulative_ownership_change=%d exec_cumulative_transfer=%d exec_cumulative_transfer_visits=%d exec_cumulative_transfer_continental=%d exec_pair=(%d,%d) exec_over_plate=%d exec_sub_plate=%d exec_obs=%d exec_penetration_km=%.1f exec_mean_convergence_km_per_my=%.3f exec_max_convergence_km_per_my=%.3f exec_support=%d exec_triangles=%d exec_continental_support=%d/%d exec_qualified_samples=%d exec_seed_samples=%d exec_collision_seed_samples=%d exec_effective_mass=%d exec_affected=%d exec_continental_gain=%d exec_ownership_change=%d exec_transfer=%d exec_transfer_continental=%d exec_cooldown_suppressed=%d exec_qualified_unexecuted=%d exec_transfer_reject_locality=%d exec_transfer_reject_continentality=%d exec_transfer_reject_cap=%d exec_transfer_boundary_local=%d exec_transfer_patch_support=%d exec_transfer_anchor_seeds=%d exec_radius_rad=%.6f exec_transfer_radius_rad=%.6f exec_mean_elev_delta_km=%.6f exec_max_elev_delta_km=%.6f exec_cumulative_mean_elev_delta_km=%.6f exec_cumulative_max_elev_delta_km=%.6f exec_strength_scale=%.6f donor_share=%.6f->%.6f recipient_share=%.6f->%.6f exec_from_shadow=%d"),
 			*SummaryTag,
 			Snapshot.Step,
 			CE.ExecutedCollisionCount,
@@ -1055,6 +1076,10 @@ namespace
 			CE.CumulativeCollisionAffectedSampleCount,
 			CE.CumulativeCollisionAffectedSampleVisits,
 			CE.CumulativeCollisionDrivenContinentalGainCount,
+			CE.CumulativeCollisionDrivenOwnershipChangeCount,
+			CE.CumulativeCollisionTransferredSampleCount,
+			CE.CumulativeCollisionTransferredSampleVisits,
+			CE.CumulativeCollisionTransferredContinentalSampleCount,
 			CE.ExecutedPlateA,
 			CE.ExecutedPlateB,
 			CE.ExecutedOverridingPlateId,
@@ -1074,14 +1099,27 @@ namespace
 			CE.CollisionAffectedSampleCount,
 			CE.CollisionDrivenContinentalGainCount,
 			CE.CollisionDrivenOwnershipChangeCount,
+			CE.CollisionTransferredSampleCount,
+			CE.CollisionTransferredContinentalSampleCount,
 			CE.CooldownSuppressedQualifiedCount,
 			CE.QualifiedButUnexecutedCount,
+			CE.ExecutedTransferRejectedByLocalityCount,
+			CE.ExecutedTransferRejectedByContinentalityCount,
+			CE.ExecutedTransferRejectedByCapCount,
+			CE.ExecutedTransferBoundaryLocalSampleCount,
+			CE.ExecutedTransferCandidateSupportCount,
+			CE.ExecutedTransferAnchorSeedCount,
 			CE.ExecutedInfluenceRadiusRad,
+			CE.ExecutedTransferInfluenceRadiusRad,
 			CE.ExecutedMeanElevationDeltaKm,
 			CE.ExecutedMaxElevationDeltaKm,
 			CE.CumulativeMeanElevationDeltaKm,
 			CE.CumulativeMaxElevationDeltaKm,
 			CE.ExecutedStrengthScale,
+			CE.ExecutedDonorPlateShareBefore,
+			CE.ExecutedDonorPlateShareAfter,
+			CE.ExecutedRecipientPlateShareBefore,
+			CE.ExecutedRecipientPlateShareAfter,
 			CE.bExecutedFromShadowQualifiedState ? 1 : 0);
 		Test.AddInfo(Message);
 		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
@@ -1617,7 +1655,36 @@ namespace
 			}
 		}
 
-		// 5. CollisionCumulativeMask: samples touched by any collision event through this checkpoint
+		// 5. CollisionTransferMask: samples structurally transferred by the current solve
+		{
+			const TArray<uint8>& CollisionTransferMask = Planet.GetCollisionTransferMaskForTest();
+			if (CollisionTransferMask.Num() == SampleCount)
+			{
+				TArray<float> CollisionTransferValues;
+				CollisionTransferValues.SetNum(SampleCount);
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					CollisionTransferValues[I] = CollisionTransferMask[I] != 0 ? 1.0f : 0.0f;
+				}
+
+				const FString OutputPath = FPaths::Combine(OutputDirectory, TEXT("CollisionTransferMask.png"));
+				if (!TectonicMollweideExporter::ExportScalarOverlay(
+					PlanetData,
+					CollisionTransferValues,
+					0.0f,
+					1.0f,
+					OutputPath,
+					TestExportWidth,
+					TestExportHeight,
+					Error))
+				{
+					Test.AddError(FString::Printf(TEXT("CollisionTransferMask export step %d failed: %s"), Step, *Error));
+					bAllSucceeded = false;
+				}
+			}
+		}
+
+		// 6. CollisionCumulativeMask: samples touched by any collision event through this checkpoint
 		{
 			const TArray<uint8>& CollisionCumulativeMask = Planet.GetCollisionCumulativeExecutionMaskForTest();
 			if (CollisionCumulativeMask.Num() == SampleCount)
@@ -1646,7 +1713,39 @@ namespace
 			}
 		}
 
-		// 6. CollisionElevationDeltaMask: cumulative collision-driven elevation gain in km
+		// 7. CollisionCumulativeTransferMask: samples structurally transferred through this checkpoint
+		{
+			const TArray<uint8>& CollisionCumulativeTransferMask =
+				Planet.GetCollisionCumulativeTransferMaskForTest();
+			if (CollisionCumulativeTransferMask.Num() == SampleCount)
+			{
+				TArray<float> CollisionCumulativeTransferValues;
+				CollisionCumulativeTransferValues.SetNum(SampleCount);
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					CollisionCumulativeTransferValues[I] =
+						CollisionCumulativeTransferMask[I] != 0 ? 1.0f : 0.0f;
+				}
+
+				const FString OutputPath =
+					FPaths::Combine(OutputDirectory, TEXT("CollisionCumulativeTransferMask.png"));
+				if (!TectonicMollweideExporter::ExportScalarOverlay(
+					PlanetData,
+					CollisionCumulativeTransferValues,
+					0.0f,
+					1.0f,
+					OutputPath,
+					TestExportWidth,
+					TestExportHeight,
+					Error))
+				{
+					Test.AddError(FString::Printf(TEXT("CollisionCumulativeTransferMask export step %d failed: %s"), Step, *Error));
+					bAllSucceeded = false;
+				}
+			}
+		}
+
+		// 8. CollisionElevationDeltaMask: cumulative collision-driven elevation gain in km
 		{
 			const TArray<float>& CollisionElevationDeltaMask = Planet.GetCollisionCumulativeElevationDeltaMaskForTest();
 			if (CollisionElevationDeltaMask.Num() == SampleCount)
@@ -1674,7 +1773,7 @@ namespace
 			}
 		}
 
-		// 7. CollisionContinentalGainMask: cumulative count of collision-driven CW gains
+		// 9. CollisionContinentalGainMask: cumulative count of collision-driven CW gains
 		{
 			const TArray<float>& CollisionContinentalGainMask = Planet.GetCollisionCumulativeContinentalGainMaskForTest();
 			if (CollisionContinentalGainMask.Num() == SampleCount)
@@ -1777,6 +1876,20 @@ namespace
 		}
 
 		{
+			const TArray<uint8>& CollisionTransferMask = Planet.GetCollisionTransferMaskForTest();
+			if (CollisionTransferMask.Num() == SampleCount)
+			{
+				TArray<float> Values;
+				Values.SetNum(SampleCount);
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					Values[I] = CollisionTransferMask[I] != 0 ? 1.0f : 0.0f;
+				}
+				ExportOverlay(TEXT("CollisionTransferMask.png"), Values, 0.0f, 1.0f);
+			}
+		}
+
+		{
 			const TArray<uint8>& CollisionCumulativeMask = Planet.GetCollisionCumulativeExecutionMaskForTest();
 			if (CollisionCumulativeMask.Num() == SampleCount)
 			{
@@ -1787,6 +1900,21 @@ namespace
 					Values[I] = CollisionCumulativeMask[I] != 0 ? 1.0f : 0.0f;
 				}
 				ExportOverlay(TEXT("CollisionCumulativeMask.png"), Values, 0.0f, 1.0f);
+			}
+		}
+
+		{
+			const TArray<uint8>& CollisionCumulativeTransferMask =
+				Planet.GetCollisionCumulativeTransferMaskForTest();
+			if (CollisionCumulativeTransferMask.Num() == SampleCount)
+			{
+				TArray<float> Values;
+				Values.SetNum(SampleCount);
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					Values[I] = CollisionCumulativeTransferMask[I] != 0 ? 1.0f : 0.0f;
+				}
+				ExportOverlay(TEXT("CollisionCumulativeTransferMask.png"), Values, 0.0f, 1.0f);
 			}
 		}
 
@@ -1865,6 +1993,77 @@ namespace
 			Result.bFootprintPass &&
 			Result.bElevationPass &&
 			Result.bContinentalGainPass &&
+			Result.bChurnPass &&
+			Result.bCoherencePass &&
+			Result.bLeakagePass;
+		return Result;
+	}
+
+	FV9CollisionStructuralGateResult EvaluateV9CollisionStructuralTransferStep100Gate(
+		const FV6CheckpointSnapshot& BaselineSnapshot,
+		const FV6CheckpointSnapshot& CandidateSnapshot,
+		const int32 TotalSampleCount)
+	{
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& BaselineExec =
+			BaselineSnapshot.CollisionExecution;
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& CandidateExec =
+			CandidateSnapshot.CollisionExecution;
+
+		FV9CollisionStructuralGateResult Result;
+		Result.RequiredCumulativeTransferFootprint =
+			FMath::Max(BaselineExec.CumulativeCollisionTransferredSampleCount + 12, 12);
+		Result.RequiredMinPlateShareDelta = 8.0 / static_cast<double>(FMath::Max(TotalSampleCount, 1));
+		Result.RequiredMaxPlateShareDelta = 64.0 / static_cast<double>(FMath::Max(TotalSampleCount, 1));
+		Result.RequiredBoundaryLocalFraction = 0.75;
+		Result.MaxAllowedChurn = BaselineSnapshot.OwnershipChurn.ChurnFraction + 0.01;
+		Result.MinAllowedCoherence = BaselineSnapshot.BoundaryCoherence.BoundaryCoherenceScore - 0.01;
+		Result.MaxAllowedInteriorLeakage =
+			BaselineSnapshot.BoundaryCoherence.InteriorLeakageFraction + 0.02;
+
+		const double RecipientShareDelta = FMath::Abs(CandidateExec.ExecutedRecipientPlateShareDelta);
+		const double DonorShareDelta = FMath::Abs(CandidateExec.ExecutedDonorPlateShareDelta);
+		const int32 CurrentOrCumulativeOwnershipChange = FMath::Max(
+			CandidateExec.CollisionDrivenOwnershipChangeCount,
+			CandidateExec.CumulativeCollisionDrivenOwnershipChangeCount);
+		const int32 CurrentOrCumulativeTransferCount = FMath::Max(
+			CandidateExec.CollisionTransferredSampleCount,
+			CandidateExec.CumulativeCollisionTransferredSampleVisits);
+		const int32 CurrentOrCumulativeContinentalTransferCount = FMath::Max(
+			CandidateExec.CollisionTransferredContinentalSampleCount,
+			CandidateExec.CumulativeCollisionTransferredContinentalSampleCount);
+		const double BoundaryLocalFraction =
+			CandidateExec.CollisionTransferredSampleCount > 0
+				? static_cast<double>(CandidateExec.ExecutedTransferBoundaryLocalSampleCount) /
+					static_cast<double>(CandidateExec.CollisionTransferredSampleCount)
+				: 0.0;
+
+		Result.bOwnershipChangePass = CurrentOrCumulativeOwnershipChange > 0;
+		Result.bTransferPass = CurrentOrCumulativeTransferCount > 0;
+		Result.bTransferredContinentalPass = CurrentOrCumulativeContinentalTransferCount > 0;
+		Result.bTransferFootprintPass =
+			CandidateExec.CumulativeCollisionTransferredSampleCount >= Result.RequiredCumulativeTransferFootprint;
+		Result.bShareDeltaPass =
+			CandidateExec.CollisionTransferredSampleCount > 0 &&
+			RecipientShareDelta >= Result.RequiredMinPlateShareDelta &&
+			DonorShareDelta >= Result.RequiredMinPlateShareDelta &&
+			RecipientShareDelta <= Result.RequiredMaxPlateShareDelta &&
+			DonorShareDelta <= Result.RequiredMaxPlateShareDelta;
+		Result.bBoundaryLocalityPass =
+			CandidateExec.CollisionTransferredSampleCount > 0 &&
+			BoundaryLocalFraction >= Result.RequiredBoundaryLocalFraction;
+		Result.bChurnPass =
+			CandidateSnapshot.OwnershipChurn.ChurnFraction <= Result.MaxAllowedChurn;
+		Result.bCoherencePass =
+			CandidateSnapshot.BoundaryCoherence.BoundaryCoherenceScore >= Result.MinAllowedCoherence;
+		Result.bLeakagePass =
+			CandidateSnapshot.BoundaryCoherence.InteriorLeakageFraction <= Result.MaxAllowedInteriorLeakage;
+		Result.bAllowStep200 =
+			Result.bOwnershipChangePass &&
+			Result.bTransferPass &&
+			Result.bTransferredContinentalPass &&
+			Result.bTransferFootprintPass &&
+			Result.bShareDeltaPass &&
+			Result.bBoundaryLocalityPass &&
 			Result.bChurnPass &&
 			Result.bCoherencePass &&
 			Result.bLeakagePass;
@@ -6836,5 +7035,438 @@ bool FTectonicPlanetV6V9Phase1dCollisionFidelityTuningHarnessTest::RunTest(const
 
 	TestTrue(TEXT("Baseline reached step 100"), BaselinePlanet.GetPlanet().CurrentStep >= 100);
 	TestTrue(TEXT("Candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep >= 100);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9Phase1dCollisionStructuralTransferTuningHarnessTest,
+	"Aurous.TectonicPlanet.V6V9Phase1dCollisionStructuralTransferTuningHarnessTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9Phase1dCollisionStructuralTransferTuningHarnessTest::RunTest(
+	const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	const FString RunId = TEXT("V9Phase1dCollisionStructuralTransferTuningHarness");
+
+	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+			FixedIntervalSteps,
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			TestRandomSeed);
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+		Planet.SetV9CollisionShadowForTest(true);
+		Planet.SetV9CollisionExecutionForTest(true);
+		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(false);
+		return Planet;
+	};
+
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
+	BaselinePlanet.SetV9CollisionExecutionStructuralTransferForTest(false);
+
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
+	CandidatePlanet.SetV9CollisionExecutionStructuralTransferForTest(true);
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	const FString ExportRoot = FPaths::Combine(
+		FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	const FString BaselineExportRoot = FPaths::Combine(ExportRoot, TEXT("baseline_execution"));
+	const FString CandidateExportRoot = FPaths::Combine(ExportRoot, TEXT("candidate_structural_transfer"));
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*BaselineExportRoot);
+	PlatformFile.CreateDirectoryTree(*CandidateExportRoot);
+
+	AddInfo(TEXT("[V9CollisionStructuralHarness] export_policy step25/100=minimal_collision_overlays step200=full_only_if_structural_gate_passes"));
+
+	const auto CaptureCheckpoint =
+		[this](
+			FTectonicPlanetV6& Planet,
+			const FString& VariantTag,
+			const FString& VariantExportRoot,
+			const int32 Step,
+			const bool bFullExports) -> FV6CheckpointSnapshot
+	{
+		if (bFullExports)
+		{
+			ExportV6CheckpointMaps(*this, Planet, VariantExportRoot, Step);
+			ExportV6DebugOverlays(*this, Planet, VariantExportRoot, Step);
+		}
+		else
+		{
+			ExportV6CollisionTuningInnerLoopOverlays(*this, Planet, VariantExportRoot, Step);
+		}
+
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+		const FString Tag = FString::Printf(
+			TEXT("[V9CollisionStructuralHarness variant=%s step=%d]"),
+			*VariantTag,
+			Step);
+		AddV6BoundaryCoherenceInfo(*this, *Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, *Tag, Snapshot);
+		AddV6CollisionShadowInfo(*this, *Tag, Snapshot);
+		AddV6CollisionExecutionInfo(*this, *Tag, Snapshot);
+		return Snapshot;
+	};
+
+	const auto LogComparison =
+		[this](
+			const int32 Step,
+			const FV6CheckpointSnapshot& BaselineSnapshot,
+			const FV6CheckpointSnapshot& CandidateSnapshot)
+	{
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& BaselineExec =
+			BaselineSnapshot.CollisionExecution;
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& CandidateExec =
+			CandidateSnapshot.CollisionExecution;
+		const FString Message = FString::Printf(
+			TEXT("[V9CollisionStructuralHarness compare step=%d] churn %.4f->%.4f coherence %.4f->%.4f interior_leakage %.4f->%.4f active_fraction %.4f->%.4f exec_current %d->%d exec_cumulative %d->%d ownership_change %d->%d ownership_change_cumulative %d->%d transfer_current %d->%d transfer_cumulative %d->%d transfer_continental_current %d->%d transfer_continental_cumulative %d->%d transfer_boundary_local %d->%d recipient_share_delta %.6f->%.6f donor_share_delta %.6f->%.6f"),
+			Step,
+			BaselineSnapshot.OwnershipChurn.ChurnFraction,
+			CandidateSnapshot.OwnershipChurn.ChurnFraction,
+			BaselineSnapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			CandidateSnapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			BaselineSnapshot.BoundaryCoherence.InteriorLeakageFraction,
+			CandidateSnapshot.BoundaryCoherence.InteriorLeakageFraction,
+			BaselineSnapshot.ActiveZone.ActiveFraction,
+			CandidateSnapshot.ActiveZone.ActiveFraction,
+			BaselineExec.ExecutedCollisionCount,
+			CandidateExec.ExecutedCollisionCount,
+			BaselineExec.CumulativeExecutedCollisionCount,
+			CandidateExec.CumulativeExecutedCollisionCount,
+			BaselineExec.CollisionDrivenOwnershipChangeCount,
+			CandidateExec.CollisionDrivenOwnershipChangeCount,
+			BaselineExec.CumulativeCollisionDrivenOwnershipChangeCount,
+			CandidateExec.CumulativeCollisionDrivenOwnershipChangeCount,
+			BaselineExec.CollisionTransferredSampleCount,
+			CandidateExec.CollisionTransferredSampleCount,
+			BaselineExec.CumulativeCollisionTransferredSampleCount,
+			CandidateExec.CumulativeCollisionTransferredSampleCount,
+			BaselineExec.CollisionTransferredContinentalSampleCount,
+			CandidateExec.CollisionTransferredContinentalSampleCount,
+			BaselineExec.CumulativeCollisionTransferredContinentalSampleCount,
+			CandidateExec.CumulativeCollisionTransferredContinentalSampleCount,
+			BaselineExec.ExecutedTransferBoundaryLocalSampleCount,
+			CandidateExec.ExecutedTransferBoundaryLocalSampleCount,
+			BaselineExec.ExecutedRecipientPlateShareDelta,
+			CandidateExec.ExecutedRecipientPlateShareDelta,
+			BaselineExec.ExecutedDonorPlateShareDelta,
+			CandidateExec.ExecutedDonorPlateShareDelta);
+		AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	};
+
+	BaselinePlanet.AdvanceSteps(25);
+	CandidatePlanet.AdvanceSteps(25);
+	const FV6CheckpointSnapshot BaselineStep25 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_execution"), BaselineExportRoot, 25, false);
+	const FV6CheckpointSnapshot CandidateStep25 =
+		CaptureCheckpoint(CandidatePlanet, TEXT("candidate_structural_transfer"), CandidateExportRoot, 25, false);
+	LogComparison(25, BaselineStep25, CandidateStep25);
+
+	BaselinePlanet.AdvanceSteps(75);
+	CandidatePlanet.AdvanceSteps(75);
+	const FV6CheckpointSnapshot BaselineStep100 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_execution"), BaselineExportRoot, 100, false);
+	const FV6CheckpointSnapshot CandidateStep100 =
+		CaptureCheckpoint(CandidatePlanet, TEXT("candidate_structural_transfer"), CandidateExportRoot, 100, false);
+	LogComparison(100, BaselineStep100, CandidateStep100);
+
+	const FV9CollisionStructuralGateResult Gate =
+		EvaluateV9CollisionStructuralTransferStep100Gate(
+			BaselineStep100,
+			CandidateStep100,
+			SampleCount);
+	const FTectonicPlanetV6CollisionExecutionDiagnostic& BaselineExec = BaselineStep100.CollisionExecution;
+	const FTectonicPlanetV6CollisionExecutionDiagnostic& CandidateExec = CandidateStep100.CollisionExecution;
+	const double CandidateBoundaryLocalFraction =
+		CandidateExec.CollisionTransferredSampleCount > 0
+			? static_cast<double>(CandidateExec.ExecutedTransferBoundaryLocalSampleCount) /
+				static_cast<double>(CandidateExec.CollisionTransferredSampleCount)
+			: 0.0;
+	const FString GateMessage = FString::Printf(
+		TEXT("[V9CollisionStructuralHarness gate step=100] run_step200=%d ownership_change_pass=%d candidate_ownership_change=%d/%d transfer_pass=%d candidate_transfer=%d/%d transferred_continental_pass=%d candidate_transfer_continental=%d/%d transfer_footprint_pass=%d candidate_cumulative_transfer_footprint=%d required_cumulative_transfer_footprint=%d share_delta_pass=%d candidate_recipient_share_delta=%.6f candidate_donor_share_delta=%.6f required_share_delta=[%.6f,%.6f] boundary_locality_pass=%d candidate_boundary_local_fraction=%.4f required_boundary_local_fraction=%.4f churn_pass=%d candidate_churn=%.4f max_churn=%.4f coherence_pass=%d candidate_coherence=%.4f min_coherence=%.4f leakage_pass=%d candidate_interior_leakage=%.4f max_interior_leakage=%.4f"),
+		Gate.bAllowStep200 ? 1 : 0,
+		Gate.bOwnershipChangePass ? 1 : 0,
+		CandidateExec.CollisionDrivenOwnershipChangeCount,
+		CandidateExec.CumulativeCollisionDrivenOwnershipChangeCount,
+		Gate.bTransferPass ? 1 : 0,
+		CandidateExec.CollisionTransferredSampleCount,
+		CandidateExec.CumulativeCollisionTransferredSampleVisits,
+		Gate.bTransferredContinentalPass ? 1 : 0,
+		CandidateExec.CollisionTransferredContinentalSampleCount,
+		CandidateExec.CumulativeCollisionTransferredContinentalSampleCount,
+		Gate.bTransferFootprintPass ? 1 : 0,
+		CandidateExec.CumulativeCollisionTransferredSampleCount,
+		Gate.RequiredCumulativeTransferFootprint,
+		Gate.bShareDeltaPass ? 1 : 0,
+		CandidateExec.ExecutedRecipientPlateShareDelta,
+		CandidateExec.ExecutedDonorPlateShareDelta,
+		Gate.RequiredMinPlateShareDelta,
+		Gate.RequiredMaxPlateShareDelta,
+		Gate.bBoundaryLocalityPass ? 1 : 0,
+		CandidateBoundaryLocalFraction,
+		Gate.RequiredBoundaryLocalFraction,
+		Gate.bChurnPass ? 1 : 0,
+		CandidateStep100.OwnershipChurn.ChurnFraction,
+		Gate.MaxAllowedChurn,
+		Gate.bCoherencePass ? 1 : 0,
+		CandidateStep100.BoundaryCoherence.BoundaryCoherenceScore,
+		Gate.MinAllowedCoherence,
+		Gate.bLeakagePass ? 1 : 0,
+		CandidateStep100.BoundaryCoherence.InteriorLeakageFraction,
+		Gate.MaxAllowedInteriorLeakage);
+	AddInfo(GateMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *GateMessage);
+
+	if (Gate.bAllowStep200)
+	{
+		BaselinePlanet.AdvanceSteps(100);
+		CandidatePlanet.AdvanceSteps(100);
+		const FV6CheckpointSnapshot BaselineStep200 =
+			CaptureCheckpoint(BaselinePlanet, TEXT("baseline_execution"), BaselineExportRoot, 200, true);
+		const FV6CheckpointSnapshot CandidateStep200 =
+			CaptureCheckpoint(CandidatePlanet, TEXT("candidate_structural_transfer"), CandidateExportRoot, 200, true);
+		LogComparison(200, BaselineStep200, CandidateStep200);
+		TestTrue(TEXT("Structural candidate promoted to step 200 when gates pass"), CandidatePlanet.GetPlanet().CurrentStep == 200);
+	}
+	else
+	{
+		TestTrue(TEXT("Weak structural candidate rejected before step 200"), CandidatePlanet.GetPlanet().CurrentStep == 100);
+	}
+
+	TestTrue(TEXT("Structural baseline reached step 100"), BaselinePlanet.GetPlanet().CurrentStep >= 100);
+	TestTrue(TEXT("Structural candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep >= 100);
+	TestTrue(TEXT("Baseline structural transfer stays disabled"), BaselineExec.CumulativeCollisionTransferredSampleCount == 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9Phase1dTerraneCaptureRefinementTuningHarnessTest,
+	"Aurous.TectonicPlanet.V6V9Phase1dTerraneCaptureRefinementTuningHarnessTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9Phase1dTerraneCaptureRefinementTuningHarnessTest::RunTest(
+	const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	const FString RunId = TEXT("V9Phase1dTerraneCaptureRefinementTuningHarness");
+
+	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+			FixedIntervalSteps,
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			TestRandomSeed);
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+		Planet.SetV9CollisionShadowForTest(true);
+		Planet.SetV9CollisionExecutionForTest(true);
+		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(false);
+		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
+		return Planet;
+	};
+
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
+	BaselinePlanet.SetV9CollisionExecutionRefinedStructuralTransferForTest(false);
+
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
+	CandidatePlanet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	const FString ExportRoot = FPaths::Combine(
+		FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	const FString BaselineExportRoot = FPaths::Combine(ExportRoot, TEXT("baseline_structural_transfer"));
+	const FString CandidateExportRoot = FPaths::Combine(ExportRoot, TEXT("candidate_refined_terrane_capture"));
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*BaselineExportRoot);
+	PlatformFile.CreateDirectoryTree(*CandidateExportRoot);
+
+	AddInfo(TEXT("[V9TerraneCaptureHarness] export_policy step25/100=minimal_collision_overlays step200=full_only_if_structural_gate_passes"));
+
+	const auto CaptureCheckpoint =
+		[this](
+			FTectonicPlanetV6& Planet,
+			const FString& VariantTag,
+			const FString& VariantExportRoot,
+			const int32 Step,
+			const bool bFullExports) -> FV6CheckpointSnapshot
+	{
+		if (bFullExports)
+		{
+			ExportV6CheckpointMaps(*this, Planet, VariantExportRoot, Step);
+			ExportV6DebugOverlays(*this, Planet, VariantExportRoot, Step);
+		}
+		else
+		{
+			ExportV6CollisionTuningInnerLoopOverlays(*this, Planet, VariantExportRoot, Step);
+		}
+
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+		const FString Tag = FString::Printf(
+			TEXT("[V9TerraneCaptureHarness variant=%s step=%d]"),
+			*VariantTag,
+			Step);
+		AddV6BoundaryCoherenceInfo(*this, *Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, *Tag, Snapshot);
+		AddV6CollisionShadowInfo(*this, *Tag, Snapshot);
+		AddV6CollisionExecutionInfo(*this, *Tag, Snapshot);
+		return Snapshot;
+	};
+
+	const auto LogComparison =
+		[this](
+			const int32 Step,
+			const FV6CheckpointSnapshot& BaselineSnapshot,
+			const FV6CheckpointSnapshot& CandidateSnapshot)
+	{
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& BaselineExec =
+			BaselineSnapshot.CollisionExecution;
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& CandidateExec =
+			CandidateSnapshot.CollisionExecution;
+		const FString Message = FString::Printf(
+			TEXT("[V9TerraneCaptureHarness compare step=%d] churn %.4f->%.4f coherence %.4f->%.4f interior_leakage %.4f->%.4f active_fraction %.4f->%.4f exec_current %d->%d exec_cumulative %d->%d ownership_change %d->%d ownership_change_cumulative %d->%d transfer_current %d->%d transfer_cumulative %d->%d transfer_continental_current %d->%d transfer_continental_cumulative %d->%d transfer_boundary_local %d->%d transfer_patch_support %d->%d transfer_anchor_seeds %d->%d recipient_share_delta %.6f->%.6f donor_share_delta %.6f->%.6f"),
+			Step,
+			BaselineSnapshot.OwnershipChurn.ChurnFraction,
+			CandidateSnapshot.OwnershipChurn.ChurnFraction,
+			BaselineSnapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			CandidateSnapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			BaselineSnapshot.BoundaryCoherence.InteriorLeakageFraction,
+			CandidateSnapshot.BoundaryCoherence.InteriorLeakageFraction,
+			BaselineSnapshot.ActiveZone.ActiveFraction,
+			CandidateSnapshot.ActiveZone.ActiveFraction,
+			BaselineExec.ExecutedCollisionCount,
+			CandidateExec.ExecutedCollisionCount,
+			BaselineExec.CumulativeExecutedCollisionCount,
+			CandidateExec.CumulativeExecutedCollisionCount,
+			BaselineExec.CollisionDrivenOwnershipChangeCount,
+			CandidateExec.CollisionDrivenOwnershipChangeCount,
+			BaselineExec.CumulativeCollisionDrivenOwnershipChangeCount,
+			CandidateExec.CumulativeCollisionDrivenOwnershipChangeCount,
+			BaselineExec.CollisionTransferredSampleCount,
+			CandidateExec.CollisionTransferredSampleCount,
+			BaselineExec.CumulativeCollisionTransferredSampleCount,
+			CandidateExec.CumulativeCollisionTransferredSampleCount,
+			BaselineExec.CollisionTransferredContinentalSampleCount,
+			CandidateExec.CollisionTransferredContinentalSampleCount,
+			BaselineExec.CumulativeCollisionTransferredContinentalSampleCount,
+			CandidateExec.CumulativeCollisionTransferredContinentalSampleCount,
+			BaselineExec.ExecutedTransferBoundaryLocalSampleCount,
+			CandidateExec.ExecutedTransferBoundaryLocalSampleCount,
+			BaselineExec.ExecutedTransferCandidateSupportCount,
+			CandidateExec.ExecutedTransferCandidateSupportCount,
+			BaselineExec.ExecutedTransferAnchorSeedCount,
+			CandidateExec.ExecutedTransferAnchorSeedCount,
+			BaselineExec.ExecutedRecipientPlateShareDelta,
+			CandidateExec.ExecutedRecipientPlateShareDelta,
+			BaselineExec.ExecutedDonorPlateShareDelta,
+			CandidateExec.ExecutedDonorPlateShareDelta);
+		AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	};
+
+	BaselinePlanet.AdvanceSteps(25);
+	CandidatePlanet.AdvanceSteps(25);
+	const FV6CheckpointSnapshot BaselineStep25 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_structural_transfer"), BaselineExportRoot, 25, false);
+	const FV6CheckpointSnapshot CandidateStep25 =
+		CaptureCheckpoint(CandidatePlanet, TEXT("candidate_refined_terrane_capture"), CandidateExportRoot, 25, false);
+	LogComparison(25, BaselineStep25, CandidateStep25);
+
+	BaselinePlanet.AdvanceSteps(75);
+	CandidatePlanet.AdvanceSteps(75);
+	const FV6CheckpointSnapshot BaselineStep100 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_structural_transfer"), BaselineExportRoot, 100, false);
+	const FV6CheckpointSnapshot CandidateStep100 =
+		CaptureCheckpoint(CandidatePlanet, TEXT("candidate_refined_terrane_capture"), CandidateExportRoot, 100, false);
+	LogComparison(100, BaselineStep100, CandidateStep100);
+
+	const FV9CollisionStructuralGateResult Gate =
+		EvaluateV9CollisionStructuralTransferStep100Gate(
+			BaselineStep100,
+			CandidateStep100,
+			SampleCount);
+	const FTectonicPlanetV6CollisionExecutionDiagnostic& CandidateExec = CandidateStep100.CollisionExecution;
+	const double CandidateBoundaryLocalFraction =
+		CandidateExec.CollisionTransferredSampleCount > 0
+			? static_cast<double>(CandidateExec.ExecutedTransferBoundaryLocalSampleCount) /
+				static_cast<double>(CandidateExec.CollisionTransferredSampleCount)
+			: 0.0;
+	const FString GateMessage = FString::Printf(
+		TEXT("[V9TerraneCaptureHarness gate step=100] run_step200=%d ownership_change_pass=%d candidate_ownership_change=%d/%d transfer_pass=%d candidate_transfer=%d/%d transferred_continental_pass=%d candidate_transfer_continental=%d/%d transfer_footprint_pass=%d candidate_cumulative_transfer_footprint=%d required_cumulative_transfer_footprint=%d share_delta_pass=%d candidate_recipient_share_delta=%.6f candidate_donor_share_delta=%.6f required_share_delta=[%.6f,%.6f] boundary_locality_pass=%d candidate_boundary_local_fraction=%.4f required_boundary_local_fraction=%.4f transfer_patch_support=%d transfer_anchor_seeds=%d churn_pass=%d candidate_churn=%.4f max_churn=%.4f coherence_pass=%d candidate_coherence=%.4f min_coherence=%.4f leakage_pass=%d candidate_interior_leakage=%.4f max_interior_leakage=%.4f"),
+		Gate.bAllowStep200 ? 1 : 0,
+		Gate.bOwnershipChangePass ? 1 : 0,
+		CandidateExec.CollisionDrivenOwnershipChangeCount,
+		CandidateExec.CumulativeCollisionDrivenOwnershipChangeCount,
+		Gate.bTransferPass ? 1 : 0,
+		CandidateExec.CollisionTransferredSampleCount,
+		CandidateExec.CumulativeCollisionTransferredSampleVisits,
+		Gate.bTransferredContinentalPass ? 1 : 0,
+		CandidateExec.CollisionTransferredContinentalSampleCount,
+		CandidateExec.CumulativeCollisionTransferredContinentalSampleCount,
+		Gate.bTransferFootprintPass ? 1 : 0,
+		CandidateExec.CumulativeCollisionTransferredSampleCount,
+		Gate.RequiredCumulativeTransferFootprint,
+		Gate.bShareDeltaPass ? 1 : 0,
+		CandidateExec.ExecutedRecipientPlateShareDelta,
+		CandidateExec.ExecutedDonorPlateShareDelta,
+		Gate.RequiredMinPlateShareDelta,
+		Gate.RequiredMaxPlateShareDelta,
+		Gate.bBoundaryLocalityPass ? 1 : 0,
+		CandidateBoundaryLocalFraction,
+		Gate.RequiredBoundaryLocalFraction,
+		CandidateExec.ExecutedTransferCandidateSupportCount,
+		CandidateExec.ExecutedTransferAnchorSeedCount,
+		Gate.bChurnPass ? 1 : 0,
+		CandidateStep100.OwnershipChurn.ChurnFraction,
+		Gate.MaxAllowedChurn,
+		Gate.bCoherencePass ? 1 : 0,
+		CandidateStep100.BoundaryCoherence.BoundaryCoherenceScore,
+		Gate.MinAllowedCoherence,
+		Gate.bLeakagePass ? 1 : 0,
+		CandidateStep100.BoundaryCoherence.InteriorLeakageFraction,
+		Gate.MaxAllowedInteriorLeakage);
+	AddInfo(GateMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *GateMessage);
+
+	if (Gate.bAllowStep200)
+	{
+		BaselinePlanet.AdvanceSteps(100);
+		CandidatePlanet.AdvanceSteps(100);
+		const FV6CheckpointSnapshot BaselineStep200 =
+			CaptureCheckpoint(BaselinePlanet, TEXT("baseline_structural_transfer"), BaselineExportRoot, 200, true);
+		const FV6CheckpointSnapshot CandidateStep200 =
+			CaptureCheckpoint(CandidatePlanet, TEXT("candidate_refined_terrane_capture"), CandidateExportRoot, 200, true);
+		LogComparison(200, BaselineStep200, CandidateStep200);
+		TestTrue(TEXT("Refined terrane-capture candidate promoted to step 200 when gates pass"), CandidatePlanet.GetPlanet().CurrentStep == 200);
+	}
+	else
+	{
+		TestTrue(TEXT("Refined terrane-capture candidate rejected before step 200"), CandidatePlanet.GetPlanet().CurrentStep == 100);
+	}
+
+	TestTrue(TEXT("Terrane-capture baseline reached step 100"), BaselinePlanet.GetPlanet().CurrentStep >= 100);
+	TestTrue(TEXT("Terrane-capture candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep >= 100);
 	return true;
 }

@@ -908,6 +908,10 @@ struct AUROUS_API FTectonicPlanetV6CollisionExecutionDiagnostic
 	int32 CumulativeCollisionAffectedSampleCount = 0;
 	int32 CumulativeCollisionAffectedSampleVisits = 0;
 	int32 CumulativeCollisionDrivenContinentalGainCount = 0;
+	int32 CumulativeCollisionDrivenOwnershipChangeCount = 0;
+	int32 CumulativeCollisionTransferredSampleCount = 0;
+	int32 CumulativeCollisionTransferredSampleVisits = 0;
+	int32 CumulativeCollisionTransferredContinentalSampleCount = 0;
 	int32 ExecutedPlateA = INDEX_NONE;
 	int32 ExecutedPlateB = INDEX_NONE;
 	int32 ExecutedOverridingPlateId = INDEX_NONE;
@@ -926,15 +930,30 @@ struct AUROUS_API FTectonicPlanetV6CollisionExecutionDiagnostic
 	int32 CollisionAffectedSampleCount = 0;
 	int32 CollisionDrivenContinentalGainCount = 0;
 	int32 CollisionDrivenOwnershipChangeCount = 0;
+	int32 CollisionTransferredSampleCount = 0;
+	int32 CollisionTransferredContinentalSampleCount = 0;
 	int32 CooldownSuppressedQualifiedCount = 0;
 	int32 QualifiedButUnexecutedCount = 0;
 	int32 ExecutedEffectiveMassSampleCount = 0;
+	int32 ExecutedTransferRejectedByLocalityCount = 0;
+	int32 ExecutedTransferRejectedByContinentalityCount = 0;
+	int32 ExecutedTransferRejectedByCapCount = 0;
+	int32 ExecutedTransferBoundaryLocalSampleCount = 0;
+	int32 ExecutedTransferCandidateSupportCount = 0;
+	int32 ExecutedTransferAnchorSeedCount = 0;
 	double ExecutedInfluenceRadiusRad = 0.0;
+	double ExecutedTransferInfluenceRadiusRad = 0.0;
 	double ExecutedMeanElevationDeltaKm = 0.0;
 	double ExecutedMaxElevationDeltaKm = 0.0;
 	double ExecutedStrengthScale = 1.0;
 	double CumulativeMeanElevationDeltaKm = 0.0;
 	double CumulativeMaxElevationDeltaKm = 0.0;
+	double ExecutedDonorPlateShareBefore = 0.0;
+	double ExecutedDonorPlateShareAfter = 0.0;
+	double ExecutedDonorPlateShareDelta = 0.0;
+	double ExecutedRecipientPlateShareBefore = 0.0;
+	double ExecutedRecipientPlateShareAfter = 0.0;
+	double ExecutedRecipientPlateShareDelta = 0.0;
 	bool bExecutedFromShadowQualifiedState = false;
 };
 
@@ -985,6 +1004,14 @@ struct AUROUS_API FTectonicPlanetV6
 	{
 		return CurrentSolveCollisionExecutionMask;
 	}
+	const TArray<uint8>& GetCollisionTransferMaskForTest() const
+	{
+		return CurrentSolveCollisionTransferMask;
+	}
+	const TArray<uint8>& GetCollisionCumulativeTransferMaskForTest() const
+	{
+		return CumulativeCollisionTransferMask;
+	}
 	const TArray<uint8>& GetCollisionCumulativeExecutionMaskForTest() const
 	{
 		return CumulativeCollisionExecutionMask;
@@ -1016,6 +1043,8 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetV9CollisionShadowForTest(bool bEnable);
 	void SetV9CollisionExecutionForTest(bool bEnable);
 	void SetV9CollisionExecutionEnhancedConsequencesForTest(bool bEnable);
+	void SetV9CollisionExecutionStructuralTransferForTest(bool bEnable);
+	void SetV9CollisionExecutionRefinedStructuralTransferForTest(bool bEnable);
 
 	static FTectonicPlanetV6ResolvedSample ResolvePhase1OwnershipForTest(
 		const TArray<FTectonicPlanetV6OwnerCandidate>& OwnerCandidates,
@@ -1136,7 +1165,9 @@ private:
 	TArray<uint8> CurrentSolveCollisionShadowPersistenceMask;
 	FTectonicPlanetV6CollisionShadowDiagnostic CurrentSolveCollisionShadowDiagnostic;
 	TArray<uint8> CurrentSolveCollisionExecutionMask;
+	TArray<uint8> CurrentSolveCollisionTransferMask;
 	TArray<uint8> CumulativeCollisionExecutionMask;
+	TArray<uint8> CumulativeCollisionTransferMask;
 	TArray<float> CumulativeCollisionElevationDeltaMaskKm;
 	TArray<float> CumulativeCollisionContinentalGainMask;
 	FTectonicPlanetV6CollisionExecutionDiagnostic CurrentSolveCollisionExecutionDiagnostic;
@@ -1145,6 +1176,9 @@ private:
 	int32 V9CollisionExecutionCumulativeCount = 0;
 	int32 V9CollisionExecutionCumulativeAffectedSampleVisits = 0;
 	int32 V9CollisionExecutionCumulativeContinentalGainCount = 0;
+	int32 V9CollisionExecutionCumulativeOwnershipChangeCount = 0;
+	int32 V9CollisionExecutionCumulativeTransferredSampleVisits = 0;
+	int32 V9CollisionExecutionCumulativeTransferredContinentalSampleCount = 0;
 	double V9CollisionExecutionCumulativeElevationDeltaKm = 0.0;
 	double V9CollisionExecutionCumulativeMaxElevationDeltaKm = 0.0;
 	bool bEnableSyntheticCoverageRetentionForTest = false;
@@ -1155,6 +1189,8 @@ private:
 	bool bEnableV9CollisionShadowForTest = false;
 	bool bEnableV9CollisionExecutionForTest = false;
 	bool bEnableV9CollisionExecutionEnhancedConsequencesForTest = false;
+	bool bEnableV9CollisionExecutionStructuralTransferForTest = false;
+	bool bEnableV9CollisionExecutionRefinedStructuralTransferForTest = false;
 	int32 V9Phase1ActiveBoundaryRingCountForTest = 1;
 	int32 V9Phase1PersistentActivePairHorizonForTest = 2;
 	ETectonicPlanetV6ActiveZoneClassifierMode V9Phase1ActiveZoneClassifierModeForTest =
