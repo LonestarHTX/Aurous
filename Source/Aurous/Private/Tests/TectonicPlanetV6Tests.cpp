@@ -133,6 +133,24 @@ namespace
 		int32 MaxComponentsObserved = 0;
 	};
 
+	struct FV9CollisionFidelityGateResult
+	{
+		bool bFootprintPass = false;
+		bool bElevationPass = false;
+		bool bContinentalGainPass = false;
+		bool bChurnPass = false;
+		bool bCoherencePass = false;
+		bool bLeakagePass = false;
+		bool bAllowStep200 = false;
+		int32 RequiredCumulativeAffectedSamples = 0;
+		int32 RequiredCumulativeContinentalGain = 0;
+		double RequiredExecutedMeanElevationDeltaKm = 0.0;
+		double RequiredCumulativeMeanElevationDeltaKm = 0.0;
+		double MaxAllowedChurn = 0.0;
+		double MinAllowedCoherence = 0.0;
+		double MaxAllowedInteriorLeakage = 0.0;
+	};
+
 	FV6CheckpointSnapshot BuildV6CheckpointSnapshot(const FTectonicPlanetV6& Planet);
 
 	FTectonicPlanetV6 CreateInitializedPlanetV6WithConfig(
@@ -1029,11 +1047,14 @@ namespace
 	{
 		const FTectonicPlanetV6CollisionExecutionDiagnostic& CE = Snapshot.CollisionExecution;
 		const FString Message = FString::Printf(
-			TEXT("%s step=%d exec_collision_count=%d exec_collision_cumulative=%d exec_pair=(%d,%d) exec_over_plate=%d exec_sub_plate=%d exec_obs=%d exec_penetration_km=%.1f exec_mean_convergence_km_per_my=%.3f exec_max_convergence_km_per_my=%.3f exec_support=%d exec_triangles=%d exec_continental_support=%d/%d exec_qualified_samples=%d exec_seed_samples=%d exec_collision_seed_samples=%d exec_affected=%d exec_continental_gain=%d exec_ownership_change=%d exec_cooldown_suppressed=%d exec_qualified_unexecuted=%d exec_radius_rad=%.6f exec_mean_elev_delta_km=%.6f exec_from_shadow=%d"),
+			TEXT("%s step=%d exec_collision_count=%d exec_collision_cumulative=%d exec_cumulative_affected=%d exec_cumulative_affected_visits=%d exec_cumulative_continental_gain=%d exec_pair=(%d,%d) exec_over_plate=%d exec_sub_plate=%d exec_obs=%d exec_penetration_km=%.1f exec_mean_convergence_km_per_my=%.3f exec_max_convergence_km_per_my=%.3f exec_support=%d exec_triangles=%d exec_continental_support=%d/%d exec_qualified_samples=%d exec_seed_samples=%d exec_collision_seed_samples=%d exec_effective_mass=%d exec_affected=%d exec_continental_gain=%d exec_ownership_change=%d exec_cooldown_suppressed=%d exec_qualified_unexecuted=%d exec_radius_rad=%.6f exec_mean_elev_delta_km=%.6f exec_max_elev_delta_km=%.6f exec_cumulative_mean_elev_delta_km=%.6f exec_cumulative_max_elev_delta_km=%.6f exec_strength_scale=%.6f exec_from_shadow=%d"),
 			*SummaryTag,
 			Snapshot.Step,
 			CE.ExecutedCollisionCount,
 			CE.CumulativeExecutedCollisionCount,
+			CE.CumulativeCollisionAffectedSampleCount,
+			CE.CumulativeCollisionAffectedSampleVisits,
+			CE.CumulativeCollisionDrivenContinentalGainCount,
 			CE.ExecutedPlateA,
 			CE.ExecutedPlateB,
 			CE.ExecutedOverridingPlateId,
@@ -1049,6 +1070,7 @@ namespace
 			CE.ExecutedContinentalQualifiedSampleCount,
 			CE.ExecutedSeedSampleCount,
 			CE.ExecutedCollisionSeedSampleCount,
+			CE.ExecutedEffectiveMassSampleCount,
 			CE.CollisionAffectedSampleCount,
 			CE.CollisionDrivenContinentalGainCount,
 			CE.CollisionDrivenOwnershipChangeCount,
@@ -1056,6 +1078,10 @@ namespace
 			CE.QualifiedButUnexecutedCount,
 			CE.ExecutedInfluenceRadiusRad,
 			CE.ExecutedMeanElevationDeltaKm,
+			CE.ExecutedMaxElevationDeltaKm,
+			CE.CumulativeMeanElevationDeltaKm,
+			CE.CumulativeMaxElevationDeltaKm,
+			CE.ExecutedStrengthScale,
 			CE.bExecutedFromShadowQualifiedState ? 1 : 0);
 		Test.AddInfo(Message);
 		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
@@ -1591,7 +1617,258 @@ namespace
 			}
 		}
 
+		// 5. CollisionCumulativeMask: samples touched by any collision event through this checkpoint
+		{
+			const TArray<uint8>& CollisionCumulativeMask = Planet.GetCollisionCumulativeExecutionMaskForTest();
+			if (CollisionCumulativeMask.Num() == SampleCount)
+			{
+				TArray<float> CollisionCumulativeValues;
+				CollisionCumulativeValues.SetNum(SampleCount);
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					CollisionCumulativeValues[I] = CollisionCumulativeMask[I] != 0 ? 1.0f : 0.0f;
+				}
+
+				const FString OutputPath = FPaths::Combine(OutputDirectory, TEXT("CollisionCumulativeMask.png"));
+				if (!TectonicMollweideExporter::ExportScalarOverlay(
+					PlanetData,
+					CollisionCumulativeValues,
+					0.0f,
+					1.0f,
+					OutputPath,
+					TestExportWidth,
+					TestExportHeight,
+					Error))
+				{
+					Test.AddError(FString::Printf(TEXT("CollisionCumulativeMask export step %d failed: %s"), Step, *Error));
+					bAllSucceeded = false;
+				}
+			}
+		}
+
+		// 6. CollisionElevationDeltaMask: cumulative collision-driven elevation gain in km
+		{
+			const TArray<float>& CollisionElevationDeltaMask = Planet.GetCollisionCumulativeElevationDeltaMaskForTest();
+			if (CollisionElevationDeltaMask.Num() == SampleCount)
+			{
+				float MaxDelta = 1.0f;
+				for (const float Value : CollisionElevationDeltaMask)
+				{
+					MaxDelta = FMath::Max(MaxDelta, Value);
+				}
+
+				const FString OutputPath = FPaths::Combine(OutputDirectory, TEXT("CollisionElevationDeltaMask.png"));
+				if (!TectonicMollweideExporter::ExportScalarOverlay(
+					PlanetData,
+					CollisionElevationDeltaMask,
+					0.0f,
+					MaxDelta,
+					OutputPath,
+					TestExportWidth,
+					TestExportHeight,
+					Error))
+				{
+					Test.AddError(FString::Printf(TEXT("CollisionElevationDeltaMask export step %d failed: %s"), Step, *Error));
+					bAllSucceeded = false;
+				}
+			}
+		}
+
+		// 7. CollisionContinentalGainMask: cumulative count of collision-driven CW gains
+		{
+			const TArray<float>& CollisionContinentalGainMask = Planet.GetCollisionCumulativeContinentalGainMaskForTest();
+			if (CollisionContinentalGainMask.Num() == SampleCount)
+			{
+				float MaxGain = 1.0f;
+				for (const float Value : CollisionContinentalGainMask)
+				{
+					MaxGain = FMath::Max(MaxGain, Value);
+				}
+
+				const FString OutputPath = FPaths::Combine(OutputDirectory, TEXT("CollisionContinentalGainMask.png"));
+				if (!TectonicMollweideExporter::ExportScalarOverlay(
+					PlanetData,
+					CollisionContinentalGainMask,
+					0.0f,
+					MaxGain,
+					OutputPath,
+					TestExportWidth,
+					TestExportHeight,
+					Error))
+				{
+					Test.AddError(FString::Printf(TEXT("CollisionContinentalGainMask export step %d failed: %s"), Step, *Error));
+					bAllSucceeded = false;
+				}
+			}
+		}
+
 		return bAllSucceeded;
+	}
+
+	bool ExportV6CollisionTuningInnerLoopOverlays(
+		FAutomationTestBase& Test,
+		const FTectonicPlanetV6& Planet,
+		const FString& ExportRoot,
+		const int32 Step)
+	{
+		const FString OutputDirectory = FPaths::Combine(ExportRoot, FString::Printf(TEXT("step_%03d"), Step));
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		const int32 SampleCount = PlanetData.Samples.Num();
+		if (SampleCount == 0) { return false; }
+
+		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+		PlatformFile.CreateDirectoryTree(*OutputDirectory);
+
+		bool bAllSucceeded = true;
+		FString Error;
+
+		const auto ExportOverlay =
+			[&](
+				const TCHAR* Name,
+				const TArray<float>& Values,
+				const float MinValue,
+				const float MaxValue)
+		{
+			const FString OutputPath = FPaths::Combine(OutputDirectory, Name);
+			if (!TectonicMollweideExporter::ExportScalarOverlay(
+				PlanetData,
+				Values,
+				MinValue,
+				MaxValue,
+				OutputPath,
+				TestExportWidth,
+				TestExportHeight,
+				Error))
+			{
+				Test.AddError(FString::Printf(TEXT("%s export step %d failed: %s"), Name, Step, *Error));
+				bAllSucceeded = false;
+			}
+		};
+
+		{
+			TArray<float> ChurnValues;
+			ChurnValues.Init(0.0f, SampleCount);
+			const TArray<FTectonicPlanetV6ResolvedSample>& ResolvedSamples = Planet.GetLastResolvedSamplesForTest();
+			for (int32 I = 0; I < SampleCount; ++I)
+			{
+				if (ResolvedSamples.IsValidIndex(I) &&
+					ResolvedSamples[I].PreviousPlateId != INDEX_NONE &&
+					ResolvedSamples[I].FinalPlateId != INDEX_NONE &&
+					ResolvedSamples[I].FinalPlateId != ResolvedSamples[I].PreviousPlateId)
+				{
+					ChurnValues[I] = 1.0f;
+				}
+			}
+			ExportOverlay(TEXT("OwnershipChurnMask.png"), ChurnValues, 0.0f, 1.0f);
+		}
+
+		{
+			const TArray<uint8>& CollisionExecutionMask = Planet.GetCollisionExecutionMaskForTest();
+			if (CollisionExecutionMask.Num() == SampleCount)
+			{
+				TArray<float> Values;
+				Values.SetNum(SampleCount);
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					Values[I] = CollisionExecutionMask[I] != 0 ? 1.0f : 0.0f;
+				}
+				ExportOverlay(TEXT("CollisionExecutedMask.png"), Values, 0.0f, 1.0f);
+			}
+		}
+
+		{
+			const TArray<uint8>& CollisionCumulativeMask = Planet.GetCollisionCumulativeExecutionMaskForTest();
+			if (CollisionCumulativeMask.Num() == SampleCount)
+			{
+				TArray<float> Values;
+				Values.SetNum(SampleCount);
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					Values[I] = CollisionCumulativeMask[I] != 0 ? 1.0f : 0.0f;
+				}
+				ExportOverlay(TEXT("CollisionCumulativeMask.png"), Values, 0.0f, 1.0f);
+			}
+		}
+
+		{
+			const TArray<float>& CollisionElevationDeltaMask = Planet.GetCollisionCumulativeElevationDeltaMaskForTest();
+			if (CollisionElevationDeltaMask.Num() == SampleCount)
+			{
+				float MaxDelta = 1.0f;
+				for (const float Value : CollisionElevationDeltaMask)
+				{
+					MaxDelta = FMath::Max(MaxDelta, Value);
+				}
+				ExportOverlay(TEXT("CollisionElevationDeltaMask.png"), CollisionElevationDeltaMask, 0.0f, MaxDelta);
+			}
+		}
+
+		{
+			const TArray<float>& CollisionContinentalGainMask = Planet.GetCollisionCumulativeContinentalGainMaskForTest();
+			if (CollisionContinentalGainMask.Num() == SampleCount)
+			{
+				float MaxGain = 1.0f;
+				for (const float Value : CollisionContinentalGainMask)
+				{
+					MaxGain = FMath::Max(MaxGain, Value);
+				}
+				ExportOverlay(TEXT("CollisionContinentalGainMask.png"), CollisionContinentalGainMask, 0.0f, MaxGain);
+			}
+		}
+
+		return bAllSucceeded;
+	}
+
+	FV9CollisionFidelityGateResult EvaluateV9CollisionFidelityStep100Gate(
+		const FV6CheckpointSnapshot& BaselineSnapshot,
+		const FV6CheckpointSnapshot& CandidateSnapshot)
+	{
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& BaselineExec =
+			BaselineSnapshot.CollisionExecution;
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& CandidateExec =
+			CandidateSnapshot.CollisionExecution;
+
+		FV9CollisionFidelityGateResult Result;
+		Result.RequiredCumulativeAffectedSamples = FMath::Max(
+			BaselineExec.CumulativeCollisionAffectedSampleCount + 25,
+			FMath::CeilToInt(static_cast<double>(BaselineExec.CumulativeCollisionAffectedSampleCount) * 1.15));
+		Result.RequiredCumulativeContinentalGain = FMath::Max(
+			BaselineExec.CumulativeCollisionDrivenContinentalGainCount + 10,
+			FMath::CeilToInt(static_cast<double>(BaselineExec.CumulativeCollisionDrivenContinentalGainCount) * 1.15));
+		Result.RequiredExecutedMeanElevationDeltaKm =
+			BaselineExec.ExecutedMeanElevationDeltaKm > UE_DOUBLE_SMALL_NUMBER
+				? BaselineExec.ExecutedMeanElevationDeltaKm * 1.10
+				: 0.05;
+		Result.RequiredCumulativeMeanElevationDeltaKm =
+			BaselineExec.CumulativeMeanElevationDeltaKm > UE_DOUBLE_SMALL_NUMBER
+				? BaselineExec.CumulativeMeanElevationDeltaKm * 1.10
+				: 0.05;
+		Result.MaxAllowedChurn = BaselineSnapshot.OwnershipChurn.ChurnFraction + 0.01;
+		Result.MinAllowedCoherence = BaselineSnapshot.BoundaryCoherence.BoundaryCoherenceScore - 0.01;
+		Result.MaxAllowedInteriorLeakage =
+			BaselineSnapshot.BoundaryCoherence.InteriorLeakageFraction + 0.02;
+
+		Result.bFootprintPass =
+			CandidateExec.CumulativeCollisionAffectedSampleCount >= Result.RequiredCumulativeAffectedSamples;
+		Result.bContinentalGainPass =
+			CandidateExec.CumulativeCollisionDrivenContinentalGainCount >= Result.RequiredCumulativeContinentalGain;
+		Result.bElevationPass =
+			CandidateExec.ExecutedMeanElevationDeltaKm >= Result.RequiredExecutedMeanElevationDeltaKm ||
+			CandidateExec.CumulativeMeanElevationDeltaKm >= Result.RequiredCumulativeMeanElevationDeltaKm;
+		Result.bChurnPass =
+			CandidateSnapshot.OwnershipChurn.ChurnFraction <= Result.MaxAllowedChurn;
+		Result.bCoherencePass =
+			CandidateSnapshot.BoundaryCoherence.BoundaryCoherenceScore >= Result.MinAllowedCoherence;
+		Result.bLeakagePass =
+			CandidateSnapshot.BoundaryCoherence.InteriorLeakageFraction <= Result.MaxAllowedInteriorLeakage;
+		Result.bAllowStep200 =
+			Result.bFootprintPass &&
+			Result.bElevationPass &&
+			Result.bContinentalGainPass &&
+			Result.bChurnPass &&
+			Result.bCoherencePass &&
+			Result.bLeakagePass;
+		return Result;
 	}
 
 	FV6BaselineSummary RunV6BaselineScenario(
@@ -6216,5 +6493,348 @@ bool FTectonicPlanetV6V9Phase1dCollisionExecutionValidationTest::RunTest(const F
 	LogCheckpoint(200);
 
 	TestTrue(TEXT("Reached step 200"), Planet.GetPlanet().CurrentStep == 200);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9Phase1dCollisionConsequenceFidelityValidationTest,
+	"Aurous.TectonicPlanet.V6V9Phase1dCollisionConsequenceFidelityValidationTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9Phase1dCollisionConsequenceFidelityValidationTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	const FString RunId = TEXT("V9Phase1dCollisionConsequenceFidelityValidation");
+
+	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+			FixedIntervalSteps,
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			TestRandomSeed);
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+		Planet.SetV9CollisionShadowForTest(true);
+		Planet.SetV9CollisionExecutionForTest(true);
+		return Planet;
+	};
+
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
+	BaselinePlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(false);
+
+	FTectonicPlanetV6 FidelityPlanet = InitializePlanet();
+	FidelityPlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	const FString ExportRoot = FPaths::Combine(
+		FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	const FString BaselineExportRoot = FPaths::Combine(ExportRoot, TEXT("baseline_execution"));
+	const FString FidelityExportRoot = FPaths::Combine(ExportRoot, TEXT("fidelity_execution"));
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*BaselineExportRoot);
+	PlatformFile.CreateDirectoryTree(*FidelityExportRoot);
+	ExportV6CheckpointMaps(*this, BaselinePlanet, BaselineExportRoot, 0);
+	ExportV6DebugOverlays(*this, BaselinePlanet, BaselineExportRoot, 0);
+	ExportV6CheckpointMaps(*this, FidelityPlanet, FidelityExportRoot, 0);
+	ExportV6DebugOverlays(*this, FidelityPlanet, FidelityExportRoot, 0);
+
+	const auto CaptureCheckpoint =
+		[this](
+			FTectonicPlanetV6& Planet,
+			const FString& VariantTag,
+			const FString& VariantExportRoot,
+			const int32 Step) -> FV6CheckpointSnapshot
+	{
+		ExportV6CheckpointMaps(*this, Planet, VariantExportRoot, Step);
+		ExportV6DebugOverlays(*this, Planet, VariantExportRoot, Step);
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+		const FString Tag = FString::Printf(TEXT("[V9CollisionConsequence variant=%s step=%d]"), *VariantTag, Step);
+		AddV6ThesisRemeshInfo(*this, *Tag, Snapshot);
+		AddV6DiagnosticsPackageInfo(*this, *Tag, Snapshot);
+		AddV6BoundaryCoherenceInfo(*this, *Tag, Snapshot);
+		AddV6InteriorInstabilityInfo(*this, *Tag, Snapshot);
+		AddV6SyntheticCoveragePersistenceInfo(*this, *Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, *Tag, Snapshot);
+		AddV6TectonicInteractionInfo(*this, *Tag, Snapshot);
+		AddV6CollisionShadowInfo(*this, *Tag, Snapshot);
+		AddV6CollisionExecutionInfo(*this, *Tag, Snapshot);
+		return Snapshot;
+	};
+
+	const auto LogComparison =
+		[this](
+			const int32 Step,
+			const FV6CheckpointSnapshot& BaselineSnapshot,
+			const FV6CheckpointSnapshot& FidelitySnapshot)
+	{
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& BaselineExec =
+			BaselineSnapshot.CollisionExecution;
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& FidelityExec =
+			FidelitySnapshot.CollisionExecution;
+		const FString Message = FString::Printf(
+			TEXT("[V9CollisionConsequence compare step=%d] churn %.4f->%.4f coherence %.4f->%.4f interior_leakage %.4f->%.4f max_components %d->%d miss %d->%d multi %d->%d active_fraction %.4f->%.4f exec_current %d->%d exec_cumulative %d->%d exec_affected %d->%d exec_cumulative_affected %d->%d exec_continental_gain %d->%d exec_cumulative_continental_gain %d->%d exec_mean_elev_delta_km %.6f->%.6f exec_max_elev_delta_km %.6f->%.6f exec_cumulative_mean_elev_delta_km %.6f->%.6f exec_cumulative_max_elev_delta_km %.6f->%.6f"),
+			Step,
+			BaselineSnapshot.OwnershipChurn.ChurnFraction,
+			FidelitySnapshot.OwnershipChurn.ChurnFraction,
+			BaselineSnapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			FidelitySnapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			BaselineSnapshot.BoundaryCoherence.InteriorLeakageFraction,
+			FidelitySnapshot.BoundaryCoherence.InteriorLeakageFraction,
+			BaselineSnapshot.MaxComponentsPerPlate,
+			FidelitySnapshot.MaxComponentsPerPlate,
+			BaselineSnapshot.MissCount,
+			FidelitySnapshot.MissCount,
+			BaselineSnapshot.MultiHitCount,
+			FidelitySnapshot.MultiHitCount,
+			BaselineSnapshot.ActiveZone.ActiveFraction,
+			FidelitySnapshot.ActiveZone.ActiveFraction,
+			BaselineExec.ExecutedCollisionCount,
+			FidelityExec.ExecutedCollisionCount,
+			BaselineExec.CumulativeExecutedCollisionCount,
+			FidelityExec.CumulativeExecutedCollisionCount,
+			BaselineExec.CollisionAffectedSampleCount,
+			FidelityExec.CollisionAffectedSampleCount,
+			BaselineExec.CumulativeCollisionAffectedSampleCount,
+			FidelityExec.CumulativeCollisionAffectedSampleCount,
+			BaselineExec.CollisionDrivenContinentalGainCount,
+			FidelityExec.CollisionDrivenContinentalGainCount,
+			BaselineExec.CumulativeCollisionDrivenContinentalGainCount,
+			FidelityExec.CumulativeCollisionDrivenContinentalGainCount,
+			BaselineExec.ExecutedMeanElevationDeltaKm,
+			FidelityExec.ExecutedMeanElevationDeltaKm,
+			BaselineExec.ExecutedMaxElevationDeltaKm,
+			FidelityExec.ExecutedMaxElevationDeltaKm,
+			BaselineExec.CumulativeMeanElevationDeltaKm,
+			FidelityExec.CumulativeMeanElevationDeltaKm,
+			BaselineExec.CumulativeMaxElevationDeltaKm,
+			FidelityExec.CumulativeMaxElevationDeltaKm);
+		AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	};
+
+	BaselinePlanet.AdvanceSteps(25);
+	FidelityPlanet.AdvanceSteps(25);
+	const FV6CheckpointSnapshot BaselineStep25 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_execution"), BaselineExportRoot, 25);
+	const FV6CheckpointSnapshot FidelityStep25 =
+		CaptureCheckpoint(FidelityPlanet, TEXT("fidelity_execution"), FidelityExportRoot, 25);
+	LogComparison(25, BaselineStep25, FidelityStep25);
+
+	BaselinePlanet.AdvanceSteps(75);
+	FidelityPlanet.AdvanceSteps(75);
+	const FV6CheckpointSnapshot BaselineStep100 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_execution"), BaselineExportRoot, 100);
+	const FV6CheckpointSnapshot FidelityStep100 =
+		CaptureCheckpoint(FidelityPlanet, TEXT("fidelity_execution"), FidelityExportRoot, 100);
+	LogComparison(100, BaselineStep100, FidelityStep100);
+
+	BaselinePlanet.AdvanceSteps(100);
+	FidelityPlanet.AdvanceSteps(100);
+	const FV6CheckpointSnapshot BaselineStep200 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_execution"), BaselineExportRoot, 200);
+	const FV6CheckpointSnapshot FidelityStep200 =
+		CaptureCheckpoint(FidelityPlanet, TEXT("fidelity_execution"), FidelityExportRoot, 200);
+	LogComparison(200, BaselineStep200, FidelityStep200);
+
+	TestTrue(TEXT("Baseline variant reached step 200"), BaselinePlanet.GetPlanet().CurrentStep == 200);
+	TestTrue(TEXT("Fidelity variant reached step 200"), FidelityPlanet.GetPlanet().CurrentStep == 200);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9Phase1dCollisionFidelityTuningHarnessTest,
+	"Aurous.TectonicPlanet.V6V9Phase1dCollisionFidelityTuningHarnessTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9Phase1dCollisionFidelityTuningHarnessTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	const FString RunId = TEXT("V9Phase1dCollisionFidelityTuningHarness");
+
+	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+			FixedIntervalSteps,
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			TestRandomSeed);
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+		Planet.SetV9CollisionShadowForTest(true);
+		Planet.SetV9CollisionExecutionForTest(true);
+		return Planet;
+	};
+
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
+	BaselinePlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(false);
+
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
+	CandidatePlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	const FString ExportRoot = FPaths::Combine(
+		FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	const FString BaselineExportRoot = FPaths::Combine(ExportRoot, TEXT("baseline_execution"));
+	const FString CandidateExportRoot = FPaths::Combine(ExportRoot, TEXT("candidate_execution"));
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*BaselineExportRoot);
+	PlatformFile.CreateDirectoryTree(*CandidateExportRoot);
+
+	AddInfo(TEXT("[V9CollisionTuningHarness] export_policy step25/100=minimal_collision_overlays step200=full_only_if_gate_passes"));
+
+	const auto CaptureCheckpoint =
+		[this](
+			FTectonicPlanetV6& Planet,
+			const FString& VariantTag,
+			const FString& VariantExportRoot,
+			const int32 Step,
+			const bool bFullExports) -> FV6CheckpointSnapshot
+	{
+		if (bFullExports)
+		{
+			ExportV6CheckpointMaps(*this, Planet, VariantExportRoot, Step);
+			ExportV6DebugOverlays(*this, Planet, VariantExportRoot, Step);
+		}
+		else
+		{
+			ExportV6CollisionTuningInnerLoopOverlays(*this, Planet, VariantExportRoot, Step);
+		}
+
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+		const FString Tag = FString::Printf(TEXT("[V9CollisionTuningHarness variant=%s step=%d]"), *VariantTag, Step);
+		AddV6BoundaryCoherenceInfo(*this, *Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, *Tag, Snapshot);
+		AddV6CollisionShadowInfo(*this, *Tag, Snapshot);
+		AddV6CollisionExecutionInfo(*this, *Tag, Snapshot);
+		return Snapshot;
+	};
+
+	const auto LogComparison =
+		[this](
+			const int32 Step,
+			const FV6CheckpointSnapshot& BaselineSnapshot,
+			const FV6CheckpointSnapshot& CandidateSnapshot)
+	{
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& BaselineExec =
+			BaselineSnapshot.CollisionExecution;
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& CandidateExec =
+			CandidateSnapshot.CollisionExecution;
+		const FString Message = FString::Printf(
+			TEXT("[V9CollisionTuningHarness compare step=%d] churn %.4f->%.4f coherence %.4f->%.4f interior_leakage %.4f->%.4f active_fraction %.4f->%.4f exec_current %d->%d exec_cumulative %d->%d exec_affected %d->%d exec_cumulative_affected %d->%d exec_continental_gain %d->%d exec_cumulative_continental_gain %d->%d exec_mean_elev_delta_km %.6f->%.6f exec_max_elev_delta_km %.6f->%.6f exec_cumulative_mean_elev_delta_km %.6f->%.6f"),
+			Step,
+			BaselineSnapshot.OwnershipChurn.ChurnFraction,
+			CandidateSnapshot.OwnershipChurn.ChurnFraction,
+			BaselineSnapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			CandidateSnapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			BaselineSnapshot.BoundaryCoherence.InteriorLeakageFraction,
+			CandidateSnapshot.BoundaryCoherence.InteriorLeakageFraction,
+			BaselineSnapshot.ActiveZone.ActiveFraction,
+			CandidateSnapshot.ActiveZone.ActiveFraction,
+			BaselineExec.ExecutedCollisionCount,
+			CandidateExec.ExecutedCollisionCount,
+			BaselineExec.CumulativeExecutedCollisionCount,
+			CandidateExec.CumulativeExecutedCollisionCount,
+			BaselineExec.CollisionAffectedSampleCount,
+			CandidateExec.CollisionAffectedSampleCount,
+			BaselineExec.CumulativeCollisionAffectedSampleCount,
+			CandidateExec.CumulativeCollisionAffectedSampleCount,
+			BaselineExec.CollisionDrivenContinentalGainCount,
+			CandidateExec.CollisionDrivenContinentalGainCount,
+			BaselineExec.CumulativeCollisionDrivenContinentalGainCount,
+			CandidateExec.CumulativeCollisionDrivenContinentalGainCount,
+			BaselineExec.ExecutedMeanElevationDeltaKm,
+			CandidateExec.ExecutedMeanElevationDeltaKm,
+			BaselineExec.ExecutedMaxElevationDeltaKm,
+			CandidateExec.ExecutedMaxElevationDeltaKm,
+			BaselineExec.CumulativeMeanElevationDeltaKm,
+			CandidateExec.CumulativeMeanElevationDeltaKm);
+		AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	};
+
+	BaselinePlanet.AdvanceSteps(25);
+	CandidatePlanet.AdvanceSteps(25);
+	const FV6CheckpointSnapshot BaselineStep25 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_execution"), BaselineExportRoot, 25, false);
+	const FV6CheckpointSnapshot CandidateStep25 =
+		CaptureCheckpoint(CandidatePlanet, TEXT("candidate_execution"), CandidateExportRoot, 25, false);
+	LogComparison(25, BaselineStep25, CandidateStep25);
+
+	BaselinePlanet.AdvanceSteps(75);
+	CandidatePlanet.AdvanceSteps(75);
+	const FV6CheckpointSnapshot BaselineStep100 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_execution"), BaselineExportRoot, 100, false);
+	const FV6CheckpointSnapshot CandidateStep100 =
+		CaptureCheckpoint(CandidatePlanet, TEXT("candidate_execution"), CandidateExportRoot, 100, false);
+	LogComparison(100, BaselineStep100, CandidateStep100);
+
+	const FV9CollisionFidelityGateResult Gate =
+		EvaluateV9CollisionFidelityStep100Gate(BaselineStep100, CandidateStep100);
+	const FTectonicPlanetV6CollisionExecutionDiagnostic& BaselineExec = BaselineStep100.CollisionExecution;
+	const FTectonicPlanetV6CollisionExecutionDiagnostic& CandidateExec = CandidateStep100.CollisionExecution;
+
+	const FString GateMessage = FString::Printf(
+		TEXT("[V9CollisionTuningHarness gate step=100] run_step200=%d footprint_pass=%d candidate_cumulative_affected=%d required_cumulative_affected=%d elevation_pass=%d candidate_exec_mean_delta_km=%.6f required_exec_mean_delta_km=%.6f candidate_cumulative_mean_delta_km=%.6f required_cumulative_mean_delta_km=%.6f continental_gain_pass=%d candidate_cumulative_continental_gain=%d required_cumulative_continental_gain=%d churn_pass=%d candidate_churn=%.4f max_churn=%.4f coherence_pass=%d candidate_coherence=%.4f min_coherence=%.4f leakage_pass=%d candidate_interior_leakage=%.4f max_interior_leakage=%.4f"),
+		Gate.bAllowStep200 ? 1 : 0,
+		Gate.bFootprintPass ? 1 : 0,
+		CandidateExec.CumulativeCollisionAffectedSampleCount,
+		Gate.RequiredCumulativeAffectedSamples,
+		Gate.bElevationPass ? 1 : 0,
+		CandidateExec.ExecutedMeanElevationDeltaKm,
+		Gate.RequiredExecutedMeanElevationDeltaKm,
+		CandidateExec.CumulativeMeanElevationDeltaKm,
+		Gate.RequiredCumulativeMeanElevationDeltaKm,
+		Gate.bContinentalGainPass ? 1 : 0,
+		CandidateExec.CumulativeCollisionDrivenContinentalGainCount,
+		Gate.RequiredCumulativeContinentalGain,
+		Gate.bChurnPass ? 1 : 0,
+		CandidateStep100.OwnershipChurn.ChurnFraction,
+		Gate.MaxAllowedChurn,
+		Gate.bCoherencePass ? 1 : 0,
+		CandidateStep100.BoundaryCoherence.BoundaryCoherenceScore,
+		Gate.MinAllowedCoherence,
+		Gate.bLeakagePass ? 1 : 0,
+		CandidateStep100.BoundaryCoherence.InteriorLeakageFraction,
+		Gate.MaxAllowedInteriorLeakage);
+	AddInfo(GateMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *GateMessage);
+
+	if (Gate.bAllowStep200)
+	{
+		BaselinePlanet.AdvanceSteps(100);
+		CandidatePlanet.AdvanceSteps(100);
+		const FV6CheckpointSnapshot BaselineStep200 =
+			CaptureCheckpoint(BaselinePlanet, TEXT("baseline_execution"), BaselineExportRoot, 200, true);
+		const FV6CheckpointSnapshot CandidateStep200 =
+			CaptureCheckpoint(CandidatePlanet, TEXT("candidate_execution"), CandidateExportRoot, 200, true);
+		LogComparison(200, BaselineStep200, CandidateStep200);
+		TestTrue(TEXT("Candidate promoted to step 200 when gates pass"), CandidatePlanet.GetPlanet().CurrentStep == 200);
+	}
+	else
+	{
+		TestTrue(TEXT("Weak candidate rejected before step 200"), CandidatePlanet.GetPlanet().CurrentStep == 100);
+	}
+
+	TestTrue(TEXT("Baseline reached step 100"), BaselinePlanet.GetPlanet().CurrentStep >= 100);
+	TestTrue(TEXT("Candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep >= 100);
 	return true;
 }

@@ -923,14 +923,47 @@ namespace
 		TMap<uint64, int32>& InOutLastExecutedSolveIndexByKey,
 		const int32 CurrentSolveIndex,
 		TArray<uint8>& OutExecutionMask,
+		TArray<uint8>& InOutCumulativeExecutionMask,
+		TArray<float>& InOutCumulativeElevationDeltaMaskKm,
+		TArray<float>& InOutCumulativeContinentalGainMask,
 		FTectonicPlanetV6CollisionExecutionDiagnostic& OutDiagnostic,
-		int32& InOutCumulativeExecutionCount)
+		int32& InOutCumulativeExecutionCount,
+		int32& InOutCumulativeAffectedSampleVisits,
+		int32& InOutCumulativeContinentalGainCount,
+		double& InOutCumulativeElevationDeltaKm,
+		double& InOutCumulativeMaxElevationDeltaKm,
+		const bool bEnableEnhancedConsequences)
 	{
 		constexpr int32 CollisionExecutionPairCooldownSolves = 3;
 
 		OutDiagnostic = FTectonicPlanetV6CollisionExecutionDiagnostic{};
 		OutExecutionMask.Init(0, Planet.Samples.Num());
 		OutDiagnostic.CumulativeExecutedCollisionCount = InOutCumulativeExecutionCount;
+		if (InOutCumulativeExecutionMask.Num() != Planet.Samples.Num())
+		{
+			InOutCumulativeExecutionMask.Init(0, Planet.Samples.Num());
+		}
+		if (InOutCumulativeElevationDeltaMaskKm.Num() != Planet.Samples.Num())
+		{
+			InOutCumulativeElevationDeltaMaskKm.Init(0.0f, Planet.Samples.Num());
+		}
+		if (InOutCumulativeContinentalGainMask.Num() != Planet.Samples.Num())
+		{
+			InOutCumulativeContinentalGainMask.Init(0.0f, Planet.Samples.Num());
+		}
+		OutDiagnostic.CumulativeCollisionAffectedSampleVisits = InOutCumulativeAffectedSampleVisits;
+		OutDiagnostic.CumulativeCollisionDrivenContinentalGainCount =
+			InOutCumulativeContinentalGainCount;
+		OutDiagnostic.CumulativeMeanElevationDeltaKm =
+			InOutCumulativeAffectedSampleVisits > 0
+				? InOutCumulativeElevationDeltaKm /
+					static_cast<double>(InOutCumulativeAffectedSampleVisits)
+				: 0.0;
+		OutDiagnostic.CumulativeMaxElevationDeltaKm = InOutCumulativeMaxElevationDeltaKm;
+		for (const uint8 Value : InOutCumulativeExecutionMask)
+		{
+			OutDiagnostic.CumulativeCollisionAffectedSampleCount += Value != 0 ? 1 : 0;
+		}
 		ResetV9CollisionExecutionLegacyStats(Planet);
 
 		if (Planet.Samples.IsEmpty() || ResolvedSamples.Num() != Planet.Samples.Num())
@@ -1107,15 +1140,49 @@ namespace
 		const double CollisionGlobalDistanceRad = 0.659;
 		const double MinCollisionRadiusRad = 0.05;
 		const double CollisionCoefficient = 0.013;
-		const double SurgeRadiusRad = FMath::Max(
-			CollisionGlobalDistanceRad * FMath::Min(Xi, 1.0),
-			MinCollisionRadiusRad);
+		const double ObservationStrength = FMath::Clamp(
+			(static_cast<double>(SelectedPair->ObservationCount) - 3.0) / 9.0,
+			0.0,
+			1.0);
+		const double PenetrationStrength = FMath::Clamp(
+			(SelectedPair->AccumulatedPenetrationKm - 3000.0) / 9000.0,
+			0.0,
+			1.0);
+		const double ContinentalStrength = FMath::Clamp(
+			static_cast<double>(SelectedPair->ContinentalQualifiedSampleCount) / 24.0,
+			0.0,
+			1.0);
+		const double CollisionStrength01 = bEnableEnhancedConsequences
+			? FMath::Clamp(
+				(0.45 * ObservationStrength) +
+				(0.35 * PenetrationStrength) +
+				(0.20 * ContinentalStrength),
+				0.0,
+				1.0)
+			: 0.0;
+		const int32 EffectiveMassSampleCount = bEnableEnhancedConsequences
+			? FMath::Max(
+				CollisionEvent.TerraneSampleIndices.Num(),
+				SelectedPair->ContinentalQualifiedSampleCount)
+			: CollisionEvent.TerraneSampleIndices.Num();
+		const double CollisionRadiusScale = bEnableEnhancedConsequences
+			? (1.0 + (0.20 * CollisionStrength01))
+			: 1.0;
+		const double CollisionCoefficientScale = bEnableEnhancedConsequences
+			? (1.0 + (0.85 * CollisionStrength01))
+			: 1.0;
+		const double SurgeRadiusRad = FMath::Min(
+			CollisionGlobalDistanceRad,
+			FMath::Max(
+				(CollisionGlobalDistanceRad * FMath::Min(Xi, 1.0)) * CollisionRadiusScale,
+				MinCollisionRadiusRad));
 
 		TArray<int32> AffectedSampleIndices;
 		AffectedSampleIndices.Reserve(Planet.Samples.Num() / 16);
 		int32 ContinentalGainCount = 0;
 		int32 CWBoostedCount = 0;
 		double TotalElevationDeltaKm = 0.0;
+		double MaxElevationDeltaKm = 0.0;
 		for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
 		{
 			FSample& Sample = Planet.Samples[SampleIndex];
@@ -1137,7 +1204,8 @@ namespace
 			const float PreviousElevation = Sample.Elevation;
 			const double ElevationDeltaKm =
 				CollisionCoefficient *
-				(static_cast<double>(CollisionEvent.TerraneSampleIndices.Num()) /
+				CollisionCoefficientScale *
+				(static_cast<double>(EffectiveMassSampleCount) /
 					static_cast<double>(Planet.Samples.Num())) *
 				Kernel *
 				Planet.PlanetRadiusKm;
@@ -1157,11 +1225,21 @@ namespace
 
 			Sample.ContinentalWeight = 1.0f;
 			Sample.Thickness = FMath::Max(Sample.Thickness, static_cast<float>(ContinentalThicknessKm));
-			ContinentalGainCount += PreviousContinentalWeight < 0.5f && Sample.ContinentalWeight >= 0.5f ? 1 : 0;
+			const bool bContinentalGain =
+				PreviousContinentalWeight < 0.5f && Sample.ContinentalWeight >= 0.5f;
+			ContinentalGainCount += bContinentalGain ? 1 : 0;
 			CWBoostedCount += Sample.ContinentalWeight > PreviousContinentalWeight ? 1 : 0;
-			TotalElevationDeltaKm += static_cast<double>(Sample.Elevation - PreviousElevation);
+			const double AppliedElevationDeltaKm = static_cast<double>(Sample.Elevation - PreviousElevation);
+			TotalElevationDeltaKm += AppliedElevationDeltaKm;
+			MaxElevationDeltaKm = FMath::Max(MaxElevationDeltaKm, AppliedElevationDeltaKm);
 			AffectedSampleIndices.Add(SampleIndex);
 			OutExecutionMask[SampleIndex] = 1;
+			InOutCumulativeExecutionMask[SampleIndex] = 1;
+			InOutCumulativeElevationDeltaMaskKm[SampleIndex] += static_cast<float>(AppliedElevationDeltaKm);
+			if (bContinentalGain)
+			{
+				InOutCumulativeContinentalGainMask[SampleIndex] += 1.0f;
+			}
 		}
 
 		SyncV6CarriedSamplesFromCanonicalIndices(Planet, AffectedSampleIndices);
@@ -1184,9 +1262,17 @@ namespace
 
 		InOutLastExecutedSolveIndexByKey.Add(SelectedPairKey, CurrentSolveIndex);
 		++InOutCumulativeExecutionCount;
+		InOutCumulativeAffectedSampleVisits += AffectedSampleIndices.Num();
+		InOutCumulativeContinentalGainCount += ContinentalGainCount;
+		InOutCumulativeElevationDeltaKm += TotalElevationDeltaKm;
+		InOutCumulativeMaxElevationDeltaKm =
+			FMath::Max(InOutCumulativeMaxElevationDeltaKm, MaxElevationDeltaKm);
 
 		OutDiagnostic.ExecutedCollisionCount = 1;
 		OutDiagnostic.CumulativeExecutedCollisionCount = InOutCumulativeExecutionCount;
+		OutDiagnostic.CumulativeCollisionAffectedSampleVisits = InOutCumulativeAffectedSampleVisits;
+		OutDiagnostic.CumulativeCollisionDrivenContinentalGainCount =
+			InOutCumulativeContinentalGainCount;
 		OutDiagnostic.ExecutedPlateA = SelectedPair->PlateA;
 		OutDiagnostic.ExecutedPlateB = SelectedPair->PlateB;
 		OutDiagnostic.ExecutedOverridingPlateId = OverridingPlateId;
@@ -1205,6 +1291,7 @@ namespace
 			SelectedPair->ContinentalQualifiedSampleCount;
 		OutDiagnostic.ExecutedSeedSampleCount = SeedSampleIndices.Num();
 		OutDiagnostic.ExecutedCollisionSeedSampleCount = CollisionSeedSampleIndices.Num();
+		OutDiagnostic.ExecutedEffectiveMassSampleCount = EffectiveMassSampleCount;
 		OutDiagnostic.CollisionAffectedSampleCount = AffectedSampleIndices.Num();
 		OutDiagnostic.CollisionDrivenContinentalGainCount = ContinentalGainCount;
 		OutDiagnostic.CollisionDrivenOwnershipChangeCount = 0;
@@ -1213,12 +1300,25 @@ namespace
 			AffectedSampleIndices.IsEmpty()
 				? 0.0
 				: TotalElevationDeltaKm / static_cast<double>(AffectedSampleIndices.Num());
+		OutDiagnostic.ExecutedMaxElevationDeltaKm = MaxElevationDeltaKm;
+		OutDiagnostic.ExecutedStrengthScale = CollisionCoefficientScale;
+		OutDiagnostic.CumulativeMeanElevationDeltaKm =
+			InOutCumulativeAffectedSampleVisits > 0
+				? InOutCumulativeElevationDeltaKm /
+					static_cast<double>(InOutCumulativeAffectedSampleVisits)
+				: 0.0;
+		OutDiagnostic.CumulativeMaxElevationDeltaKm = InOutCumulativeMaxElevationDeltaKm;
 		OutDiagnostic.bExecutedFromShadowQualifiedState = true;
+		OutDiagnostic.CumulativeCollisionAffectedSampleCount = 0;
+		for (const uint8 Value : InOutCumulativeExecutionMask)
+		{
+			OutDiagnostic.CumulativeCollisionAffectedSampleCount += Value != 0 ? 1 : 0;
+		}
 
 		UE_LOG(
 			LogTemp,
 			Log,
-			TEXT("[V9CollisionExecution Step=%d] pair=(%d,%d) over_plate=%d sub_plate=%d obs=%d accumulated_penetration_km=%.1f mean_convergence_km_per_my=%.3f max_convergence_km_per_my=%.3f support=%d triangles=%d continental_support=%d/%d qualified_samples=%d seed_samples=%d collision_seed_samples=%d affected=%d continental_gain=%d ownership_change=%d cooldown_suppressed=%d qualified_unexecuted=%d influence_radius_rad=%.6f mean_elev_delta_km=%.6f"),
+			TEXT("[V9CollisionExecution Step=%d] pair=(%d,%d) over_plate=%d sub_plate=%d obs=%d accumulated_penetration_km=%.1f mean_convergence_km_per_my=%.3f max_convergence_km_per_my=%.3f support=%d triangles=%d continental_support=%d/%d qualified_samples=%d seed_samples=%d collision_seed_samples=%d effective_mass=%d affected=%d cumulative_affected=%d cumulative_affected_visits=%d continental_gain=%d cumulative_continental_gain=%d ownership_change=%d cooldown_suppressed=%d qualified_unexecuted=%d influence_radius_rad=%.6f mean_elev_delta_km=%.6f max_elev_delta_km=%.6f cumulative_mean_elev_delta_km=%.6f cumulative_max_elev_delta_km=%.6f strength_scale=%.6f"),
 			Planet.CurrentStep,
 			SelectedPair->PlateA,
 			SelectedPair->PlateB,
@@ -1235,13 +1335,21 @@ namespace
 			SelectedPair->ContinentalQualifiedSampleCount,
 			SeedSampleIndices.Num(),
 			CollisionSeedSampleIndices.Num(),
+			EffectiveMassSampleCount,
 			AffectedSampleIndices.Num(),
+			OutDiagnostic.CumulativeCollisionAffectedSampleCount,
+			InOutCumulativeAffectedSampleVisits,
 			ContinentalGainCount,
+			InOutCumulativeContinentalGainCount,
 			0,
 			OutDiagnostic.CooldownSuppressedQualifiedCount,
 			OutDiagnostic.QualifiedButUnexecutedCount,
 			SurgeRadiusRad,
-			OutDiagnostic.ExecutedMeanElevationDeltaKm);
+			OutDiagnostic.ExecutedMeanElevationDeltaKm,
+			OutDiagnostic.ExecutedMaxElevationDeltaKm,
+			OutDiagnostic.CumulativeMeanElevationDeltaKm,
+			OutDiagnostic.CumulativeMaxElevationDeltaKm,
+			OutDiagnostic.ExecutedStrengthScale);
 	}
 
 	const FPlate* FindPlateById(const FTectonicPlanet& Planet, const int32 PlateId)
@@ -8828,13 +8936,21 @@ void FTectonicPlanetV6::Initialize(
 	CurrentSolveCollisionShadowPersistenceMask.Reset();
 	CurrentSolveCollisionShadowDiagnostic = FTectonicPlanetV6CollisionShadowDiagnostic{};
 	CurrentSolveCollisionExecutionMask.Reset();
+	CumulativeCollisionExecutionMask.Reset();
+	CumulativeCollisionElevationDeltaMaskKm.Reset();
+	CumulativeCollisionContinentalGainMask.Reset();
 	CurrentSolveCollisionExecutionDiagnostic = FTectonicPlanetV6CollisionExecutionDiagnostic{};
 	V9CollisionShadowPairRecurrenceByKey.Reset();
 	V9CollisionExecutionLastSolveIndexByKey.Reset();
 	V9CollisionExecutionCumulativeCount = 0;
+	V9CollisionExecutionCumulativeAffectedSampleVisits = 0;
+	V9CollisionExecutionCumulativeContinentalGainCount = 0;
+	V9CollisionExecutionCumulativeElevationDeltaKm = 0.0;
+	V9CollisionExecutionCumulativeMaxElevationDeltaKm = 0.0;
 	bEnableSyntheticCoverageRetentionForTest = false;
 	bEnableV9CollisionShadowForTest = false;
 	bEnableV9CollisionExecutionForTest = false;
+	bEnableV9CollisionExecutionEnhancedConsequencesForTest = false;
 	PreviousIntervalMeanSubductionDistanceKm = -1.0;
 	PreviousIntervalSubductionSampleCount = 0;
 	PreviousIntervalTrackedTriangleCount = 0;
@@ -11624,8 +11740,16 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			V9CollisionExecutionLastSolveIndexByKey,
 			PeriodicSolveCount + 1,
 			CurrentSolveCollisionExecutionMask,
+			CumulativeCollisionExecutionMask,
+			CumulativeCollisionElevationDeltaMaskKm,
+			CumulativeCollisionContinentalGainMask,
 			CurrentSolveCollisionExecutionDiagnostic,
-			V9CollisionExecutionCumulativeCount);
+			V9CollisionExecutionCumulativeCount,
+			V9CollisionExecutionCumulativeAffectedSampleVisits,
+			V9CollisionExecutionCumulativeContinentalGainCount,
+			V9CollisionExecutionCumulativeElevationDeltaKm,
+			V9CollisionExecutionCumulativeMaxElevationDeltaKm,
+			bEnableV9CollisionExecutionEnhancedConsequencesForTest);
 	}
 	else
 	{
@@ -11633,6 +11757,34 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		CurrentSolveCollisionExecutionDiagnostic = FTectonicPlanetV6CollisionExecutionDiagnostic{};
 		CurrentSolveCollisionExecutionDiagnostic.CumulativeExecutedCollisionCount =
 			V9CollisionExecutionCumulativeCount;
+		CurrentSolveCollisionExecutionDiagnostic.CumulativeCollisionAffectedSampleVisits =
+			V9CollisionExecutionCumulativeAffectedSampleVisits;
+		CurrentSolveCollisionExecutionDiagnostic.CumulativeCollisionDrivenContinentalGainCount =
+			V9CollisionExecutionCumulativeContinentalGainCount;
+		CurrentSolveCollisionExecutionDiagnostic.CumulativeMeanElevationDeltaKm =
+			V9CollisionExecutionCumulativeAffectedSampleVisits > 0
+				? V9CollisionExecutionCumulativeElevationDeltaKm /
+					static_cast<double>(V9CollisionExecutionCumulativeAffectedSampleVisits)
+				: 0.0;
+		CurrentSolveCollisionExecutionDiagnostic.CumulativeMaxElevationDeltaKm =
+			V9CollisionExecutionCumulativeMaxElevationDeltaKm;
+		if (CumulativeCollisionExecutionMask.Num() != Planet.Samples.Num())
+		{
+			CumulativeCollisionExecutionMask.Init(0, Planet.Samples.Num());
+		}
+		if (CumulativeCollisionElevationDeltaMaskKm.Num() != Planet.Samples.Num())
+		{
+			CumulativeCollisionElevationDeltaMaskKm.Init(0.0f, Planet.Samples.Num());
+		}
+		if (CumulativeCollisionContinentalGainMask.Num() != Planet.Samples.Num())
+		{
+			CumulativeCollisionContinentalGainMask.Init(0.0f, Planet.Samples.Num());
+		}
+		for (const uint8 Value : CumulativeCollisionExecutionMask)
+		{
+			CurrentSolveCollisionExecutionDiagnostic.CumulativeCollisionAffectedSampleCount +=
+				Value != 0 ? 1 : 0;
+		}
 		ResetV9CollisionExecutionLegacyStats(Planet);
 	}
 	const TCHAR* CopiedFrontierModeLabel = GetCopiedFrontierModeLabel(PeriodicSolveMode);
@@ -14640,6 +14792,13 @@ void FTectonicPlanetV6::SetV9Phase1AuthorityForTest(const bool bEnable, const in
 	V9CollisionShadowPairRecurrenceByKey.Reset();
 	V9CollisionExecutionLastSolveIndexByKey.Reset();
 	V9CollisionExecutionCumulativeCount = 0;
+	V9CollisionExecutionCumulativeAffectedSampleVisits = 0;
+	V9CollisionExecutionCumulativeContinentalGainCount = 0;
+	V9CollisionExecutionCumulativeElevationDeltaKm = 0.0;
+	V9CollisionExecutionCumulativeMaxElevationDeltaKm = 0.0;
+	CumulativeCollisionExecutionMask.Reset();
+	CumulativeCollisionElevationDeltaMaskKm.Reset();
+	CumulativeCollisionContinentalGainMask.Reset();
 }
 
 void FTectonicPlanetV6::SetV9Phase1ActiveZoneClassifierModeForTest(
@@ -14651,6 +14810,13 @@ void FTectonicPlanetV6::SetV9Phase1ActiveZoneClassifierModeForTest(
 	V9CollisionShadowPairRecurrenceByKey.Reset();
 	V9CollisionExecutionLastSolveIndexByKey.Reset();
 	V9CollisionExecutionCumulativeCount = 0;
+	V9CollisionExecutionCumulativeAffectedSampleVisits = 0;
+	V9CollisionExecutionCumulativeContinentalGainCount = 0;
+	V9CollisionExecutionCumulativeElevationDeltaKm = 0.0;
+	V9CollisionExecutionCumulativeMaxElevationDeltaKm = 0.0;
+	CumulativeCollisionExecutionMask.Reset();
+	CumulativeCollisionElevationDeltaMaskKm.Reset();
+	CumulativeCollisionContinentalGainMask.Reset();
 }
 
 void FTectonicPlanetV6::SetV9Phase1PersistentActivePairHorizonForTest(const int32 InPersistenceHorizon)
@@ -14661,6 +14827,13 @@ void FTectonicPlanetV6::SetV9Phase1PersistentActivePairHorizonForTest(const int3
 	V9CollisionShadowPairRecurrenceByKey.Reset();
 	V9CollisionExecutionLastSolveIndexByKey.Reset();
 	V9CollisionExecutionCumulativeCount = 0;
+	V9CollisionExecutionCumulativeAffectedSampleVisits = 0;
+	V9CollisionExecutionCumulativeContinentalGainCount = 0;
+	V9CollisionExecutionCumulativeElevationDeltaKm = 0.0;
+	V9CollisionExecutionCumulativeMaxElevationDeltaKm = 0.0;
+	CumulativeCollisionExecutionMask.Reset();
+	CumulativeCollisionElevationDeltaMaskKm.Reset();
+	CumulativeCollisionContinentalGainMask.Reset();
 }
 
 void FTectonicPlanetV6::SetV9CollisionShadowForTest(const bool bEnable)
@@ -14677,7 +14850,19 @@ void FTectonicPlanetV6::SetV9CollisionExecutionForTest(const bool bEnable)
 {
 	bEnableV9CollisionExecutionForTest = bEnable;
 	CurrentSolveCollisionExecutionMask.Reset();
+	CumulativeCollisionExecutionMask.Reset();
+	CumulativeCollisionElevationDeltaMaskKm.Reset();
+	CumulativeCollisionContinentalGainMask.Reset();
 	CurrentSolveCollisionExecutionDiagnostic = FTectonicPlanetV6CollisionExecutionDiagnostic{};
 	V9CollisionExecutionLastSolveIndexByKey.Reset();
 	V9CollisionExecutionCumulativeCount = 0;
+	V9CollisionExecutionCumulativeAffectedSampleVisits = 0;
+	V9CollisionExecutionCumulativeContinentalGainCount = 0;
+	V9CollisionExecutionCumulativeElevationDeltaKm = 0.0;
+	V9CollisionExecutionCumulativeMaxElevationDeltaKm = 0.0;
+}
+
+void FTectonicPlanetV6::SetV9CollisionExecutionEnhancedConsequencesForTest(const bool bEnable)
+{
+	bEnableV9CollisionExecutionEnhancedConsequencesForTest = bEnable;
 }
