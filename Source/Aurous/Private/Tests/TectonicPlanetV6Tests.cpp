@@ -9112,3 +9112,363 @@ bool FTectonicPlanetV6V9HighReliefCollisionRidgeSurgeHarnessTest::RunTest(
 	TestTrue(TEXT("Ridge-surge candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep >= 100);
 	return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9Step200ThesisSurgeValidationTest,
+	"Aurous.TectonicPlanet.V6V9Step200ThesisSurgeValidationTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9Step200ThesisSurgeValidationTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	constexpr int32 TargetStep = 200;
+	const FString RunId = TEXT("V9Step200ThesisSurgeValidation");
+
+	// Paper-faithful thesis surge: radial biweight kernel, NOT ridge surge
+	FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+		ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+		FixedIntervalSteps,
+		INDEX_NONE,
+		SampleCount,
+		PlateCount,
+		TestRandomSeed);
+	Planet.SetSyntheticCoverageRetentionForTest(false);
+	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+	Planet.SetExcludeMixedTrianglesForTest(false);
+	Planet.SetV9Phase1AuthorityForTest(true, 1);
+	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+	Planet.SetV9CollisionShadowForTest(true);
+	Planet.SetV9CollisionExecutionForTest(true);
+	Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+	Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
+	Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+	Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
+	// Ridge surge OFF — paper-faithful radial biweight kernel (default)
+
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	const FString ExportRoot = FPaths::Combine(
+		FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*ExportRoot);
+
+	AddInfo(TEXT("[V9Step200ThesisSurge] config=paper_faithful kernel=radial_biweight ridge_surge=off 60k/40 seed=42 cadence=16"));
+
+	// --- Per-event collision tracking ---
+	struct FCollisionEventRecord
+	{
+		int32 Step = 0;
+		int32 RemeshCycle = 0;
+		int32 EventsThisCycle = 0;
+		int32 PlateA = INDEX_NONE;
+		int32 PlateB = INDEX_NONE;
+		int32 SubductingPlateId = INDEX_NONE;
+		int32 OverridingPlateId = INDEX_NONE;
+		int32 TerraneComponentSize = 0;
+		int32 TransferredComponentSize = 0;
+		int32 AffectedSampleCount = 0;
+		int32 OwnershipChangeCount = 0;
+		int32 TransferredSampleCount = 0;
+		double RelativeSpeedKmPerMy = 0.0;
+		double Xi = 0.0;
+		double InfluenceRadiusRad = 0.0;
+		double MeanElevationDeltaKm = 0.0;
+		double MaxElevationDeltaKm = 0.0;
+		double DonorPlateShareDelta = 0.0;
+		double RecipientPlateShareDelta = 0.0;
+	};
+
+	TArray<FCollisionEventRecord> EventLog;
+	TMap<uint64, int32> PairExecutionCounts;
+	int32 PreviousCumulativeCount = 0;
+	int32 RemeshCycleCounter = 0;
+
+	const auto MakePairKey = [](const int32 A, const int32 B) -> uint64
+	{
+		return static_cast<uint64>(FMath::Min(A, B)) * 10000 + static_cast<uint64>(FMath::Max(A, B));
+	};
+
+	// Build milestone schedule: all remesh boundaries + checkpoint steps
+	TArray<int32> Milestones;
+	for (int32 S = FixedIntervalSteps; S <= TargetStep; S += FixedIntervalSteps)
+	{
+		Milestones.AddUnique(S);
+	}
+	Milestones.AddUnique(25);
+	Milestones.AddUnique(100);
+	Milestones.AddUnique(TargetStep);
+	Milestones.Sort();
+
+	FV6CheckpointSnapshot Step25Snapshot;
+	FV6CheckpointSnapshot Step100Snapshot;
+	FV6CheckpointSnapshot Step200Snapshot;
+
+	for (const int32 Milestone : Milestones)
+	{
+		const int32 CurrentStep = Planet.GetPlanet().CurrentStep;
+		if (Milestone <= CurrentStep) { continue; }
+		Planet.AdvanceSteps(Milestone - CurrentStep);
+
+		// Check for collision events at remesh boundaries
+		const bool bIsRemeshBoundary = (Milestone % FixedIntervalSteps == 0);
+		if (bIsRemeshBoundary)
+		{
+			++RemeshCycleCounter;
+			const FTectonicPlanetV6CollisionExecutionDiagnostic ExecDiag =
+				Planet.ComputeCollisionExecutionDiagnosticForTest();
+			const int32 NewCumulative = ExecDiag.CumulativeExecutedCollisionCount;
+			if (NewCumulative > PreviousCumulativeCount)
+			{
+				const int32 EventsThisCycle = NewCumulative - PreviousCumulativeCount;
+
+				FCollisionEventRecord Record;
+				Record.Step = Milestone;
+				Record.RemeshCycle = RemeshCycleCounter;
+				Record.EventsThisCycle = EventsThisCycle;
+				Record.PlateA = ExecDiag.ExecutedPlateA;
+				Record.PlateB = ExecDiag.ExecutedPlateB;
+				Record.SubductingPlateId = ExecDiag.ExecutedSubductingPlateId;
+				Record.OverridingPlateId = ExecDiag.ExecutedOverridingPlateId;
+				Record.TerraneComponentSize = ExecDiag.ExecutedDonorTerraneComponentSize;
+				Record.TransferredComponentSize = ExecDiag.ExecutedTransferredComponentSize;
+				Record.AffectedSampleCount = ExecDiag.CollisionAffectedSampleCount;
+				Record.OwnershipChangeCount = ExecDiag.CollisionDrivenOwnershipChangeCount;
+				Record.TransferredSampleCount = ExecDiag.CollisionTransferredSampleCount;
+				Record.RelativeSpeedKmPerMy = ExecDiag.ExecutedRelativeSpeedKmPerMy;
+				Record.Xi = ExecDiag.ExecutedXi;
+				Record.InfluenceRadiusRad = ExecDiag.ExecutedInfluenceRadiusRad;
+				Record.MeanElevationDeltaKm = ExecDiag.ExecutedMeanElevationDeltaKm;
+				Record.MaxElevationDeltaKm = ExecDiag.ExecutedMaxElevationDeltaKm;
+				Record.DonorPlateShareDelta = ExecDiag.ExecutedDonorPlateShareDelta;
+				Record.RecipientPlateShareDelta = ExecDiag.ExecutedRecipientPlateShareDelta;
+				EventLog.Add(Record);
+
+				if (ExecDiag.ExecutedPlateA != INDEX_NONE && ExecDiag.ExecutedPlateB != INDEX_NONE)
+				{
+					PairExecutionCounts.FindOrAdd(
+						MakePairKey(ExecDiag.ExecutedPlateA, ExecDiag.ExecutedPlateB)) += EventsThisCycle;
+				}
+
+				const FString EventMsg = FString::Printf(
+					TEXT("[V9Step200ThesisSurge EVENT step=%d cycle=%d] events_this_cycle=%d pair=(%d,%d) donor=%d recipient=%d terrane=%d transferred=%d affected=%d ownership_change=%d transferred_samples=%d rel_speed=%.3f xi=%.6f radius_rad=%.6f mean_delta_km=%.4f max_delta_km=%.4f donor_share_delta=%.6f recipient_share_delta=%.6f cumulative_events=%d cumulative_affected=%d"),
+					Milestone, RemeshCycleCounter, EventsThisCycle,
+					ExecDiag.ExecutedPlateA, ExecDiag.ExecutedPlateB,
+					ExecDiag.ExecutedSubductingPlateId, ExecDiag.ExecutedOverridingPlateId,
+					ExecDiag.ExecutedDonorTerraneComponentSize,
+					ExecDiag.ExecutedTransferredComponentSize,
+					ExecDiag.CollisionAffectedSampleCount,
+					ExecDiag.CollisionDrivenOwnershipChangeCount,
+					ExecDiag.CollisionTransferredSampleCount,
+					ExecDiag.ExecutedRelativeSpeedKmPerMy,
+					ExecDiag.ExecutedXi,
+					ExecDiag.ExecutedInfluenceRadiusRad,
+					ExecDiag.ExecutedMeanElevationDeltaKm,
+					ExecDiag.ExecutedMaxElevationDeltaKm,
+					ExecDiag.ExecutedDonorPlateShareDelta,
+					ExecDiag.ExecutedRecipientPlateShareDelta,
+					NewCumulative,
+					ExecDiag.CumulativeCollisionAffectedSampleCount);
+				AddInfo(EventMsg);
+				UE_LOG(LogTemp, Log, TEXT("%s"), *EventMsg);
+
+				PreviousCumulativeCount = NewCumulative;
+			}
+		}
+
+		// Checkpoint captures at steps 25, 100, 200
+		const bool bIsStep25 = (Milestone == 25);
+		const bool bIsStep100 = (Milestone == 100);
+		const bool bIsStep200 = (Milestone == TargetStep);
+
+		if (bIsStep25 || bIsStep100 || bIsStep200)
+		{
+			const bool bFullExports = bIsStep200;
+			if (bFullExports)
+			{
+				ExportV6CheckpointMaps(*this, Planet, ExportRoot, Milestone);
+				ExportV6DebugOverlays(*this, Planet, ExportRoot, Milestone);
+			}
+			ExportV6CollisionTuningInnerLoopOverlays(*this, Planet, ExportRoot, Milestone);
+
+			const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+			const FString Tag = FString::Printf(TEXT("[V9Step200ThesisSurge step=%d]"), Milestone);
+			AddV6BoundaryCoherenceInfo(*this, *Tag, Snapshot);
+			AddV6ActiveZoneInfo(*this, *Tag, Snapshot);
+			AddV6CollisionShadowInfo(*this, *Tag, Snapshot);
+			AddV6CollisionExecutionInfo(*this, *Tag, Snapshot);
+
+			// Continental elevation at each checkpoint
+			const FV9ContinentalElevationStats Elev = ComputeContinentalElevationStats(Planet);
+			const FString ElevCheckMsg = FString::Printf(
+				TEXT("[V9Step200ThesisSurge ELEVATION step=%d] continental_count=%d mean_km=%.4f p95_km=%.4f max_km=%.4f above_2km=%d above_5km=%d collision_above5_current=%d collision_above5_cumulative=%d"),
+				Milestone, Elev.ContinentalSampleCount,
+				Elev.MeanElevationKm, Elev.P95ElevationKm, Elev.MaxElevationKm,
+				Elev.SamplesAbove2Km, Elev.SamplesAbove5Km,
+				ComputeCollisionRegionSamplesAboveElevationThreshold(Planet, 5.0, false),
+				ComputeCollisionRegionSamplesAboveElevationThreshold(Planet, 5.0, true));
+			AddInfo(ElevCheckMsg);
+			UE_LOG(LogTemp, Log, TEXT("%s"), *ElevCheckMsg);
+
+			if (bIsStep25) { Step25Snapshot = Snapshot; }
+			else if (bIsStep100) { Step100Snapshot = Snapshot; }
+			else if (bIsStep200)
+			{
+				Step200Snapshot = Snapshot;
+
+				// Additional step-200 exports: Elevation and TerraneComponentMask
+				const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+				const int32 SC = PlanetData.Samples.Num();
+				const FString OutputDirectory = FPaths::Combine(
+					ExportRoot, FString::Printf(TEXT("step_%03d"), Milestone));
+				PlatformFile.CreateDirectoryTree(*OutputDirectory);
+				FString Error;
+
+				TArray<float> ElevValues;
+				ElevValues.SetNum(SC);
+				for (int32 I = 0; I < SC; ++I)
+				{
+					ElevValues[I] = PlanetData.Samples[I].Elevation;
+				}
+				TectonicMollweideExporter::ExportScalarOverlay(
+					PlanetData, ElevValues, -10.0f, 10.0f,
+					FPaths::Combine(OutputDirectory, TEXT("Elevation.png")),
+					TestExportWidth, TestExportHeight, Error);
+
+				const TArray<uint8>& TerraneMask =
+					Planet.GetThesisCollisionTerraneComponentMaskForTest();
+				if (TerraneMask.Num() == SC)
+				{
+					TArray<float> TerraneValues;
+					TerraneValues.SetNum(SC);
+					for (int32 I = 0; I < SC; ++I)
+					{
+						TerraneValues[I] = TerraneMask[I] != 0 ? 1.0f : 0.0f;
+					}
+					TectonicMollweideExporter::ExportScalarOverlay(
+						PlanetData, TerraneValues, 0.0f, 1.0f,
+						FPaths::Combine(OutputDirectory, TEXT("CollisionTerraneComponentMask.png")),
+						TestExportWidth, TestExportHeight, Error);
+				}
+			}
+		}
+	}
+
+	// ===== Step-200 Comprehensive Report =====
+	const FTectonicPlanetV6CollisionExecutionDiagnostic& Exec200 = Step200Snapshot.CollisionExecution;
+
+	// 1. Collision aggregates
+	AddInfo(FString::Printf(
+		TEXT("[V9Step200ThesisSurge AGGREGATE step=200] cumulative_events=%d cumulative_affected=%d cumulative_affected_visits=%d cumulative_continental_gain=%d cumulative_ownership_change=%d cumulative_transferred=%d cumulative_transferred_visits=%d cumulative_transferred_continental=%d cumulative_mean_elev_delta_km=%.6f cumulative_max_elev_delta_km=%.6f event_records_captured=%d"),
+		Exec200.CumulativeExecutedCollisionCount,
+		Exec200.CumulativeCollisionAffectedSampleCount,
+		Exec200.CumulativeCollisionAffectedSampleVisits,
+		Exec200.CumulativeCollisionDrivenContinentalGainCount,
+		Exec200.CumulativeCollisionDrivenOwnershipChangeCount,
+		Exec200.CumulativeCollisionTransferredSampleCount,
+		Exec200.CumulativeCollisionTransferredSampleVisits,
+		Exec200.CumulativeCollisionTransferredContinentalSampleCount,
+		Exec200.CumulativeMeanElevationDeltaKm,
+		Exec200.CumulativeMaxElevationDeltaKm,
+		EventLog.Num()));
+
+	// 2. Stability metrics
+	AddInfo(FString::Printf(
+		TEXT("[V9Step200ThesisSurge STABILITY step=200] churn=%.4f coherence=%.4f interior_leakage=%.4f max_components=%d active_fraction=%.4f plates_with_hit=%d/%d miss=%d multi_hit=%d"),
+		Step200Snapshot.OwnershipChurn.ChurnFraction,
+		Step200Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+		Step200Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+		Step200Snapshot.MaxComponentsPerPlate,
+		Step200Snapshot.ActiveZone.ActiveFraction,
+		Step200Snapshot.CompetitiveParticipation.PlatesWithAnyHit,
+		Step200Snapshot.CompetitiveParticipation.TotalPlateCount,
+		Step200Snapshot.MissCount,
+		Step200Snapshot.MultiHitCount));
+
+	// 3. Repeated-pair analysis
+	{
+		int32 TotalUniquePairs = PairExecutionCounts.Num();
+		int32 PairsWith2Plus = 0;
+		int32 MaxExecForPair = 0;
+		FString RepeatedDetails;
+		for (const auto& Entry : PairExecutionCounts)
+		{
+			const int32 PA = static_cast<int32>(Entry.Key / 10000);
+			const int32 PB = static_cast<int32>(Entry.Key % 10000);
+			if (Entry.Value >= 2)
+			{
+				++PairsWith2Plus;
+				RepeatedDetails += FString::Printf(TEXT(" (%d,%d)x%d"), PA, PB, Entry.Value);
+			}
+			MaxExecForPair = FMath::Max(MaxExecForPair, Entry.Value);
+		}
+		if (RepeatedDetails.IsEmpty()) { RepeatedDetails = TEXT(" none"); }
+		AddInfo(FString::Printf(
+			TEXT("[V9Step200ThesisSurge REPEATED_PAIRS step=200] unique_pairs=%d pairs_with_2plus=%d max_executions_single_pair=%d repeated=%s"),
+			TotalUniquePairs, PairsWith2Plus, MaxExecForPair, *RepeatedDetails));
+	}
+
+	// 4. Cumulative elevation delta distribution from collision mask
+	{
+		const TArray<float>& ElevDeltaMask =
+			Planet.GetCollisionCumulativeElevationDeltaMaskForTest();
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		if (ElevDeltaMask.Num() == PlanetData.Samples.Num())
+		{
+			int32 AffectedCount = 0;
+			double SumDelta = 0.0;
+			double MaxDelta = 0.0;
+			int32 Above1Km = 0;
+			int32 Above2Km = 0;
+			int32 Above3Km = 0;
+			for (int32 I = 0; I < ElevDeltaMask.Num(); ++I)
+			{
+				const float Delta = ElevDeltaMask[I];
+				if (Delta > UE_SMALL_NUMBER)
+				{
+					++AffectedCount;
+					SumDelta += Delta;
+					MaxDelta = FMath::Max(MaxDelta, static_cast<double>(Delta));
+					if (Delta >= 1.0f) { ++Above1Km; }
+					if (Delta >= 2.0f) { ++Above2Km; }
+					if (Delta >= 3.0f) { ++Above3Km; }
+				}
+			}
+			const double MeanDelta = AffectedCount > 0 ? SumDelta / AffectedCount : 0.0;
+			AddInfo(FString::Printf(
+				TEXT("[V9Step200ThesisSurge ELEV_DELTA_DISTRIBUTION step=200] affected_samples=%d mean_delta_km=%.4f max_delta_km=%.4f above_1km=%d above_2km=%d above_3km=%d"),
+				AffectedCount, MeanDelta, MaxDelta, Above1Km, Above2Km, Above3Km));
+		}
+	}
+
+	// 5. Step-100 → step-200 progression
+	{
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& Exec100 = Step100Snapshot.CollisionExecution;
+		AddInfo(FString::Printf(
+			TEXT("[V9Step200ThesisSurge PROGRESSION 100->200] events=%d->%d affected=%d->%d transferred=%d->%d ownership_change=%d->%d mean_elev_delta=%.6f->%.6f max_elev_delta=%.6f->%.6f churn=%.4f->%.4f coherence=%.4f->%.4f leakage=%.4f->%.4f"),
+			Exec100.CumulativeExecutedCollisionCount,
+			Exec200.CumulativeExecutedCollisionCount,
+			Exec100.CumulativeCollisionAffectedSampleCount,
+			Exec200.CumulativeCollisionAffectedSampleCount,
+			Exec100.CumulativeCollisionTransferredSampleCount,
+			Exec200.CumulativeCollisionTransferredSampleCount,
+			Exec100.CumulativeCollisionDrivenOwnershipChangeCount,
+			Exec200.CumulativeCollisionDrivenOwnershipChangeCount,
+			Exec100.CumulativeMeanElevationDeltaKm,
+			Exec200.CumulativeMeanElevationDeltaKm,
+			Exec100.CumulativeMaxElevationDeltaKm,
+			Exec200.CumulativeMaxElevationDeltaKm,
+			Step100Snapshot.OwnershipChurn.ChurnFraction,
+			Step200Snapshot.OwnershipChurn.ChurnFraction,
+			Step100Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			Step200Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			Step100Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+			Step200Snapshot.BoundaryCoherence.InteriorLeakageFraction));
+	}
+
+	TestTrue(TEXT("Planet reached step 200"),
+		Planet.GetPlanet().CurrentStep >= TargetStep);
+	return true;
+}
