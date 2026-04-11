@@ -21,7 +21,7 @@ namespace
 	constexpr double SubductionControlDistanceRad = 0.10;
 	constexpr double SubductionMaxDistanceKm = SubductionMaxDistanceRad * 6371.0;
 	constexpr double SubductionControlDistanceKm = SubductionControlDistanceRad * 6371.0;
-	constexpr double SubductionBaseUpliftKmPerMy = 0.0006;
+	constexpr double SubductionBaseUpliftKmPerMy = 0.6;
 	constexpr double MaxPlateSpeedKmPerMy = 100.0;
 	constexpr double ConvergentThresholdRatio = -0.3;
 	constexpr double SlabPullEpsilon = 0.1;
@@ -66,6 +66,15 @@ namespace
 	constexpr double DirectionDegeneracyThreshold = 1.0e-8;
 	constexpr double GapSeparationDirectionEpsilon = 1.0e-10;
 	constexpr double DivergenceEpsilon = 1.0e-10;
+
+	double ComputeSubductionElevationTransfer(const double ElevationKm)
+	{
+		const double NormalizedElevation = FMath::Clamp(
+			(ElevationKm - TrenchElevationKm) / (ElevationCeilingKm - TrenchElevationKm),
+			0.0,
+			1.0);
+		return NormalizedElevation * NormalizedElevation;
+	}
 
 	uint32 MixBits(uint32 Value)
 	{
@@ -6019,15 +6028,33 @@ void FTectonicPlanet::AdvanceStep()
 			CarriedSample.Age += static_cast<float>(DeltaTimeMyears);
 			if (CarriedSample.SubductionDistanceKm >= 0.0f)
 			{
+				const double BaseUpliftKmPerMy =
+					SubductionBaseUpliftKmPerMyForTest >= 0.0
+						? SubductionBaseUpliftKmPerMyForTest
+						: SubductionBaseUpliftKmPerMy;
 				const double DistanceRad =
 					static_cast<double>(CarriedSample.SubductionDistanceKm) / FMath::Max(PlanetRadiusKm, UE_DOUBLE_SMALL_NUMBER);
+				const double DistanceTransfer =
+					SubductionDistanceTransfer(DistanceRad, SubductionControlDistanceRad, SubductionMaxDistanceRad);
+				const double SpeedTransfer =
+					static_cast<double>(CarriedSample.SubductionSpeed) / MaxPlateSpeedKmPerMy;
+				const double ElevationTransfer =
+					bDisableSubductionElevationTransferForTest
+						? 1.0
+						: ComputeSubductionElevationTransfer(static_cast<double>(CarriedSample.Elevation));
 				const double UpliftKm =
-					SubductionBaseUpliftKmPerMy *
-					SubductionDistanceTransfer(DistanceRad, SubductionControlDistanceRad, SubductionMaxDistanceRad) *
-					(static_cast<double>(CarriedSample.SubductionSpeed) / MaxPlateSpeedKmPerMy) *
+					BaseUpliftKmPerMy *
+					DistanceTransfer *
+					SpeedTransfer *
+					ElevationTransfer *
 					DeltaTimeMyears;
 				CarriedSample.Elevation += static_cast<float>(UpliftKm);
-				if (UpliftKm > 0.0 && CarriedSample.Elevation > 0.0f && CarriedSample.OrogenyType == EOrogenyType::None)
+				const bool bStrongAndeanUplift =
+					DistanceTransfer >= 0.5 &&
+					SpeedTransfer >= 0.15 &&
+					UpliftKm >= 0.015 &&
+					CarriedSample.Elevation >= 0.25f;
+				if (bStrongAndeanUplift && CarriedSample.OrogenyType == EOrogenyType::None)
 				{
 					CarriedSample.OrogenyType = EOrogenyType::Andean;
 				}

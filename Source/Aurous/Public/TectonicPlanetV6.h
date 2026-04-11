@@ -545,6 +545,12 @@ struct AUROUS_API FTectonicPlanetV6CopiedFrontierSolveAttribution
 	int32 TectonicMaintenanceAndeanTaggedCount = 0;
 	int32 TectonicMaintenanceElevationBoostCount = 0;
 	int32 TectonicMaintenanceThicknessBoostCount = 0;
+	int32 ActiveBandTriangleFieldContinuityClampCount = 0;
+	int32 ActiveBandSyntheticFieldPreserveCount = 0;
+	int32 ActiveBandOceanicFieldPreserveCount = 0;
+	int32 ActiveBandPreviousOwnerCompatibleRecoveryCount = 0;
+	int32 ActiveBandSyntheticLoopBreakCount = 0;
+	int32 ActiveBandSyntheticSingleSourceRecoveryCount = 0;
 	int32 SingleHitContinentalLossSamePlateCount = 0;
 	int32 SingleHitContinentalLossCrossPlateCount = 0;
 	int32 SingleHitContinentalLossCopiedFrontierHitCount = 0;
@@ -955,6 +961,14 @@ struct AUROUS_API FTectonicPlanetV6CollisionExecutionDiagnostic
 	double ExecutedRecipientPlateShareAfter = 0.0;
 	double ExecutedRecipientPlateShareDelta = 0.0;
 	bool bExecutedFromShadowQualifiedState = false;
+
+	// Thesis-shaped terrane quality diagnostics
+	int32 ExecutedDonorTerraneComponentSize = 0;
+	int32 ExecutedTransferredComponentSize = 0;
+	int32 ExecutedTransferRejectedByConnectivityCount = 0;
+	double ExecutedTerraneAreaSr = 0.0;
+	double ExecutedXi = 0.0;
+	double ExecutedRelativeSpeedKmPerMy = 0.0;
 };
 
 struct AUROUS_API FTectonicPlanetV6
@@ -1024,6 +1038,54 @@ struct AUROUS_API FTectonicPlanetV6
 	{
 		return CumulativeCollisionContinentalGainMask;
 	}
+	const TArray<int32>& GetCurrentSolvePreSolvePlateIdsForTest() const
+	{
+		return CurrentSolvePreSolvePlateIds;
+	}
+	const TArray<float>& GetCurrentSolvePreSolveContinentalWeightsForTest() const
+	{
+		return CurrentSolvePreSolveContinentalWeights;
+	}
+	const TArray<float>& GetCurrentSolvePreSolveElevationsForTest() const
+	{
+		return CurrentSolvePreSolveElevations;
+	}
+	const TArray<uint8>& GetCurrentSolvePreviousSyntheticFlagsForTest() const
+	{
+		return CurrentSolvePreviousSyntheticFlags;
+	}
+	const TArray<uint8>& GetCurrentSolvePreviousTransferSourceKindValuesForTest() const
+	{
+		return CurrentSolvePreviousTransferSourceKindValues;
+	}
+	const TArray<uint8>& GetCurrentSolvePreviousResolutionKindValuesForTest() const
+	{
+		return CurrentSolvePreviousResolutionKindValues;
+	}
+	const TArray<uint8>& GetCurrentSolvePreviousOwnerFilteredHitFlagsForTest() const
+	{
+		return CurrentSolvePreviousOwnerFilteredHitFlags;
+	}
+	const TArray<uint8>& GetCurrentSolvePreviousOwnerUnfilteredHitFlagsForTest() const
+	{
+		return CurrentSolvePreviousOwnerUnfilteredHitFlags;
+	}
+	const TArray<uint8>& GetCurrentSolvePreviousOwnerRecoveryFlagsForTest() const
+	{
+		return CurrentSolvePreviousOwnerRecoveryFlags;
+	}
+	const TArray<uint8>& GetCurrentSolveActiveZoneFlagsForTest() const
+	{
+		return CurrentSolveActiveZoneFlags;
+	}
+	const TArray<uint8>& GetCurrentSolveActiveZoneCauseValuesForTest() const
+	{
+		return CurrentSolveActiveZoneCauseValues;
+	}
+	const TArray<uint8>& GetThesisCollisionTerraneComponentMaskForTest() const
+	{
+		return CurrentSolveThesisCollisionTerraneComponentMask;
+	}
 
 	const FTectonicPlanet& GetPlanet() const;
 	FTectonicPlanet& GetPlanetMutable();
@@ -1045,6 +1107,9 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetV9CollisionExecutionEnhancedConsequencesForTest(bool bEnable);
 	void SetV9CollisionExecutionStructuralTransferForTest(bool bEnable);
 	void SetV9CollisionExecutionRefinedStructuralTransferForTest(bool bEnable);
+	void SetV9ThesisShapedCollisionExecutionForTest(bool bEnable);
+	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
+	void SetUseLinearConvergentMaintenanceInfluenceForTest(bool bEnableLinear);
 
 	static FTectonicPlanetV6ResolvedSample ResolvePhase1OwnershipForTest(
 		const TArray<FTectonicPlanetV6OwnerCandidate>& OwnerCandidates,
@@ -1122,8 +1187,15 @@ private:
 	TArray<uint8> MissLineageCounts; // per-sample miss streak counter, capped at 255
 	TArray<uint8> PreviousSolveSyntheticFlags;
 	TArray<uint8> PreviousSolveRetainedSyntheticCoverageFlags;
+	TArray<uint8> PreviousSolveTransferSourceKindValues;
+	TArray<uint8> PreviousSolveResolutionKindValues;
+	TArray<int32> CurrentSolvePreSolvePlateIds;
+	TArray<float> CurrentSolvePreSolveContinentalWeights;
+	TArray<float> CurrentSolvePreSolveElevations;
 	TArray<uint8> CurrentSolvePreviousSyntheticFlags;
 	TArray<uint8> CurrentSolvePreviousRetainedSyntheticCoverageFlags;
+	TArray<uint8> CurrentSolvePreviousTransferSourceKindValues;
+	TArray<uint8> CurrentSolvePreviousResolutionKindValues;
 	TArray<uint8> CurrentSolveRetainedSyntheticCoverageFlags;
 	TArray<uint8> CurrentSolvePreviousOwnerFilteredHitFlags;
 	TArray<uint8> CurrentSolvePreviousOwnerUnfilteredHitFlags;
@@ -1191,6 +1263,10 @@ private:
 	bool bEnableV9CollisionExecutionEnhancedConsequencesForTest = false;
 	bool bEnableV9CollisionExecutionStructuralTransferForTest = false;
 	bool bEnableV9CollisionExecutionRefinedStructuralTransferForTest = false;
+	bool bEnableV9ThesisShapedCollisionExecutionForTest = false;
+	bool bUseLinearConvergentMaintenanceSpeedFactorForTest = true;
+	bool bUseLinearConvergentMaintenanceInfluenceForTest = true;
+	TArray<uint8> CurrentSolveThesisCollisionTerraneComponentMask;
 	int32 V9Phase1ActiveBoundaryRingCountForTest = 1;
 	int32 V9Phase1PersistentActivePairHorizonForTest = 2;
 	ETectonicPlanetV6ActiveZoneClassifierMode V9Phase1ActiveZoneClassifierModeForTest =

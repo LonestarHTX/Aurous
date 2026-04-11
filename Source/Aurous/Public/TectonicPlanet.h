@@ -766,6 +766,8 @@ struct AUROUS_API FTectonicPlanet
 	bool bEnableAutomaticRifting = true;
 	bool bEnableWarpedRiftBoundaries = true;
 	bool bUseVertexLevelSoupInclusionForTest = false; // Spike: include triangle in every plate that owns >= 1 vertex.
+	double SubductionBaseUpliftKmPerMyForTest = -1.0; // < 0 uses the compiled default.
+	bool bDisableSubductionElevationTransferForTest = false;
 	double RiftBoundaryWarpAmplitude = 0.18;
 	double RiftBoundaryWarpFrequency = 1.5;
 	EResamplingPolicy ResamplingPolicy = EResamplingPolicy::PeriodicFull;

@@ -172,6 +172,38 @@ namespace
 		double MaxAllowedInteriorLeakage = 0.0;
 	};
 
+	struct FV9ThesisShapedCollisionGateResult
+	{
+		bool bTerraneDetectedPass = false;
+		bool bTransferCoherentPass = false;
+		bool bOwnershipMaterialPass = false;
+		bool bAffectedFootprintPass = false;
+		bool bElevationPass = false;
+		bool bContinentalGainPass = false;
+		bool bChurnPass = false;
+		bool bCoherencePass = false;
+		bool bLeakagePass = false;
+		bool bAllowStep200 = false;
+		int32 RequiredMinTerraneComponentSize = 0;
+		int32 RequiredMinTransferSize = 0;
+		int32 RequiredMinAffectedSamples = 0;
+		int32 RequiredMinOwnershipChange = 0;
+		double RequiredMinMeanElevationDeltaKm = 0.0;
+		double MaxAllowedChurn = 0.0;
+		double MinAllowedCoherence = 0.0;
+		double MaxAllowedInteriorLeakage = 0.0;
+	};
+
+	struct FV9ContinentalElevationStats
+	{
+		double MeanElevationKm = 0.0;
+		double P95ElevationKm = 0.0;
+		double MaxElevationKm = 0.0;
+		int32 SamplesAbove2Km = 0;
+		int32 SamplesAbove5Km = 0;
+		int32 ContinentalSampleCount = 0;
+	};
+
 	FV6CheckpointSnapshot BuildV6CheckpointSnapshot(const FTectonicPlanetV6& Planet);
 
 	FTectonicPlanetV6 CreateInitializedPlanetV6WithConfig(
@@ -2064,6 +2096,860 @@ namespace
 			Result.bTransferFootprintPass &&
 			Result.bShareDeltaPass &&
 			Result.bBoundaryLocalityPass &&
+			Result.bChurnPass &&
+			Result.bCoherencePass &&
+			Result.bLeakagePass;
+		return Result;
+	}
+
+	FV9ContinentalElevationStats ComputeContinentalElevationStats(const FTectonicPlanetV6& Planet)
+	{
+		FV9ContinentalElevationStats Result;
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		TArray<double> ContinentalElevations;
+		ContinentalElevations.Reserve(PlanetData.Samples.Num() / 3);
+		for (const FSample& Sample : PlanetData.Samples)
+		{
+			if (Sample.ContinentalWeight >= 0.5f)
+			{
+				++Result.ContinentalSampleCount;
+				ContinentalElevations.Add(static_cast<double>(Sample.Elevation));
+				if (Sample.Elevation >= 2.0f) { ++Result.SamplesAbove2Km; }
+				if (Sample.Elevation >= 5.0f) { ++Result.SamplesAbove5Km; }
+				Result.MaxElevationKm = FMath::Max(Result.MaxElevationKm, static_cast<double>(Sample.Elevation));
+			}
+		}
+		if (!ContinentalElevations.IsEmpty())
+		{
+			double Sum = 0.0;
+			for (const double E : ContinentalElevations) { Sum += E; }
+			Result.MeanElevationKm = Sum / static_cast<double>(ContinentalElevations.Num());
+			ContinentalElevations.Sort();
+			const int32 P95Index = FMath::Min(
+				static_cast<int32>(static_cast<double>(ContinentalElevations.Num()) * 0.95),
+				ContinentalElevations.Num() - 1);
+			Result.P95ElevationKm = ContinentalElevations[P95Index];
+		}
+		return Result;
+	}
+
+	int32 ComputeAndeanSampleCount(const FTectonicPlanetV6& Planet)
+	{
+		int32 Count = 0;
+		for (const FSample& Sample : Planet.GetPlanet().Samples)
+		{
+			Count += Sample.OrogenyType == EOrogenyType::Andean ? 1 : 0;
+		}
+		return Count;
+	}
+
+	enum class EBoundaryFieldCouplingProvenanceBucket : uint8
+	{
+		DirectHitTriangle = 0,
+		SingleSource = 1,
+		SyntheticRecovery = 2,
+		FallbackDefault = 3,
+		Count = 4,
+	};
+
+	enum class EBoundaryFieldCouplingLeakCause : uint8
+	{
+		CwThresholdCross = 0,
+		ElevationJumpGt1Km = 1,
+		QueryMissWithPreviousOwner = 2,
+		TransferProvenanceChanged = 3,
+		OtherUnknown = 4,
+		Count = 5,
+	};
+
+	enum class EBoundaryFieldCouplingProximityBucket : uint8
+	{
+		ActiveBand = 0,
+		OneRing = 1,
+		NearInterior2To3 = 2,
+		DeepInterior4Plus = 3,
+		Count = 4,
+	};
+
+	struct FBoundaryFieldCouplingMismatchLog
+	{
+		int32 SampleIndex = INDEX_NONE;
+		double AbsCwDelta = 0.0;
+		EBoundaryFieldCouplingProvenanceBucket Provenance =
+			EBoundaryFieldCouplingProvenanceBucket::FallbackDefault;
+		float PreSolveContinentalWeight = 0.0f;
+		float PostSolveContinentalWeight = 0.0f;
+		float PreSolveElevationKm = 0.0f;
+		float PostSolveElevationKm = 0.0f;
+		int32 PreviousPlateId = INDEX_NONE;
+		int32 FinalPlateId = INDEX_NONE;
+		int32 ActiveRingDistance = INDEX_NONE;
+		bool bActiveZoneSample = false;
+	};
+
+	struct FBoundaryFieldCouplingSyntheticMissLog
+	{
+		int32 SampleIndex = INDEX_NONE;
+		int32 MissLineageAge = 0;
+		EBoundaryFieldCouplingProvenanceBucket PreviousProvenance =
+			EBoundaryFieldCouplingProvenanceBucket::FallbackDefault;
+		float PreSolveContinentalWeight = 0.0f;
+		float PostSolveContinentalWeight = 0.0f;
+		float PreSolveElevationKm = 0.0f;
+		float PostSolveElevationKm = 0.0f;
+		int32 PreviousPlateId = INDEX_NONE;
+		int32 FinalPlateId = INDEX_NONE;
+		int32 ConvergentActiveRingDistance = INDEX_NONE;
+		bool bNearConvergentFront = false;
+		bool bCurrentActive = false;
+	};
+
+	struct FBoundaryFieldCouplingLeakLog
+	{
+		int32 SampleIndex = INDEX_NONE;
+		double AbsElevationDeltaKm = 0.0;
+		EBoundaryFieldCouplingLeakCause Cause = EBoundaryFieldCouplingLeakCause::OtherUnknown;
+		EBoundaryFieldCouplingProvenanceBucket PreviousProvenance =
+			EBoundaryFieldCouplingProvenanceBucket::FallbackDefault;
+		EBoundaryFieldCouplingProvenanceBucket CurrentProvenance =
+			EBoundaryFieldCouplingProvenanceBucket::FallbackDefault;
+		EBoundaryFieldCouplingProximityBucket ProximityBucket =
+			EBoundaryFieldCouplingProximityBucket::DeepInterior4Plus;
+		float PreSolveContinentalWeight = 0.0f;
+		float PostSolveContinentalWeight = 0.0f;
+		float PreSolveElevationKm = 0.0f;
+		float PostSolveElevationKm = 0.0f;
+		int32 PreviousPlateId = INDEX_NONE;
+		int32 FinalPlateId = INDEX_NONE;
+	};
+
+	struct FBoundaryFieldCouplingBandDeltaStats
+	{
+		int32 SampleCount = 0;
+		double SumAbsCwDelta = 0.0;
+		double MaxAbsCwDelta = 0.0;
+		double SumAbsElevationDeltaKm = 0.0;
+		double MaxAbsElevationDeltaKm = 0.0;
+		int32 ThresholdCrossCount = 0;
+		int32 OwnershipRetainedCount = 0;
+	};
+
+	struct FBoundaryFieldCouplingVariantDiagnostics
+	{
+		FString Label;
+		FV6CheckpointSnapshot Snapshot;
+		int32 CwThresholdMismatchCount = 0;
+		int32 CwThresholdMismatchByProvenance[4] = { 0, 0, 0, 0 };
+		double MeanMismatchNearestActiveZoneRingDistance = 0.0;
+		FBoundaryFieldCouplingBandDeltaStats BoundaryBandDelta;
+		int32 SyntheticMissedAgainCount = 0;
+		int32 SyntheticMissedAgainByPreviousProvenance[4] = { 0, 0, 0, 0 };
+		TMap<int32, int32> SyntheticMissLineageAgeCounts;
+		int32 SyntheticMissedAgainNearConvergentFrontCount = 0;
+		int32 SyntheticMissedAgainWithCwDeltaCount = 0;
+		double SyntheticMissedAgainMeanAbsCwDelta = 0.0;
+		int32 TotalInteriorLeakCount = 0;
+		int32 InteriorLeakCauseCounts[5] = { 0, 0, 0, 0, 0 };
+		int32 InteriorLeakProximityCounts[4] = { 0, 0, 0, 0 };
+		TArray<FBoundaryFieldCouplingMismatchLog> TopMismatchLogs;
+		TArray<FBoundaryFieldCouplingSyntheticMissLog> TopSyntheticMissLogs;
+		TArray<FBoundaryFieldCouplingLeakLog> TopLeakLogs;
+	};
+
+	const TCHAR* GetBoundaryFieldCouplingProvenanceName(
+		const EBoundaryFieldCouplingProvenanceBucket Bucket)
+	{
+		switch (Bucket)
+		{
+		case EBoundaryFieldCouplingProvenanceBucket::DirectHitTriangle:
+			return TEXT("direct_hit_triangle");
+		case EBoundaryFieldCouplingProvenanceBucket::SingleSource:
+			return TEXT("single_source");
+		case EBoundaryFieldCouplingProvenanceBucket::SyntheticRecovery:
+			return TEXT("synthetic_recovery");
+		case EBoundaryFieldCouplingProvenanceBucket::FallbackDefault:
+		default:
+			return TEXT("fallback_default");
+		}
+	}
+
+	const TCHAR* GetBoundaryFieldCouplingLeakCauseName(
+		const EBoundaryFieldCouplingLeakCause Cause)
+	{
+		switch (Cause)
+		{
+		case EBoundaryFieldCouplingLeakCause::CwThresholdCross:
+			return TEXT("cw_threshold_cross");
+		case EBoundaryFieldCouplingLeakCause::ElevationJumpGt1Km:
+			return TEXT("elevation_jump_gt_1km");
+		case EBoundaryFieldCouplingLeakCause::QueryMissWithPreviousOwner:
+			return TEXT("query_miss_with_previous_owner");
+		case EBoundaryFieldCouplingLeakCause::TransferProvenanceChanged:
+			return TEXT("transfer_provenance_changed");
+		case EBoundaryFieldCouplingLeakCause::OtherUnknown:
+		default:
+			return TEXT("other_unknown");
+		}
+	}
+
+	const TCHAR* GetBoundaryFieldCouplingProximityName(
+		const EBoundaryFieldCouplingProximityBucket Bucket)
+	{
+		switch (Bucket)
+		{
+		case EBoundaryFieldCouplingProximityBucket::ActiveBand:
+			return TEXT("active_band");
+		case EBoundaryFieldCouplingProximityBucket::OneRing:
+			return TEXT("one_ring");
+		case EBoundaryFieldCouplingProximityBucket::NearInterior2To3:
+			return TEXT("near_interior_2_3");
+		case EBoundaryFieldCouplingProximityBucket::DeepInterior4Plus:
+		default:
+			return TEXT("deep_interior_4_plus");
+		}
+	}
+
+	bool IsBoundaryFieldCouplingRemeshMiss(const FTectonicPlanetV6ResolvedSample& Resolved)
+	{
+		return
+			Resolved.ResolutionKind == ETectonicPlanetV6ResolutionKind::ThesisRemeshMissOceanic ||
+			Resolved.ResolutionKind == ETectonicPlanetV6ResolutionKind::ThesisRemeshMissDestructiveExclusion ||
+			Resolved.ResolutionKind == ETectonicPlanetV6ResolutionKind::ThesisRemeshMissAmbiguous;
+	}
+
+	bool IsBoundaryFieldCouplingConflictSample(const FTectonicPlanetV6ResolvedSample& Resolved)
+	{
+		return Resolved.ExactCandidateCount > 1 || IsBoundaryFieldCouplingRemeshMiss(Resolved);
+	}
+
+	void BuildBoundaryFieldCouplingRingDistanceFromSeedFlags(
+		const FTectonicPlanet& Planet,
+		const TArray<uint8>& SeedFlags,
+		TArray<int32>& OutRingDistance)
+	{
+		const int32 SampleCount = Planet.Samples.Num();
+		OutRingDistance.Init(INDEX_NONE, SampleCount);
+		TArray<int32> Queue;
+		Queue.Reserve(SampleCount);
+		for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+		{
+			if (SeedFlags.IsValidIndex(SampleIndex) && SeedFlags[SampleIndex] != 0)
+			{
+				OutRingDistance[SampleIndex] = 0;
+				Queue.Add(SampleIndex);
+			}
+		}
+
+		for (int32 QueueIndex = 0; QueueIndex < Queue.Num(); ++QueueIndex)
+		{
+			const int32 SampleIndex = Queue[QueueIndex];
+			if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			const int32 NextDistance = OutRingDistance[SampleIndex] + 1;
+			for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+			{
+				if (!OutRingDistance.IsValidIndex(NeighborIndex) ||
+					OutRingDistance[NeighborIndex] != INDEX_NONE)
+				{
+					continue;
+				}
+
+				OutRingDistance[NeighborIndex] = NextDistance;
+				Queue.Add(NeighborIndex);
+			}
+		}
+	}
+
+	void BuildBoundaryFieldCouplingBoundaryBandAndRingDistance(
+		const FTectonicPlanet& Planet,
+		TArray<uint8>& OutBoundaryBandFlags,
+		TArray<int32>& OutBoundaryRingDistance)
+	{
+		const int32 SampleCount = Planet.Samples.Num();
+		OutBoundaryBandFlags.Init(0, SampleCount);
+		for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+		{
+			if (!Planet.Samples.IsValidIndex(SampleIndex) ||
+				!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			const int32 PlateId = Planet.Samples[SampleIndex].PlateId;
+			if (PlateId == INDEX_NONE)
+			{
+				continue;
+			}
+
+			for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+			{
+				if (!Planet.Samples.IsValidIndex(NeighborIndex))
+				{
+					continue;
+				}
+
+				const int32 NeighborPlateId = Planet.Samples[NeighborIndex].PlateId;
+				if (NeighborPlateId != INDEX_NONE && NeighborPlateId != PlateId)
+				{
+					OutBoundaryBandFlags[SampleIndex] = 1;
+					break;
+				}
+			}
+		}
+
+		BuildBoundaryFieldCouplingRingDistanceFromSeedFlags(
+			Planet,
+			OutBoundaryBandFlags,
+			OutBoundaryRingDistance);
+	}
+
+	EBoundaryFieldCouplingProximityBucket ClassifyBoundaryFieldCouplingProximity(
+		const int32 ActiveRingDistance)
+	{
+		if (ActiveRingDistance == 0)
+		{
+			return EBoundaryFieldCouplingProximityBucket::ActiveBand;
+		}
+		if (ActiveRingDistance == 1)
+		{
+			return EBoundaryFieldCouplingProximityBucket::OneRing;
+		}
+		if (ActiveRingDistance >= 2 && ActiveRingDistance <= 3)
+		{
+			return EBoundaryFieldCouplingProximityBucket::NearInterior2To3;
+		}
+		return EBoundaryFieldCouplingProximityBucket::DeepInterior4Plus;
+	}
+
+	EBoundaryFieldCouplingProvenanceBucket ClassifyBoundaryFieldCouplingCurrentProvenance(
+		const FTectonicPlanetV6ResolvedSample& Resolved)
+	{
+		if (Resolved.bHasStructuredSyntheticFill ||
+			Resolved.bRetainedSyntheticCoverage ||
+			Resolved.TransferDebug.SourceKind == ETectonicPlanetV6TransferSourceKind::StructuredSynthetic)
+		{
+			return EBoundaryFieldCouplingProvenanceBucket::SyntheticRecovery;
+		}
+		if (Resolved.TransferDebug.SourceKind == ETectonicPlanetV6TransferSourceKind::SingleSource)
+		{
+			return EBoundaryFieldCouplingProvenanceBucket::SingleSource;
+		}
+		if (Resolved.TransferDebug.SourceKind == ETectonicPlanetV6TransferSourceKind::Triangle &&
+			Resolved.ResolutionKind != ETectonicPlanetV6ResolutionKind::NearestTriangleRecovery)
+		{
+			return EBoundaryFieldCouplingProvenanceBucket::DirectHitTriangle;
+		}
+		return EBoundaryFieldCouplingProvenanceBucket::FallbackDefault;
+	}
+
+	EBoundaryFieldCouplingProvenanceBucket ClassifyBoundaryFieldCouplingPreviousProvenance(
+		const uint8 PreviousTransferSourceKindValue,
+		const uint8 PreviousResolutionKindValue,
+		const bool bPreviousSynthetic)
+	{
+		const ETectonicPlanetV6TransferSourceKind PreviousSourceKind =
+			static_cast<ETectonicPlanetV6TransferSourceKind>(PreviousTransferSourceKindValue);
+		const ETectonicPlanetV6ResolutionKind PreviousResolutionKind =
+			static_cast<ETectonicPlanetV6ResolutionKind>(PreviousResolutionKindValue);
+		if (bPreviousSynthetic ||
+			PreviousSourceKind == ETectonicPlanetV6TransferSourceKind::StructuredSynthetic ||
+			PreviousResolutionKind == ETectonicPlanetV6ResolutionKind::ThesisRemeshRetainedSyntheticCoverage)
+		{
+			return EBoundaryFieldCouplingProvenanceBucket::SyntheticRecovery;
+		}
+		if (PreviousSourceKind == ETectonicPlanetV6TransferSourceKind::SingleSource)
+		{
+			return EBoundaryFieldCouplingProvenanceBucket::SingleSource;
+		}
+		if (PreviousSourceKind == ETectonicPlanetV6TransferSourceKind::Triangle &&
+			PreviousResolutionKind != ETectonicPlanetV6ResolutionKind::NearestTriangleRecovery)
+		{
+			return EBoundaryFieldCouplingProvenanceBucket::DirectHitTriangle;
+		}
+		return EBoundaryFieldCouplingProvenanceBucket::FallbackDefault;
+	}
+
+	FString FormatBoundaryFieldCouplingAgeDistribution(const TMap<int32, int32>& Counts)
+	{
+		TArray<int32> Ages;
+		Counts.GenerateKeyArray(Ages);
+		Ages.Sort();
+
+		TArray<FString> Parts;
+		for (const int32 Age : Ages)
+		{
+			if (const int32* CountPtr = Counts.Find(Age))
+			{
+				Parts.Add(FString::Printf(TEXT("%d:%d"), Age, *CountPtr));
+			}
+		}
+		return FString::Join(Parts, TEXT(","));
+	}
+
+	void AddBoundaryFieldCouplingLog(
+		FAutomationTestBase& Test,
+		const FString& Message)
+	{
+		Test.AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	}
+
+	void ConfigureBoundaryFieldCouplingVariant(
+		FTectonicPlanetV6& Planet,
+		const bool bUseThesisScaleRelief)
+	{
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+
+		FTectonicPlanet& LegacyPlanet = Planet.GetPlanetMutable();
+		if (bUseThesisScaleRelief)
+		{
+			LegacyPlanet.SubductionBaseUpliftKmPerMyForTest = -1.0;
+			LegacyPlanet.bDisableSubductionElevationTransferForTest = false;
+			Planet.SetUseLinearConvergentMaintenanceSpeedFactorForTest(true);
+			Planet.SetUseLinearConvergentMaintenanceInfluenceForTest(true);
+		}
+		else
+		{
+			LegacyPlanet.SubductionBaseUpliftKmPerMyForTest = 0.0006;
+			LegacyPlanet.bDisableSubductionElevationTransferForTest = true;
+			Planet.SetUseLinearConvergentMaintenanceSpeedFactorForTest(false);
+			Planet.SetUseLinearConvergentMaintenanceInfluenceForTest(false);
+		}
+	}
+
+	FBoundaryFieldCouplingVariantDiagnostics BuildBoundaryFieldCouplingVariantDiagnostics(
+		const FString& Label,
+		const FTectonicPlanetV6& Planet)
+	{
+		FBoundaryFieldCouplingVariantDiagnostics Result;
+		Result.Label = Label;
+		Result.Snapshot = BuildV6CheckpointSnapshot(Planet);
+
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		const int32 SampleCount = PlanetData.Samples.Num();
+		const TArray<FTectonicPlanetV6ResolvedSample>& ResolvedSamples = Planet.GetLastResolvedSamplesForTest();
+		const TArray<int32>& PreSolvePlateIds = Planet.GetCurrentSolvePreSolvePlateIdsForTest();
+		const TArray<float>& PreSolveContinentalWeights =
+			Planet.GetCurrentSolvePreSolveContinentalWeightsForTest();
+		const TArray<float>& PreSolveElevations = Planet.GetCurrentSolvePreSolveElevationsForTest();
+		const TArray<uint8>& PreviousSyntheticFlags = Planet.GetCurrentSolvePreviousSyntheticFlagsForTest();
+		const TArray<uint8>& PreviousTransferSourceKindValues =
+			Planet.GetCurrentSolvePreviousTransferSourceKindValuesForTest();
+		const TArray<uint8>& PreviousResolutionKindValues =
+			Planet.GetCurrentSolvePreviousResolutionKindValuesForTest();
+		const TArray<uint8>& ActiveZoneFlags = Planet.GetCurrentSolveActiveZoneFlagsForTest();
+		const TArray<uint8>& ActiveZoneCauseValues = Planet.GetCurrentSolveActiveZoneCauseValuesForTest();
+		const TArray<uint8>& MissLineageCounts = Planet.GetMissLineageCountsForTest();
+
+		if (ResolvedSamples.Num() != SampleCount ||
+			PreSolvePlateIds.Num() != SampleCount ||
+			PreSolveContinentalWeights.Num() != SampleCount ||
+			PreSolveElevations.Num() != SampleCount ||
+			PreviousSyntheticFlags.Num() != SampleCount ||
+			PreviousTransferSourceKindValues.Num() != SampleCount ||
+			PreviousResolutionKindValues.Num() != SampleCount ||
+			ActiveZoneFlags.Num() != SampleCount ||
+			ActiveZoneCauseValues.Num() != SampleCount ||
+			MissLineageCounts.Num() != SampleCount)
+		{
+			return Result;
+		}
+
+		TArray<int32> ActiveRingDistance;
+		BuildBoundaryFieldCouplingRingDistanceFromSeedFlags(
+			PlanetData,
+			ActiveZoneFlags,
+			ActiveRingDistance);
+
+		TArray<uint8> ConvergentActiveFlags;
+		ConvergentActiveFlags.Init(0, SampleCount);
+		for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+		{
+			if (ActiveZoneFlags[SampleIndex] == 0)
+			{
+				continue;
+			}
+
+			const ETectonicPlanetV6ActiveZoneCause Cause =
+				static_cast<ETectonicPlanetV6ActiveZoneCause>(ActiveZoneCauseValues[SampleIndex]);
+			if (Cause == ETectonicPlanetV6ActiveZoneCause::ConvergentSubduction ||
+				Cause == ETectonicPlanetV6ActiveZoneCause::CollisionContact)
+			{
+				ConvergentActiveFlags[SampleIndex] = 1;
+			}
+		}
+
+		TArray<int32> ConvergentActiveRingDistance;
+		BuildBoundaryFieldCouplingRingDistanceFromSeedFlags(
+			PlanetData,
+			ConvergentActiveFlags,
+			ConvergentActiveRingDistance);
+
+		TArray<uint8> BoundaryBandFlags;
+		TArray<int32> BoundaryRingDistance;
+		BuildBoundaryFieldCouplingBoundaryBandAndRingDistance(
+			PlanetData,
+			BoundaryBandFlags,
+			BoundaryRingDistance);
+
+		double MismatchRingDistanceSum = 0.0;
+		int32 MismatchRingDistanceCount = 0;
+		double SyntheticMissAbsCwDeltaSum = 0.0;
+
+		for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+		{
+			const FTectonicPlanetV6ResolvedSample& Resolved = ResolvedSamples[SampleIndex];
+			const FSample& CurrentSample = PlanetData.Samples[SampleIndex];
+			const float PreSolveCw = PreSolveContinentalWeights[SampleIndex];
+			const float PostSolveCw = CurrentSample.ContinentalWeight;
+			const float PreSolveElevation = PreSolveElevations[SampleIndex];
+			const float PostSolveElevation = CurrentSample.Elevation;
+			const double AbsCwDelta = FMath::Abs(static_cast<double>(PostSolveCw - PreSolveCw));
+			const double AbsElevationDelta = FMath::Abs(static_cast<double>(PostSolveElevation - PreSolveElevation));
+			const int32 ActiveDistance = ActiveRingDistance.IsValidIndex(SampleIndex)
+				? ActiveRingDistance[SampleIndex]
+				: INDEX_NONE;
+			const int32 ConvergentDistance = ConvergentActiveRingDistance.IsValidIndex(SampleIndex)
+				? ConvergentActiveRingDistance[SampleIndex]
+				: INDEX_NONE;
+			const bool bPreviousSynthetic = PreviousSyntheticFlags[SampleIndex] != 0;
+			const EBoundaryFieldCouplingProvenanceBucket CurrentProvenance =
+				ClassifyBoundaryFieldCouplingCurrentProvenance(Resolved);
+			const EBoundaryFieldCouplingProvenanceBucket PreviousProvenance =
+				ClassifyBoundaryFieldCouplingPreviousProvenance(
+					PreviousTransferSourceKindValues[SampleIndex],
+					PreviousResolutionKindValues[SampleIndex],
+					bPreviousSynthetic);
+
+			if (Resolved.TransferDebug.bContinentalWeightWouldCrossThresholdUnderBarycentricBlend)
+			{
+				++Result.CwThresholdMismatchCount;
+				++Result.CwThresholdMismatchByProvenance[static_cast<int32>(CurrentProvenance)];
+				if (ActiveDistance != INDEX_NONE)
+				{
+					MismatchRingDistanceSum += static_cast<double>(ActiveDistance);
+					++MismatchRingDistanceCount;
+				}
+
+				FBoundaryFieldCouplingMismatchLog Log;
+				Log.SampleIndex = SampleIndex;
+				Log.AbsCwDelta = AbsCwDelta;
+				Log.Provenance = CurrentProvenance;
+				Log.PreSolveContinentalWeight = PreSolveCw;
+				Log.PostSolveContinentalWeight = PostSolveCw;
+				Log.PreSolveElevationKm = PreSolveElevation;
+				Log.PostSolveElevationKm = PostSolveElevation;
+				Log.PreviousPlateId = PreSolvePlateIds[SampleIndex];
+				Log.FinalPlateId = Resolved.FinalPlateId;
+				Log.ActiveRingDistance = ActiveDistance;
+				Log.bActiveZoneSample = ActiveZoneFlags[SampleIndex] != 0;
+				Result.TopMismatchLogs.Add(Log);
+			}
+
+			if (ActiveDistance != INDEX_NONE && ActiveDistance <= 1)
+			{
+				++Result.BoundaryBandDelta.SampleCount;
+				Result.BoundaryBandDelta.SumAbsCwDelta += AbsCwDelta;
+				Result.BoundaryBandDelta.MaxAbsCwDelta =
+					FMath::Max(Result.BoundaryBandDelta.MaxAbsCwDelta, AbsCwDelta);
+				Result.BoundaryBandDelta.SumAbsElevationDeltaKm += AbsElevationDelta;
+				Result.BoundaryBandDelta.MaxAbsElevationDeltaKm =
+					FMath::Max(Result.BoundaryBandDelta.MaxAbsElevationDeltaKm, AbsElevationDelta);
+				if ((PreSolveCw >= 0.5f) != (PostSolveCw >= 0.5f))
+				{
+					++Result.BoundaryBandDelta.ThresholdCrossCount;
+				}
+				if (PreSolvePlateIds[SampleIndex] != INDEX_NONE &&
+					Resolved.FinalPlateId == PreSolvePlateIds[SampleIndex])
+				{
+					++Result.BoundaryBandDelta.OwnershipRetainedCount;
+				}
+			}
+
+			if (bPreviousSynthetic && IsBoundaryFieldCouplingRemeshMiss(Resolved))
+			{
+				++Result.SyntheticMissedAgainCount;
+				++Result.SyntheticMissedAgainByPreviousProvenance[static_cast<int32>(PreviousProvenance)];
+				++Result.SyntheticMissLineageAgeCounts.FindOrAdd(static_cast<int32>(MissLineageCounts[SampleIndex]));
+				if (ConvergentDistance != INDEX_NONE && ConvergentDistance <= 1)
+				{
+					++Result.SyntheticMissedAgainNearConvergentFrontCount;
+				}
+				if (AbsCwDelta > 1.0e-3)
+				{
+					++Result.SyntheticMissedAgainWithCwDeltaCount;
+				}
+				SyntheticMissAbsCwDeltaSum += AbsCwDelta;
+
+				FBoundaryFieldCouplingSyntheticMissLog Log;
+				Log.SampleIndex = SampleIndex;
+				Log.MissLineageAge = static_cast<int32>(MissLineageCounts[SampleIndex]);
+				Log.PreviousProvenance = PreviousProvenance;
+				Log.PreSolveContinentalWeight = PreSolveCw;
+				Log.PostSolveContinentalWeight = PostSolveCw;
+				Log.PreSolveElevationKm = PreSolveElevation;
+				Log.PostSolveElevationKm = PostSolveElevation;
+				Log.PreviousPlateId = PreSolvePlateIds[SampleIndex];
+				Log.FinalPlateId = Resolved.FinalPlateId;
+				Log.ConvergentActiveRingDistance = ConvergentDistance;
+				Log.bNearConvergentFront = ConvergentDistance != INDEX_NONE && ConvergentDistance <= 1;
+				Log.bCurrentActive = ActiveZoneFlags[SampleIndex] != 0;
+				Result.TopSyntheticMissLogs.Add(Log);
+			}
+
+			const int32 BoundaryDistance = BoundaryRingDistance.IsValidIndex(SampleIndex)
+				? BoundaryRingDistance[SampleIndex]
+				: INDEX_NONE;
+			if (BoundaryDistance == INDEX_NONE || BoundaryDistance < 2)
+			{
+				continue;
+			}
+			if (!IsBoundaryFieldCouplingConflictSample(Resolved))
+			{
+				continue;
+			}
+
+			++Result.TotalInteriorLeakCount;
+			const bool bCwCrossedThreshold = (PreSolveCw >= 0.5f) != (PostSolveCw >= 0.5f);
+			const bool bElevationJumped = AbsElevationDelta > 1.0;
+			const bool bQueryMissWithPreviousOwner =
+				IsBoundaryFieldCouplingRemeshMiss(Resolved) && PreSolvePlateIds[SampleIndex] != INDEX_NONE;
+			const bool bTransferProvenanceChanged = CurrentProvenance != PreviousProvenance;
+			EBoundaryFieldCouplingLeakCause Cause = EBoundaryFieldCouplingLeakCause::OtherUnknown;
+			if (bCwCrossedThreshold)
+			{
+				Cause = EBoundaryFieldCouplingLeakCause::CwThresholdCross;
+			}
+			else if (bElevationJumped)
+			{
+				Cause = EBoundaryFieldCouplingLeakCause::ElevationJumpGt1Km;
+			}
+			else if (bQueryMissWithPreviousOwner)
+			{
+				Cause = EBoundaryFieldCouplingLeakCause::QueryMissWithPreviousOwner;
+			}
+			else if (bTransferProvenanceChanged)
+			{
+				Cause = EBoundaryFieldCouplingLeakCause::TransferProvenanceChanged;
+			}
+			++Result.InteriorLeakCauseCounts[static_cast<int32>(Cause)];
+
+			const EBoundaryFieldCouplingProximityBucket ProximityBucket =
+				ClassifyBoundaryFieldCouplingProximity(ActiveDistance);
+			++Result.InteriorLeakProximityCounts[static_cast<int32>(ProximityBucket)];
+
+			FBoundaryFieldCouplingLeakLog Log;
+			Log.SampleIndex = SampleIndex;
+			Log.AbsElevationDeltaKm = AbsElevationDelta;
+			Log.Cause = Cause;
+			Log.PreviousProvenance = PreviousProvenance;
+			Log.CurrentProvenance = CurrentProvenance;
+			Log.ProximityBucket = ProximityBucket;
+			Log.PreSolveContinentalWeight = PreSolveCw;
+			Log.PostSolveContinentalWeight = PostSolveCw;
+			Log.PreSolveElevationKm = PreSolveElevation;
+			Log.PostSolveElevationKm = PostSolveElevation;
+			Log.PreviousPlateId = PreSolvePlateIds[SampleIndex];
+			Log.FinalPlateId = Resolved.FinalPlateId;
+			Result.TopLeakLogs.Add(Log);
+		}
+
+		Result.MeanMismatchNearestActiveZoneRingDistance =
+			MismatchRingDistanceCount > 0
+				? MismatchRingDistanceSum / static_cast<double>(MismatchRingDistanceCount)
+				: 0.0;
+		Result.SyntheticMissedAgainMeanAbsCwDelta =
+			Result.SyntheticMissedAgainCount > 0
+				? SyntheticMissAbsCwDeltaSum / static_cast<double>(Result.SyntheticMissedAgainCount)
+				: 0.0;
+
+		Result.TopMismatchLogs.Sort([](
+			const FBoundaryFieldCouplingMismatchLog& A,
+			const FBoundaryFieldCouplingMismatchLog& B)
+		{
+			return A.AbsCwDelta > B.AbsCwDelta;
+		});
+		if (Result.TopMismatchLogs.Num() > 20)
+		{
+			Result.TopMismatchLogs.SetNum(20);
+		}
+
+		Result.TopSyntheticMissLogs.Sort([](
+			const FBoundaryFieldCouplingSyntheticMissLog& A,
+			const FBoundaryFieldCouplingSyntheticMissLog& B)
+		{
+			if (A.MissLineageAge != B.MissLineageAge)
+			{
+				return A.MissLineageAge > B.MissLineageAge;
+			}
+			return FMath::Abs(
+				static_cast<double>(A.PostSolveContinentalWeight - A.PreSolveContinentalWeight)) >
+				FMath::Abs(static_cast<double>(B.PostSolveContinentalWeight - B.PreSolveContinentalWeight));
+		});
+		if (Result.TopSyntheticMissLogs.Num() > 20)
+		{
+			Result.TopSyntheticMissLogs.SetNum(20);
+		}
+
+		Result.TopLeakLogs.Sort([](
+			const FBoundaryFieldCouplingLeakLog& A,
+			const FBoundaryFieldCouplingLeakLog& B)
+		{
+			return A.AbsElevationDeltaKm > B.AbsElevationDeltaKm;
+		});
+		if (Result.TopLeakLogs.Num() > 20)
+		{
+			Result.TopLeakLogs.SetNum(20);
+		}
+
+		return Result;
+	}
+
+	void AddBoundaryFieldCouplingAggregateComparison(
+		FAutomationTestBase& Test,
+		const FString& MetricName,
+		const double ControlValue,
+		const double CandidateValue)
+	{
+		AddBoundaryFieldCouplingLog(
+			Test,
+			FString::Printf(
+				TEXT("[BoundaryFieldCoupling metric=%s] A=%.6f B=%.6f delta=%.6f"),
+				*MetricName,
+				ControlValue,
+				CandidateValue,
+				CandidateValue - ControlValue));
+	}
+
+	void AddBoundaryFieldCouplingVariantTopLogs(
+		FAutomationTestBase& Test,
+		const FBoundaryFieldCouplingVariantDiagnostics& Variant)
+	{
+		for (const FBoundaryFieldCouplingMismatchLog& Log : Variant.TopMismatchLogs)
+		{
+			AddBoundaryFieldCouplingLog(
+				Test,
+				FString::Printf(
+					TEXT("[BoundaryFieldCoupling mismatch_top variant=%s] sample=%d abs_cw_delta=%.6f provenance=%s pre_cw=%.6f post_cw=%.6f pre_elev=%.6f post_elev=%.6f prev_plate=%d final_plate=%d active=%d active_ring=%d"),
+					*Variant.Label,
+					Log.SampleIndex,
+					Log.AbsCwDelta,
+					GetBoundaryFieldCouplingProvenanceName(Log.Provenance),
+					Log.PreSolveContinentalWeight,
+					Log.PostSolveContinentalWeight,
+					Log.PreSolveElevationKm,
+					Log.PostSolveElevationKm,
+					Log.PreviousPlateId,
+					Log.FinalPlateId,
+					Log.bActiveZoneSample ? 1 : 0,
+					Log.ActiveRingDistance));
+		}
+
+		for (const FBoundaryFieldCouplingSyntheticMissLog& Log : Variant.TopSyntheticMissLogs)
+		{
+			AddBoundaryFieldCouplingLog(
+				Test,
+				FString::Printf(
+					TEXT("[BoundaryFieldCoupling synthetic_miss_top variant=%s] sample=%d lineage_age=%d prev_provenance=%s near_convergent_front=%d convergent_ring=%d pre_cw=%.6f post_cw=%.6f pre_elev=%.6f post_elev=%.6f prev_plate=%d final_plate=%d active=%d"),
+					*Variant.Label,
+					Log.SampleIndex,
+					Log.MissLineageAge,
+					GetBoundaryFieldCouplingProvenanceName(Log.PreviousProvenance),
+					Log.bNearConvergentFront ? 1 : 0,
+					Log.ConvergentActiveRingDistance,
+					Log.PreSolveContinentalWeight,
+					Log.PostSolveContinentalWeight,
+					Log.PreSolveElevationKm,
+					Log.PostSolveElevationKm,
+					Log.PreviousPlateId,
+					Log.FinalPlateId,
+					Log.bCurrentActive ? 1 : 0));
+		}
+
+		for (const FBoundaryFieldCouplingLeakLog& Log : Variant.TopLeakLogs)
+		{
+			AddBoundaryFieldCouplingLog(
+				Test,
+				FString::Printf(
+					TEXT("[BoundaryFieldCoupling leak_top variant=%s] sample=%d abs_elev_delta=%.6f cause=%s prev_provenance=%s current_provenance=%s proximity=%s pre_cw=%.6f post_cw=%.6f pre_elev=%.6f post_elev=%.6f prev_plate=%d final_plate=%d"),
+					*Variant.Label,
+					Log.SampleIndex,
+					Log.AbsElevationDeltaKm,
+					GetBoundaryFieldCouplingLeakCauseName(Log.Cause),
+					GetBoundaryFieldCouplingProvenanceName(Log.PreviousProvenance),
+					GetBoundaryFieldCouplingProvenanceName(Log.CurrentProvenance),
+					GetBoundaryFieldCouplingProximityName(Log.ProximityBucket),
+					Log.PreSolveContinentalWeight,
+					Log.PostSolveContinentalWeight,
+					Log.PreSolveElevationKm,
+					Log.PostSolveElevationKm,
+					Log.PreviousPlateId,
+					Log.FinalPlateId));
+		}
+	}
+
+	FV9ThesisShapedCollisionGateResult EvaluateV9ThesisShapedCollisionStep100Gate(
+		const FV6CheckpointSnapshot& BaselineSnapshot,
+		const FV6CheckpointSnapshot& CandidateSnapshot,
+		const int32 TotalSampleCount)
+	{
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& BaselineExec =
+			BaselineSnapshot.CollisionExecution;
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& CandidateExec =
+			CandidateSnapshot.CollisionExecution;
+
+		FV9ThesisShapedCollisionGateResult Result;
+		Result.RequiredMinTerraneComponentSize = 20;
+		Result.RequiredMinTransferSize = FMath::Max(
+			BaselineExec.CumulativeCollisionTransferredSampleCount * 2, 30);
+		Result.RequiredMinAffectedSamples = FMath::Max(
+			BaselineExec.CumulativeCollisionAffectedSampleCount + 50, 100);
+		Result.RequiredMinOwnershipChange = FMath::Max(
+			BaselineExec.CumulativeCollisionDrivenOwnershipChangeCount * 2, 30);
+		Result.RequiredMinMeanElevationDeltaKm =
+			BaselineExec.CumulativeMeanElevationDeltaKm > UE_DOUBLE_SMALL_NUMBER
+				? BaselineExec.CumulativeMeanElevationDeltaKm * 1.25
+				: 0.05;
+		Result.MaxAllowedChurn = BaselineSnapshot.OwnershipChurn.ChurnFraction + 0.01;
+		Result.MinAllowedCoherence = BaselineSnapshot.BoundaryCoherence.BoundaryCoherenceScore - 0.01;
+		Result.MaxAllowedInteriorLeakage =
+			BaselineSnapshot.BoundaryCoherence.InteriorLeakageFraction + 0.02;
+
+		Result.bTerraneDetectedPass =
+			CandidateExec.ExecutedDonorTerraneComponentSize >= Result.RequiredMinTerraneComponentSize;
+		Result.bTransferCoherentPass =
+			CandidateExec.CumulativeCollisionTransferredSampleCount >= Result.RequiredMinTransferSize;
+		Result.bOwnershipMaterialPass =
+			CandidateExec.CumulativeCollisionDrivenOwnershipChangeCount >= Result.RequiredMinOwnershipChange;
+		Result.bAffectedFootprintPass =
+			CandidateExec.CumulativeCollisionAffectedSampleCount >= Result.RequiredMinAffectedSamples;
+		Result.bElevationPass =
+			CandidateExec.CumulativeMeanElevationDeltaKm >= Result.RequiredMinMeanElevationDeltaKm;
+		Result.bContinentalGainPass =
+			CandidateExec.CumulativeCollisionDrivenContinentalGainCount >
+			BaselineExec.CumulativeCollisionDrivenContinentalGainCount;
+		Result.bChurnPass =
+			CandidateSnapshot.OwnershipChurn.ChurnFraction <= Result.MaxAllowedChurn;
+		Result.bCoherencePass =
+			CandidateSnapshot.BoundaryCoherence.BoundaryCoherenceScore >= Result.MinAllowedCoherence;
+		Result.bLeakagePass =
+			CandidateSnapshot.BoundaryCoherence.InteriorLeakageFraction <= Result.MaxAllowedInteriorLeakage;
+		Result.bAllowStep200 =
+			Result.bTerraneDetectedPass &&
+			Result.bTransferCoherentPass &&
+			Result.bOwnershipMaterialPass &&
+			Result.bAffectedFootprintPass &&
+			Result.bElevationPass &&
+			Result.bContinentalGainPass &&
 			Result.bChurnPass &&
 			Result.bCoherencePass &&
 			Result.bLeakagePass;
@@ -6562,6 +7448,389 @@ bool FTectonicPlanetV6V9Phase1dStep200ValidationTest::RunTest(const FString& Par
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9ElevationBudgetAlignmentStep100Test,
+	"Aurous.TectonicPlanet.V6V9ElevationBudgetAlignmentStep100Test",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9ElevationBudgetAlignmentStep100Test::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+
+	FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+		ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+		FixedIntervalSteps,
+		INDEX_NONE,
+		SampleCount,
+		PlateCount,
+		TestRandomSeed);
+	Planet.SetSyntheticCoverageRetentionForTest(false);
+	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+	Planet.SetExcludeMixedTrianglesForTest(false);
+	Planet.SetV9Phase1AuthorityForTest(true, 1);
+	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+
+	Planet.AdvanceSteps(100);
+
+	const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+	const FBoundaryFieldCouplingVariantDiagnostics ContinuityDiagnostics =
+		BuildBoundaryFieldCouplingVariantDiagnostics(TEXT("current"), Planet);
+	const FTectonicPlanetV6CopiedFrontierSolveAttribution& Attribution =
+		Planet.GetLastCopiedFrontierSolveAttributionForTest();
+	const FString Tag = TEXT("[V9ElevationBudgetAlignment step=100]");
+	AddV6ThesisRemeshInfo(*this, Tag, Snapshot);
+	AddV6BoundaryCoherenceInfo(*this, Tag, Snapshot);
+	AddV6InteriorInstabilityInfo(*this, Tag, Snapshot);
+	AddV6ActiveZoneInfo(*this, Tag, Snapshot);
+
+	const FV9ContinentalElevationStats ElevationStats = ComputeContinentalElevationStats(Planet);
+	const int32 AndeanCount = ComputeAndeanSampleCount(Planet);
+	const int32 TectonicMaintenanceAppliedCount =
+		Attribution.TectonicMaintenanceAppliedCount;
+	const int32 BoundaryBandSampleCount = ContinuityDiagnostics.BoundaryBandDelta.SampleCount;
+	const double BoundaryBandMeanAbsElevationDeltaKm =
+		BoundaryBandSampleCount > 0
+			? ContinuityDiagnostics.BoundaryBandDelta.SumAbsElevationDeltaKm /
+				static_cast<double>(BoundaryBandSampleCount)
+			: 0.0;
+	const int32 InteriorLeakElevationJumpCount =
+		ContinuityDiagnostics.InteriorLeakCauseCounts[
+			static_cast<int32>(EBoundaryFieldCouplingLeakCause::ElevationJumpGt1Km)];
+	const int32 SyntheticMissedAgainCount = ContinuityDiagnostics.SyntheticMissedAgainCount;
+	const int32 SyntheticMissedAgainFromDirectHitCount =
+		ContinuityDiagnostics.SyntheticMissedAgainByPreviousProvenance[
+			static_cast<int32>(EBoundaryFieldCouplingProvenanceBucket::DirectHitTriangle)];
+	const int32 SyntheticMissedAgainFromSyntheticCount =
+		ContinuityDiagnostics.SyntheticMissedAgainByPreviousProvenance[
+			static_cast<int32>(EBoundaryFieldCouplingProvenanceBucket::SyntheticRecovery)];
+	const FString ElevationMessage = FString::Printf(
+		TEXT("%s continental_count=%d mean_elev_km=%.4f p95_elev_km=%.4f max_elev_km=%.4f above_2km=%d above_5km=%d"),
+		*Tag,
+		ElevationStats.ContinentalSampleCount,
+		ElevationStats.MeanElevationKm,
+		ElevationStats.P95ElevationKm,
+		ElevationStats.MaxElevationKm,
+		ElevationStats.SamplesAbove2Km,
+		ElevationStats.SamplesAbove5Km);
+	AddInfo(ElevationMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *ElevationMessage);
+
+	const FString FootprintMessage = FString::Printf(
+		TEXT("%s tectonic_maintenance_applied=%d andean_count=%d"),
+		*Tag,
+		TectonicMaintenanceAppliedCount,
+		AndeanCount);
+	AddInfo(FootprintMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *FootprintMessage);
+
+	const FString ContinuityMessage = FString::Printf(
+		TEXT("%s active_band_mean_abs_elev_delta_km=%.4f active_band_max_abs_elev_delta_km=%.4f interior_leaks_total=%d interior_leaks_elev_gt_1km=%d continuity_triangle_clamped=%d continuity_synthetic_preserved=%d continuity_oceanic_preserved=%d"),
+		*Tag,
+		BoundaryBandMeanAbsElevationDeltaKm,
+		ContinuityDiagnostics.BoundaryBandDelta.MaxAbsElevationDeltaKm,
+		ContinuityDiagnostics.TotalInteriorLeakCount,
+		InteriorLeakElevationJumpCount,
+		Attribution.ActiveBandTriangleFieldContinuityClampCount,
+		Attribution.ActiveBandSyntheticFieldPreserveCount,
+		Attribution.ActiveBandOceanicFieldPreserveCount);
+	AddInfo(ContinuityMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *ContinuityMessage);
+
+	const FString SyntheticRecoveryMessage = FString::Printf(
+		TEXT("%s synthetic_missed_again=%d synthetic_missed_again_prev_direct_hit=%d synthetic_missed_again_prev_synthetic=%d active_band_prev_owner_recovery=%d active_band_synthetic_loop_break=%d active_band_synthetic_single_source=%d"),
+		*Tag,
+		SyntheticMissedAgainCount,
+		SyntheticMissedAgainFromDirectHitCount,
+		SyntheticMissedAgainFromSyntheticCount,
+		Attribution.ActiveBandPreviousOwnerCompatibleRecoveryCount,
+		Attribution.ActiveBandSyntheticLoopBreakCount,
+		Attribution.ActiveBandSyntheticSingleSourceRecoveryCount);
+	AddInfo(SyntheticRecoveryMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *SyntheticRecoveryMessage);
+
+	const bool bMeanPass =
+		ElevationStats.MeanElevationKm >= 0.3 &&
+		ElevationStats.MeanElevationKm <= 3.0;
+	const bool bP95Pass = ElevationStats.P95ElevationKm > 2.0;
+	const bool bMaxPass =
+		ElevationStats.MaxElevationKm > 4.0 &&
+		ElevationStats.MaxElevationKm <= 10.0;
+	const bool bAbove2Pass = ElevationStats.SamplesAbove2Km >= 100;
+	const bool bAbove5Pass = ElevationStats.SamplesAbove5Km >= 10;
+	const bool bMaintenancePass = TectonicMaintenanceAppliedCount < 10000;
+	const bool bAndeanPass = AndeanCount < 15000;
+	const bool bChurnPass = Snapshot.OwnershipChurn.ChurnFraction < 0.05;
+	const bool bCoherencePass = Snapshot.BoundaryCoherence.BoundaryCoherenceScore > 0.93;
+	const bool bLeakagePass = Snapshot.BoundaryCoherence.InteriorLeakageFraction < 0.17;
+	const bool bElevationJumpLeakPass = InteriorLeakElevationJumpCount < 30;
+
+	const FString GateMessage = FString::Printf(
+		TEXT("%s gates mean=%d p95=%d max=%d above2=%d above5=%d maintenance=%d andean=%d churn=%d coherence=%d leakage=%d elev_jump_leaks=%d ")
+		TEXT("candidate_mean=%.4f candidate_p95=%.4f candidate_max=%.4f candidate_above2=%d candidate_above5=%d ")
+		TEXT("candidate_maintenance=%d candidate_andean=%d candidate_churn=%.4f candidate_coherence=%.4f candidate_leakage=%.4f candidate_elev_jump_leaks=%d"),
+		*Tag,
+		bMeanPass ? 1 : 0,
+		bP95Pass ? 1 : 0,
+		bMaxPass ? 1 : 0,
+		bAbove2Pass ? 1 : 0,
+		bAbove5Pass ? 1 : 0,
+		bMaintenancePass ? 1 : 0,
+		bAndeanPass ? 1 : 0,
+		bChurnPass ? 1 : 0,
+		bCoherencePass ? 1 : 0,
+		bLeakagePass ? 1 : 0,
+		bElevationJumpLeakPass ? 1 : 0,
+		ElevationStats.MeanElevationKm,
+		ElevationStats.P95ElevationKm,
+		ElevationStats.MaxElevationKm,
+		ElevationStats.SamplesAbove2Km,
+		ElevationStats.SamplesAbove5Km,
+		TectonicMaintenanceAppliedCount,
+		AndeanCount,
+		Snapshot.OwnershipChurn.ChurnFraction,
+		Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+		Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+		InteriorLeakElevationJumpCount);
+	AddInfo(GateMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *GateMessage);
+
+	TestTrue(TEXT("Step-100 continental mean elevation is positive and bounded"), bMeanPass);
+	TestTrue(TEXT("Step-100 continental p95 elevation exceeds 2 km"), bP95Pass);
+	TestTrue(TEXT("Step-100 continental max elevation exceeds 4 km without overshoot"), bMaxPass);
+	TestTrue(TEXT("Step-100 continental samples above 2 km are nontrivial"), bAbove2Pass);
+	TestTrue(TEXT("Step-100 continental samples above 5 km are nontrivial"), bAbove5Pass);
+	TestTrue(TEXT("Step-100 tectonic maintenance footprint stays below 10k samples"), bMaintenancePass);
+	TestTrue(TEXT("Step-100 Andean tag footprint stays below 15k samples"), bAndeanPass);
+	TestTrue(TEXT("Step-100 ownership churn stays below 5%"), bChurnPass);
+	TestTrue(TEXT("Step-100 boundary coherence stays above 0.93"), bCoherencePass);
+	TestTrue(TEXT("Step-100 interior leakage stays below 0.17"), bLeakagePass);
+	TestTrue(TEXT("Step-100 elevation-jump interior leaks stay below 30"), bElevationJumpLeakPass);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6BoundaryFieldCouplingDiagnosticStep100Test,
+	"Aurous.TectonicPlanet.V6BoundaryFieldCouplingDiagnosticStep100Test",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6BoundaryFieldCouplingDiagnosticStep100Test::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+
+	FTectonicPlanetV6 ControlPlanet = CreateInitializedPlanetV6WithConfig(
+		ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+		FixedIntervalSteps,
+		INDEX_NONE,
+		SampleCount,
+		PlateCount,
+		TestRandomSeed);
+	ConfigureBoundaryFieldCouplingVariant(ControlPlanet, false);
+
+	FTectonicPlanetV6 CandidatePlanet = CreateInitializedPlanetV6WithConfig(
+		ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+		FixedIntervalSteps,
+		INDEX_NONE,
+		SampleCount,
+		PlateCount,
+		TestRandomSeed);
+	ConfigureBoundaryFieldCouplingVariant(CandidatePlanet, true);
+
+	ControlPlanet.AdvanceSteps(100);
+	CandidatePlanet.AdvanceSteps(100);
+
+	TestTrue(TEXT("Control reached step 100"), ControlPlanet.GetPlanet().CurrentStep == 100);
+	TestTrue(TEXT("Candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep == 100);
+
+	const FBoundaryFieldCouplingVariantDiagnostics Control =
+		BuildBoundaryFieldCouplingVariantDiagnostics(TEXT("A_control_pre_uplift_fix"), ControlPlanet);
+	const FBoundaryFieldCouplingVariantDiagnostics Candidate =
+		BuildBoundaryFieldCouplingVariantDiagnostics(TEXT("B_candidate_thesis_scale_relief"), CandidatePlanet);
+
+	TestTrue(
+		TEXT("Control resolved sample diagnostics captured"),
+		ControlPlanet.GetLastResolvedSamplesForTest().Num() == SampleCount);
+	TestTrue(
+		TEXT("Candidate resolved sample diagnostics captured"),
+		CandidatePlanet.GetLastResolvedSamplesForTest().Num() == SampleCount);
+
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("cw_threshold_mismatch_count"),
+		Control.CwThresholdMismatchCount,
+		Candidate.CwThresholdMismatchCount);
+	for (int32 BucketIndex = 0;
+		BucketIndex < static_cast<int32>(EBoundaryFieldCouplingProvenanceBucket::Count);
+		++BucketIndex)
+	{
+		const FString MetricName = FString::Printf(
+			TEXT("cw_threshold_mismatch_provenance_%s"),
+			GetBoundaryFieldCouplingProvenanceName(
+				static_cast<EBoundaryFieldCouplingProvenanceBucket>(BucketIndex)));
+		AddBoundaryFieldCouplingAggregateComparison(
+			*this,
+			MetricName,
+			Control.CwThresholdMismatchByProvenance[BucketIndex],
+			Candidate.CwThresholdMismatchByProvenance[BucketIndex]);
+	}
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("cw_threshold_mismatch_mean_active_ring_distance"),
+		Control.MeanMismatchNearestActiveZoneRingDistance,
+		Candidate.MeanMismatchNearestActiveZoneRingDistance);
+
+	const auto& ControlBand = Control.BoundaryBandDelta;
+	const auto& CandidateBand = Candidate.BoundaryBandDelta;
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("active_band_plus_one_sample_count"),
+		ControlBand.SampleCount,
+		CandidateBand.SampleCount);
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("active_band_plus_one_mean_abs_cw_delta"),
+		ControlBand.SampleCount > 0
+			? ControlBand.SumAbsCwDelta / static_cast<double>(ControlBand.SampleCount)
+			: 0.0,
+		CandidateBand.SampleCount > 0
+			? CandidateBand.SumAbsCwDelta / static_cast<double>(CandidateBand.SampleCount)
+			: 0.0);
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("active_band_plus_one_max_abs_cw_delta"),
+		ControlBand.MaxAbsCwDelta,
+		CandidateBand.MaxAbsCwDelta);
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("active_band_plus_one_mean_abs_elev_delta"),
+		ControlBand.SampleCount > 0
+			? ControlBand.SumAbsElevationDeltaKm / static_cast<double>(ControlBand.SampleCount)
+			: 0.0,
+		CandidateBand.SampleCount > 0
+			? CandidateBand.SumAbsElevationDeltaKm / static_cast<double>(CandidateBand.SampleCount)
+			: 0.0);
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("active_band_plus_one_max_abs_elev_delta"),
+		ControlBand.MaxAbsElevationDeltaKm,
+		CandidateBand.MaxAbsElevationDeltaKm);
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("active_band_plus_one_cw_threshold_cross_fraction"),
+		ControlBand.SampleCount > 0
+			? static_cast<double>(ControlBand.ThresholdCrossCount) /
+				static_cast<double>(ControlBand.SampleCount)
+			: 0.0,
+		CandidateBand.SampleCount > 0
+			? static_cast<double>(CandidateBand.ThresholdCrossCount) /
+				static_cast<double>(CandidateBand.SampleCount)
+			: 0.0);
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("active_band_plus_one_ownership_retention_rate"),
+		ControlBand.SampleCount > 0
+			? static_cast<double>(ControlBand.OwnershipRetainedCount) /
+				static_cast<double>(ControlBand.SampleCount)
+			: 0.0,
+		CandidateBand.SampleCount > 0
+			? static_cast<double>(CandidateBand.OwnershipRetainedCount) /
+				static_cast<double>(CandidateBand.SampleCount)
+			: 0.0);
+
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("synthetic_missed_again_count"),
+		Control.SyntheticMissedAgainCount,
+		Candidate.SyntheticMissedAgainCount);
+	for (int32 BucketIndex = 0;
+		BucketIndex < static_cast<int32>(EBoundaryFieldCouplingProvenanceBucket::Count);
+		++BucketIndex)
+	{
+		const FString MetricName = FString::Printf(
+			TEXT("synthetic_missed_again_prev_provenance_%s"),
+			GetBoundaryFieldCouplingProvenanceName(
+				static_cast<EBoundaryFieldCouplingProvenanceBucket>(BucketIndex)));
+		AddBoundaryFieldCouplingAggregateComparison(
+			*this,
+			MetricName,
+			Control.SyntheticMissedAgainByPreviousProvenance[BucketIndex],
+			Candidate.SyntheticMissedAgainByPreviousProvenance[BucketIndex]);
+	}
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("synthetic_missed_again_near_convergent_front"),
+		Control.SyntheticMissedAgainNearConvergentFrontCount,
+		Candidate.SyntheticMissedAgainNearConvergentFrontCount);
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("synthetic_missed_again_with_cw_delta"),
+		Control.SyntheticMissedAgainWithCwDeltaCount,
+		Candidate.SyntheticMissedAgainWithCwDeltaCount);
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("synthetic_missed_again_mean_abs_cw_delta"),
+		Control.SyntheticMissedAgainMeanAbsCwDelta,
+		Candidate.SyntheticMissedAgainMeanAbsCwDelta);
+	AddBoundaryFieldCouplingLog(
+		*this,
+		FString::Printf(
+			TEXT("[BoundaryFieldCoupling metric=synthetic_miss_lineage_age_distribution] A=%s B=%s"),
+			*FormatBoundaryFieldCouplingAgeDistribution(Control.SyntheticMissLineageAgeCounts),
+			*FormatBoundaryFieldCouplingAgeDistribution(Candidate.SyntheticMissLineageAgeCounts)));
+
+	AddBoundaryFieldCouplingAggregateComparison(
+		*this,
+		TEXT("interior_leak_count"),
+		Control.TotalInteriorLeakCount,
+		Candidate.TotalInteriorLeakCount);
+	for (int32 CauseIndex = 0;
+		CauseIndex < static_cast<int32>(EBoundaryFieldCouplingLeakCause::Count);
+		++CauseIndex)
+	{
+		const FString MetricName = FString::Printf(
+			TEXT("interior_leak_cause_%s"),
+			GetBoundaryFieldCouplingLeakCauseName(
+				static_cast<EBoundaryFieldCouplingLeakCause>(CauseIndex)));
+		AddBoundaryFieldCouplingAggregateComparison(
+			*this,
+			MetricName,
+			Control.InteriorLeakCauseCounts[CauseIndex],
+			Candidate.InteriorLeakCauseCounts[CauseIndex]);
+	}
+	for (int32 ProximityIndex = 0;
+		ProximityIndex < static_cast<int32>(EBoundaryFieldCouplingProximityBucket::Count);
+		++ProximityIndex)
+	{
+		const FString MetricName = FString::Printf(
+			TEXT("interior_leak_proximity_%s"),
+			GetBoundaryFieldCouplingProximityName(
+				static_cast<EBoundaryFieldCouplingProximityBucket>(ProximityIndex)));
+	AddBoundaryFieldCouplingAggregateComparison(
+			*this,
+			MetricName,
+			Control.InteriorLeakProximityCounts[ProximityIndex],
+			Candidate.InteriorLeakProximityCounts[ProximityIndex]);
+	}
+
+	AddV6ThesisRemeshInfo(*this, TEXT("[BoundaryFieldCoupling A step=100]"), Control.Snapshot);
+	AddV6BoundaryCoherenceInfo(*this, TEXT("[BoundaryFieldCoupling A step=100]"), Control.Snapshot);
+	AddV6SyntheticCoveragePersistenceInfo(*this, TEXT("[BoundaryFieldCoupling A step=100]"), Control.Snapshot);
+	AddV6ThesisRemeshInfo(*this, TEXT("[BoundaryFieldCoupling B step=100]"), Candidate.Snapshot);
+	AddV6BoundaryCoherenceInfo(*this, TEXT("[BoundaryFieldCoupling B step=100]"), Candidate.Snapshot);
+	AddV6SyntheticCoveragePersistenceInfo(*this, TEXT("[BoundaryFieldCoupling B step=100]"), Candidate.Snapshot);
+
+	AddBoundaryFieldCouplingVariantTopLogs(*this, Control);
+	AddBoundaryFieldCouplingVariantTopLogs(*this, Candidate);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FTectonicPlanetV6V9Phase1dCollisionShadowValidationTest,
 	"Aurous.TectonicPlanet.V6V9Phase1dCollisionShadowValidationTest",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -7468,5 +8737,294 @@ bool FTectonicPlanetV6V9Phase1dTerraneCaptureRefinementTuningHarnessTest::RunTes
 
 	TestTrue(TEXT("Terrane-capture baseline reached step 100"), BaselinePlanet.GetPlanet().CurrentStep >= 100);
 	TestTrue(TEXT("Terrane-capture candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep >= 100);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9Phase1dThesisShapedCollisionHarnessTest,
+	"Aurous.TectonicPlanet.V6V9Phase1dThesisShapedCollisionHarnessTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9Phase1dThesisShapedCollisionHarnessTest::RunTest(
+	const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	const FString RunId = TEXT("V9Phase1dThesisShapedCollisionHarness");
+
+	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+			FixedIntervalSteps,
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			TestRandomSeed);
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9CollisionShadowForTest(true);
+		Planet.SetV9CollisionExecutionForTest(true);
+		return Planet;
+	};
+
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
+	BaselinePlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+	BaselinePlanet.SetV9CollisionExecutionStructuralTransferForTest(true);
+	BaselinePlanet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
+	CandidatePlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+	CandidatePlanet.SetV9CollisionExecutionStructuralTransferForTest(true);
+	CandidatePlanet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+	CandidatePlanet.SetV9ThesisShapedCollisionExecutionForTest(true);
+
+	const FString ExportRoot = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	const FString BaselineExportRoot = FPaths::Combine(ExportRoot, TEXT("baseline"));
+	const FString CandidateExportRoot = FPaths::Combine(ExportRoot, TEXT("candidate"));
+
+	const auto CaptureCheckpoint =
+		[this](FTectonicPlanetV6& Planet, const FString& VariantTag,
+			const FString& VariantExportRoot, const int32 Step, const bool bFullExports) -> FV6CheckpointSnapshot
+	{
+		if (bFullExports)
+		{
+			ExportV6CheckpointMaps(*this, Planet, VariantExportRoot, Step);
+			ExportV6DebugOverlays(*this, Planet, VariantExportRoot, Step);
+		}
+		ExportV6CollisionTuningInnerLoopOverlays(*this, Planet, VariantExportRoot, Step);
+
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+		const FString Tag = FString::Printf(TEXT("[V9ThesisShapedHarness %s]"), *VariantTag);
+		AddV6BoundaryCoherenceInfo(*this, Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, Tag, Snapshot);
+		AddV6CollisionShadowInfo(*this, Tag, Snapshot);
+		AddV6CollisionExecutionInfo(*this, Tag, Snapshot);
+		return Snapshot;
+	};
+
+	const auto LogComparison =
+		[this, SampleCount](const int32 Step,
+			const FV6CheckpointSnapshot& Baseline,
+			const FV6CheckpointSnapshot& Candidate)
+	{
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& BExec = Baseline.CollisionExecution;
+		const FTectonicPlanetV6CollisionExecutionDiagnostic& CExec = Candidate.CollisionExecution;
+		const FString CompareMessage = FString::Printf(
+			TEXT("[V9ThesisShapedHarness compare step=%d] ")
+			TEXT("churn=%.4f/%.4f coherence=%.4f/%.4f interior_leakage=%.4f/%.4f ")
+			TEXT("active_fraction=%.4f/%.4f ")
+			TEXT("exec_current=%d/%d exec_cumulative=%d/%d ")
+			TEXT("affected=%d/%d cumulative_affected=%d/%d ")
+			TEXT("continental_gain=%d/%d cumulative_continental_gain=%d/%d ")
+			TEXT("ownership_change=%d/%d cumulative_ownership_change=%d/%d ")
+			TEXT("transfer=%d/%d cumulative_transfer=%d/%d ")
+			TEXT("terrane_component=0/%d transferred_component=0/%d ")
+			TEXT("xi=0.000/%.6f rel_speed=0.000/%.3f ")
+			TEXT("mean_elev_delta_km=%.6f/%.6f max_elev_delta_km=%.6f/%.6f ")
+			TEXT("cumulative_mean_elev_delta_km=%.6f/%.6f ")
+			TEXT("donor_share_delta=%.6f/%.6f recipient_share_delta=%.6f/%.6f"),
+			Step,
+			Baseline.OwnershipChurn.ChurnFraction,
+			Candidate.OwnershipChurn.ChurnFraction,
+			Baseline.BoundaryCoherence.BoundaryCoherenceScore,
+			Candidate.BoundaryCoherence.BoundaryCoherenceScore,
+			Baseline.BoundaryCoherence.InteriorLeakageFraction,
+			Candidate.BoundaryCoherence.InteriorLeakageFraction,
+			Baseline.ActiveZone.ActiveFraction,
+			Candidate.ActiveZone.ActiveFraction,
+			BExec.ExecutedCollisionCount,
+			CExec.ExecutedCollisionCount,
+			BExec.CumulativeExecutedCollisionCount,
+			CExec.CumulativeExecutedCollisionCount,
+			BExec.CollisionAffectedSampleCount,
+			CExec.CollisionAffectedSampleCount,
+			BExec.CumulativeCollisionAffectedSampleCount,
+			CExec.CumulativeCollisionAffectedSampleCount,
+			BExec.CollisionDrivenContinentalGainCount,
+			CExec.CollisionDrivenContinentalGainCount,
+			BExec.CumulativeCollisionDrivenContinentalGainCount,
+			CExec.CumulativeCollisionDrivenContinentalGainCount,
+			BExec.CollisionDrivenOwnershipChangeCount,
+			CExec.CollisionDrivenOwnershipChangeCount,
+			BExec.CumulativeCollisionDrivenOwnershipChangeCount,
+			CExec.CumulativeCollisionDrivenOwnershipChangeCount,
+			BExec.CollisionTransferredSampleCount,
+			CExec.CollisionTransferredSampleCount,
+			BExec.CumulativeCollisionTransferredSampleCount,
+			CExec.CumulativeCollisionTransferredSampleCount,
+			CExec.ExecutedDonorTerraneComponentSize,
+			CExec.ExecutedTransferredComponentSize,
+			CExec.ExecutedXi,
+			CExec.ExecutedRelativeSpeedKmPerMy,
+			BExec.ExecutedMeanElevationDeltaKm,
+			CExec.ExecutedMeanElevationDeltaKm,
+			BExec.ExecutedMaxElevationDeltaKm,
+			CExec.ExecutedMaxElevationDeltaKm,
+			BExec.CumulativeMeanElevationDeltaKm,
+			CExec.CumulativeMeanElevationDeltaKm,
+			BExec.ExecutedDonorPlateShareDelta,
+			CExec.ExecutedDonorPlateShareDelta,
+			BExec.ExecutedRecipientPlateShareDelta,
+			CExec.ExecutedRecipientPlateShareDelta);
+		AddInfo(CompareMessage);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *CompareMessage);
+	};
+
+	const auto LogContinentalElevation =
+		[this](const FString& VariantTag, const int32 Step, const FTectonicPlanetV6& Planet)
+	{
+		const FV9ContinentalElevationStats Elev = ComputeContinentalElevationStats(Planet);
+		const FString Message = FString::Printf(
+			TEXT("[V9ThesisShapedHarness %s step=%d] continental_count=%d mean_elev_km=%.4f p95_elev_km=%.4f max_elev_km=%.4f above_2km=%d above_5km=%d"),
+			*VariantTag, Step,
+			Elev.ContinentalSampleCount,
+			Elev.MeanElevationKm,
+			Elev.P95ElevationKm,
+			Elev.MaxElevationKm,
+			Elev.SamplesAbove2Km,
+			Elev.SamplesAbove5Km);
+		AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	};
+
+	const auto ExportElevationOverlay =
+		[this](const FTectonicPlanetV6& Planet, const FString& VariantExportRoot, const int32 Step)
+	{
+		const FString OutputDirectory = FPaths::Combine(
+			VariantExportRoot, FString::Printf(TEXT("step_%03d"), Step));
+		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+		PlatformFile.CreateDirectoryTree(*OutputDirectory);
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		const int32 SC = PlanetData.Samples.Num();
+		if (SC == 0) { return; }
+
+		TArray<float> ElevValues;
+		ElevValues.SetNum(SC);
+		for (int32 I = 0; I < SC; ++I)
+		{
+			ElevValues[I] = PlanetData.Samples[I].Elevation;
+		}
+		FString Error;
+		const FString OutputPath = FPaths::Combine(OutputDirectory, TEXT("Elevation.png"));
+		TectonicMollweideExporter::ExportScalarOverlay(
+			PlanetData, ElevValues, -10.0f, 10.0f,
+			OutputPath, TestExportWidth, TestExportHeight, Error);
+
+		const TArray<uint8>& TerraneMask = Planet.GetThesisCollisionTerraneComponentMaskForTest();
+		if (TerraneMask.Num() == SC)
+		{
+			TArray<float> TerraneValues;
+			TerraneValues.SetNum(SC);
+			for (int32 I = 0; I < SC; ++I)
+			{
+				TerraneValues[I] = TerraneMask[I] != 0 ? 1.0f : 0.0f;
+			}
+			const FString TerranePath = FPaths::Combine(OutputDirectory, TEXT("CollisionTerraneComponentMask.png"));
+			TectonicMollweideExporter::ExportScalarOverlay(
+				PlanetData, TerraneValues, 0.0f, 1.0f,
+				TerranePath, TestExportWidth, TestExportHeight, Error);
+		}
+	};
+
+	// --- Step 25 ---
+	BaselinePlanet.AdvanceSteps(25);
+	CandidatePlanet.AdvanceSteps(25);
+	const FV6CheckpointSnapshot BaselineStep25 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_structural"), BaselineExportRoot, 25, false);
+	const FV6CheckpointSnapshot CandidateStep25 =
+		CaptureCheckpoint(CandidatePlanet, TEXT("candidate_thesis_shaped"), CandidateExportRoot, 25, false);
+	LogComparison(25, BaselineStep25, CandidateStep25);
+	LogContinentalElevation(TEXT("baseline"), 25, BaselinePlanet);
+	LogContinentalElevation(TEXT("candidate"), 25, CandidatePlanet);
+	ExportElevationOverlay(CandidatePlanet, CandidateExportRoot, 25);
+
+	// --- Step 100 ---
+	BaselinePlanet.AdvanceSteps(75);
+	CandidatePlanet.AdvanceSteps(75);
+	const FV6CheckpointSnapshot BaselineStep100 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_structural"), BaselineExportRoot, 100, false);
+	const FV6CheckpointSnapshot CandidateStep100 =
+		CaptureCheckpoint(CandidatePlanet, TEXT("candidate_thesis_shaped"), CandidateExportRoot, 100, false);
+	LogComparison(100, BaselineStep100, CandidateStep100);
+	LogContinentalElevation(TEXT("baseline"), 100, BaselinePlanet);
+	LogContinentalElevation(TEXT("candidate"), 100, CandidatePlanet);
+	ExportElevationOverlay(CandidatePlanet, CandidateExportRoot, 100);
+
+	// --- Step-100 gate ---
+	const FV9ThesisShapedCollisionGateResult Gate =
+		EvaluateV9ThesisShapedCollisionStep100Gate(BaselineStep100, CandidateStep100, SampleCount);
+
+	const FTectonicPlanetV6CollisionExecutionDiagnostic& CandidateExec = CandidateStep100.CollisionExecution;
+	const FString GateMessage = FString::Printf(
+		TEXT("[V9ThesisShapedHarness gate step=100] run_step200=%d ")
+		TEXT("terrane_detected=%d candidate_terrane=%d required_terrane=%d ")
+		TEXT("transfer_coherent=%d candidate_transfer=%d required_transfer=%d ")
+		TEXT("ownership_material=%d candidate_ownership=%d required_ownership=%d ")
+		TEXT("affected_footprint=%d candidate_affected=%d required_affected=%d ")
+		TEXT("elevation=%d candidate_cum_mean_elev=%.6f required_elev=%.6f ")
+		TEXT("continental_gain=%d candidate_gain=%d baseline_gain=%d ")
+		TEXT("churn=%d candidate_churn=%.4f max_churn=%.4f ")
+		TEXT("coherence=%d candidate_coherence=%.4f min_coherence=%.4f ")
+		TEXT("leakage=%d candidate_leakage=%.4f max_leakage=%.4f"),
+		Gate.bAllowStep200 ? 1 : 0,
+		Gate.bTerraneDetectedPass ? 1 : 0,
+		CandidateExec.ExecutedDonorTerraneComponentSize,
+		Gate.RequiredMinTerraneComponentSize,
+		Gate.bTransferCoherentPass ? 1 : 0,
+		CandidateExec.CumulativeCollisionTransferredSampleCount,
+		Gate.RequiredMinTransferSize,
+		Gate.bOwnershipMaterialPass ? 1 : 0,
+		CandidateExec.CumulativeCollisionDrivenOwnershipChangeCount,
+		Gate.RequiredMinOwnershipChange,
+		Gate.bAffectedFootprintPass ? 1 : 0,
+		CandidateExec.CumulativeCollisionAffectedSampleCount,
+		Gate.RequiredMinAffectedSamples,
+		Gate.bElevationPass ? 1 : 0,
+		CandidateExec.CumulativeMeanElevationDeltaKm,
+		Gate.RequiredMinMeanElevationDeltaKm,
+		Gate.bContinentalGainPass ? 1 : 0,
+		CandidateExec.CumulativeCollisionDrivenContinentalGainCount,
+		BaselineStep100.CollisionExecution.CumulativeCollisionDrivenContinentalGainCount,
+		Gate.bChurnPass ? 1 : 0,
+		CandidateStep100.OwnershipChurn.ChurnFraction,
+		Gate.MaxAllowedChurn,
+		Gate.bCoherencePass ? 1 : 0,
+		CandidateStep100.BoundaryCoherence.BoundaryCoherenceScore,
+		Gate.MinAllowedCoherence,
+		Gate.bLeakagePass ? 1 : 0,
+		CandidateStep100.BoundaryCoherence.InteriorLeakageFraction,
+		Gate.MaxAllowedInteriorLeakage);
+	AddInfo(GateMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *GateMessage);
+
+	if (Gate.bAllowStep200)
+	{
+		BaselinePlanet.AdvanceSteps(100);
+		CandidatePlanet.AdvanceSteps(100);
+		const FV6CheckpointSnapshot BaselineStep200 =
+			CaptureCheckpoint(BaselinePlanet, TEXT("baseline_structural"), BaselineExportRoot, 200, true);
+		const FV6CheckpointSnapshot CandidateStep200 =
+			CaptureCheckpoint(CandidatePlanet, TEXT("candidate_thesis_shaped"), CandidateExportRoot, 200, true);
+		LogComparison(200, BaselineStep200, CandidateStep200);
+		LogContinentalElevation(TEXT("baseline"), 200, BaselinePlanet);
+		LogContinentalElevation(TEXT("candidate"), 200, CandidatePlanet);
+		ExportElevationOverlay(CandidatePlanet, CandidateExportRoot, 200);
+		TestTrue(TEXT("Thesis-shaped candidate promoted to step 200 when gates pass"),
+			CandidatePlanet.GetPlanet().CurrentStep == 200);
+	}
+	else
+	{
+		TestTrue(TEXT("Thesis-shaped candidate rejected before step 200"),
+			CandidatePlanet.GetPlanet().CurrentStep == 100);
+	}
+
+	TestTrue(TEXT("Thesis-shaped baseline reached step 100"), BaselinePlanet.GetPlanet().CurrentStep >= 100);
+	TestTrue(TEXT("Thesis-shaped candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep >= 100);
 	return true;
 }
