@@ -939,6 +939,8 @@ struct AUROUS_API FTectonicPlanetV6CollisionExecutionDiagnostic
 	int32 CollisionTransferredSampleCount = 0;
 	int32 CollisionTransferredContinentalSampleCount = 0;
 	int32 CooldownSuppressedQualifiedCount = 0;
+	int32 PlateConflictSuppressedQualifiedCount = 0;
+	int32 OverlapSuppressedQualifiedCount = 0;
 	int32 QualifiedButUnexecutedCount = 0;
 	int32 ExecutedEffectiveMassSampleCount = 0;
 	int32 ExecutedTransferRejectedByLocalityCount = 0;
@@ -969,6 +971,13 @@ struct AUROUS_API FTectonicPlanetV6CollisionExecutionDiagnostic
 	double ExecutedTerraneAreaSr = 0.0;
 	double ExecutedXi = 0.0;
 	double ExecutedRelativeSpeedKmPerMy = 0.0;
+	FVector3d ExecutedSutureAxis = FVector3d::ZeroVector;
+	double ExecutedSutureHalfWidthRad = 0.0;
+	double ExecutedSutureBeltLengthEstimateRad = 0.0;
+	double ExecutedMeanAbsAlongSutureRad = 0.0;
+	double ExecutedMeanAbsPerpendicularRad = 0.0;
+	int32 ExecutedRidgeCoreAffectedSampleCount = 0;
+	int32 ExecutedRidgeFlankAffectedSampleCount = 0;
 };
 
 struct AUROUS_API FTectonicPlanetV6
@@ -1108,6 +1117,7 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetV9CollisionExecutionStructuralTransferForTest(bool bEnable);
 	void SetV9CollisionExecutionRefinedStructuralTransferForTest(bool bEnable);
 	void SetV9ThesisShapedCollisionExecutionForTest(bool bEnable);
+	void SetV9ThesisShapedCollisionRidgeSurgeForTest(bool bEnable);
 	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
 	void SetUseLinearConvergentMaintenanceInfluenceForTest(bool bEnableLinear);
 
@@ -1264,6 +1274,7 @@ private:
 	bool bEnableV9CollisionExecutionStructuralTransferForTest = false;
 	bool bEnableV9CollisionExecutionRefinedStructuralTransferForTest = false;
 	bool bEnableV9ThesisShapedCollisionExecutionForTest = false;
+	bool bEnableV9ThesisShapedCollisionRidgeSurgeForTest = false;
 	bool bUseLinearConvergentMaintenanceSpeedFactorForTest = true;
 	bool bUseLinearConvergentMaintenanceInfluenceForTest = true;
 	TArray<uint8> CurrentSolveThesisCollisionTerraneComponentMask;

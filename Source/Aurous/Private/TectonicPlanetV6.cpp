@@ -2595,6 +2595,1492 @@ namespace
 			InOutCumulativeContinentalGainCount);
 	}
 
+	void ExecuteV9ThesisShapedCollisionEventRedesign(
+		FTectonicPlanet& Planet,
+		const TArray<FTectonicPlanetV6ResolvedSample>& ResolvedSamples,
+		const FTectonicPlanetV6CollisionShadowDiagnostic& ShadowDiagnostic,
+		const bool bUseRidgeConcentratedSurge,
+		TMap<uint64, int32>& InOutLastExecutedSolveIndexByKey,
+		const int32 CurrentSolveIndex,
+		TArray<uint8>& OutExecutionMask,
+		TArray<uint8>& OutTransferMask,
+		TArray<uint8>& OutTerraneComponentMask,
+		TArray<uint8>& InOutCumulativeExecutionMask,
+		TArray<uint8>& InOutCumulativeTransferMask,
+		TArray<float>& InOutCumulativeElevationDeltaMaskKm,
+		TArray<float>& InOutCumulativeContinentalGainMask,
+		FTectonicPlanetV6CollisionExecutionDiagnostic& OutDiagnostic,
+		int32& InOutCumulativeExecutionCount,
+		int32& InOutCumulativeAffectedSampleVisits,
+		int32& InOutCumulativeContinentalGainCount,
+		int32& InOutCumulativeOwnershipChangeCount,
+		int32& InOutCumulativeTransferredSampleVisits,
+		int32& InOutCumulativeTransferredContinentalSampleCount,
+		double& InOutCumulativeElevationDeltaKm,
+		double& InOutCumulativeMaxElevationDeltaKm)
+	{
+		constexpr int32 CollisionExecutionPairCooldownSolves = 3;
+		constexpr int32 MaxCollisionExecutionsPerSolve = 3;
+		constexpr double CollisionGlobalDistanceRad = 0.659;
+		constexpr double MinCollisionRadiusRad = 0.05;
+		constexpr double MinTerraneDetectionRadiusRad = 0.08;
+		constexpr double MaxAllowedEventOverlapFraction = 0.65;
+		constexpr int32 MinThesisTransferSamples = 18;
+		constexpr int32 MaxThesisTransferSamples = 96;
+		constexpr double MaxPerSampleSurgeDeltaKm = 3.25;
+		constexpr double MaxPerSampleTransferDeltaKm = 0.85;
+		constexpr double CollisionCoefficient = 0.013;
+
+		struct FThesisTransferCandidate
+		{
+			int32 SampleIndex = INDEX_NONE;
+			double DistanceFromFrontKm = TNumericLimits<double>::Max();
+			bool bBoundaryLocal = false;
+		};
+
+		struct FPlannedThesisCollisionEvent
+		{
+			const FTectonicPlanetV6CollisionShadowTopPair* Pair = nullptr;
+			uint64 PairKey = 0;
+			int32 OverridingPlateId = INDEX_NONE;
+			int32 SubductingPlateId = INDEX_NONE;
+			FVector3d CollisionCenter = FVector3d::ZeroVector;
+			TArray<int32> SeedSampleIndices;
+			TArray<int32> CollisionSeedSampleIndices;
+			TArray<int32> TerraneComponentIndices;
+			TArray<FThesisTransferCandidate> TransferCandidates;
+			int32 TransferRejectedByLocalityCount = 0;
+			int32 TransferRejectedByContinentalityCount = 0;
+			int32 TransferRejectedByCapCount = 0;
+			int32 TransferRejectedByConnectivityCount = 0;
+			int32 TransferCandidateSupportCount = 0;
+			int32 TransferAnchorSeedCount = 0;
+			int32 DonorTerraneComponentSize = 0;
+			int32 MaxTransferSamples = 0;
+			int32 EffectiveMassSampleCount = 0;
+			double RelativeSpeedKmPerMy = 0.0;
+			double TerraneAreaSr = 0.0;
+			double Xi = 0.0;
+			double SurgeRadiusRad = 0.0;
+			double TransferInfluenceRadiusRad = 0.0;
+			double CollisionStrength01 = 0.0;
+			double CollisionCoefficientScale = 1.0;
+			FVector3d SutureFallbackAxis = FVector3d::ZeroVector;
+		};
+
+		struct FReservedInfluenceZone
+		{
+			FVector3d Center = FVector3d::ZeroVector;
+			double RadiusRad = 0.0;
+		};
+
+		OutDiagnostic = FTectonicPlanetV6CollisionExecutionDiagnostic{};
+		OutExecutionMask.Init(0, Planet.Samples.Num());
+		OutTransferMask.Init(0, Planet.Samples.Num());
+		OutTerraneComponentMask.Init(0, Planet.Samples.Num());
+		OutDiagnostic.CumulativeExecutedCollisionCount = InOutCumulativeExecutionCount;
+		if (InOutCumulativeExecutionMask.Num() != Planet.Samples.Num())
+		{
+			InOutCumulativeExecutionMask.Init(0, Planet.Samples.Num());
+		}
+		if (InOutCumulativeTransferMask.Num() != Planet.Samples.Num())
+		{
+			InOutCumulativeTransferMask.Init(0, Planet.Samples.Num());
+		}
+		if (InOutCumulativeElevationDeltaMaskKm.Num() != Planet.Samples.Num())
+		{
+			InOutCumulativeElevationDeltaMaskKm.Init(0.0f, Planet.Samples.Num());
+		}
+		if (InOutCumulativeContinentalGainMask.Num() != Planet.Samples.Num())
+		{
+			InOutCumulativeContinentalGainMask.Init(0.0f, Planet.Samples.Num());
+		}
+		OutDiagnostic.CumulativeCollisionAffectedSampleVisits = InOutCumulativeAffectedSampleVisits;
+		OutDiagnostic.CumulativeCollisionDrivenContinentalGainCount = InOutCumulativeContinentalGainCount;
+		OutDiagnostic.CumulativeCollisionDrivenOwnershipChangeCount = InOutCumulativeOwnershipChangeCount;
+		OutDiagnostic.CumulativeCollisionTransferredSampleVisits = InOutCumulativeTransferredSampleVisits;
+		OutDiagnostic.CumulativeCollisionTransferredContinentalSampleCount =
+			InOutCumulativeTransferredContinentalSampleCount;
+		OutDiagnostic.CumulativeMeanElevationDeltaKm =
+			InOutCumulativeAffectedSampleVisits > 0
+				? InOutCumulativeElevationDeltaKm /
+					static_cast<double>(InOutCumulativeAffectedSampleVisits)
+				: 0.0;
+		OutDiagnostic.CumulativeMaxElevationDeltaKm = InOutCumulativeMaxElevationDeltaKm;
+		for (const uint8 Value : InOutCumulativeExecutionMask)
+		{
+			OutDiagnostic.CumulativeCollisionAffectedSampleCount += Value != 0 ? 1 : 0;
+		}
+		for (const uint8 Value : InOutCumulativeTransferMask)
+		{
+			OutDiagnostic.CumulativeCollisionTransferredSampleCount += Value != 0 ? 1 : 0;
+		}
+		ResetV9CollisionExecutionLegacyStats(Planet);
+
+		if (Planet.Samples.IsEmpty() || ResolvedSamples.Num() != Planet.Samples.Num())
+		{
+			return;
+		}
+
+		const double AverageSampleAreaSr = (4.0 * PI) / static_cast<double>(Planet.Samples.Num());
+		const double TypicalPlateSize =
+			static_cast<double>(Planet.Samples.Num()) /
+			static_cast<double>(FMath::Max(Planet.Plates.Num(), 1));
+
+		const auto CountSamplesForPlate =
+			[&Planet](const int32 PlateId)
+		{
+			int32 Count = 0;
+			for (const FSample& Sample : Planet.Samples)
+			{
+				Count += Sample.PlateId == PlateId ? 1 : 0;
+			}
+			return Count;
+		};
+
+		const auto BuildCollisionSutureFrame =
+			[&Planet](
+				const FVector3d& CollisionCenter,
+				const TArray<int32>& PreferredSampleIndices,
+				const TArray<int32>& SecondarySampleIndices,
+				const FVector3d& FallbackAxis,
+				FVector3d& OutSutureAxis,
+				FVector3d& OutPerpendicularAxis,
+				double& OutBeltLengthEstimateRad) -> bool
+		{
+			OutSutureAxis = FVector3d::ZeroVector;
+			OutPerpendicularAxis = FVector3d::ZeroVector;
+			OutBeltLengthEstimateRad = 0.0;
+
+			const FVector3d CenterNormal = CollisionCenter.GetSafeNormal();
+			if (CenterNormal.IsNearlyZero())
+			{
+				return false;
+			}
+
+			auto BuildBasisFromSamples =
+				[&Planet, &CenterNormal](
+					const TArray<int32>& SampleIndices,
+					FVector3d& OutBasisX,
+					FVector3d& OutBasisY) -> bool
+			{
+				for (const int32 SampleIndex : SampleIndices)
+				{
+					if (!Planet.Samples.IsValidIndex(SampleIndex))
+					{
+						continue;
+					}
+					const FVector3d SampleNormal =
+						Planet.Samples[SampleIndex].Position.GetSafeNormal();
+					const FVector3d TangentProjection =
+						SampleNormal - (CenterNormal * FVector3d::DotProduct(SampleNormal, CenterNormal));
+					if (TangentProjection.SquaredLength() <= UE_DOUBLE_SMALL_NUMBER)
+					{
+						continue;
+					}
+					OutBasisX = TangentProjection.GetSafeNormal();
+					OutBasisY = FVector3d::CrossProduct(CenterNormal, OutBasisX).GetSafeNormal();
+					return !OutBasisY.IsNearlyZero();
+				}
+				return false;
+			};
+
+			FVector3d BasisX = FVector3d::ZeroVector;
+			FVector3d BasisY = FVector3d::ZeroVector;
+			if (!BuildBasisFromSamples(PreferredSampleIndices, BasisX, BasisY) &&
+				!BuildBasisFromSamples(SecondarySampleIndices, BasisX, BasisY))
+			{
+				const FVector3d FallbackTangent =
+					FallbackAxis - (CenterNormal * FVector3d::DotProduct(FallbackAxis, CenterNormal));
+				if (FallbackTangent.SquaredLength() <= UE_DOUBLE_SMALL_NUMBER)
+				{
+					return false;
+				}
+				BasisX = FallbackTangent.GetSafeNormal();
+				BasisY = FVector3d::CrossProduct(CenterNormal, BasisX).GetSafeNormal();
+				if (BasisY.IsNearlyZero())
+				{
+					return false;
+				}
+			}
+
+			TArray<FVector2d> ProjectedPoints;
+			ProjectedPoints.Reserve(PreferredSampleIndices.Num() + SecondarySampleIndices.Num());
+			auto AppendProjectedPoints =
+				[&Planet, &CenterNormal, &BasisX, &BasisY, &ProjectedPoints](
+					const TArray<int32>& SampleIndices)
+			{
+				for (const int32 SampleIndex : SampleIndices)
+				{
+					if (!Planet.Samples.IsValidIndex(SampleIndex))
+					{
+						continue;
+					}
+					const FVector3d SampleNormal =
+						Planet.Samples[SampleIndex].Position.GetSafeNormal();
+					const double AngularDistance =
+						ComputeGeodesicDistance(CenterNormal, SampleNormal);
+					if (AngularDistance <= UE_DOUBLE_SMALL_NUMBER)
+					{
+						continue;
+					}
+					const FVector3d TangentProjection =
+						SampleNormal - (CenterNormal * FVector3d::DotProduct(SampleNormal, CenterNormal));
+					if (TangentProjection.SquaredLength() <= UE_DOUBLE_SMALL_NUMBER)
+					{
+						continue;
+					}
+					const FVector3d TangentDirection = TangentProjection.GetSafeNormal();
+					ProjectedPoints.Add(
+						FVector2d(
+							FVector3d::DotProduct(TangentDirection, BasisX) * AngularDistance,
+							FVector3d::DotProduct(TangentDirection, BasisY) * AngularDistance));
+				}
+			};
+
+			AppendProjectedPoints(PreferredSampleIndices);
+			AppendProjectedPoints(SecondarySampleIndices);
+
+			if (ProjectedPoints.Num() < 2)
+			{
+				OutSutureAxis = BasisX;
+				OutPerpendicularAxis = BasisY;
+				OutBeltLengthEstimateRad = 0.0;
+				return true;
+			}
+
+			int32 BestI = 0;
+			int32 BestJ = 1;
+			double BestDistanceSquared = 0.0;
+			for (int32 I = 0; I < ProjectedPoints.Num(); ++I)
+			{
+				for (int32 J = I + 1; J < ProjectedPoints.Num(); ++J)
+				{
+					const double DistanceSquared =
+						(ProjectedPoints[J] - ProjectedPoints[I]).SquaredLength();
+					if (DistanceSquared > BestDistanceSquared)
+					{
+						BestDistanceSquared = DistanceSquared;
+						BestI = I;
+						BestJ = J;
+					}
+				}
+			}
+
+			const FVector2d Axis2D =
+				(ProjectedPoints[BestJ] - ProjectedPoints[BestI]).GetSafeNormal();
+			if (!Axis2D.IsNearlyZero())
+			{
+				OutSutureAxis =
+					((BasisX * Axis2D.X) + (BasisY * Axis2D.Y)).GetSafeNormal();
+			}
+			if (OutSutureAxis.IsNearlyZero())
+			{
+				OutSutureAxis = BasisX;
+			}
+			OutPerpendicularAxis =
+				FVector3d::CrossProduct(CenterNormal, OutSutureAxis).GetSafeNormal();
+			if (OutPerpendicularAxis.IsNearlyZero())
+			{
+				return false;
+			}
+
+			double MaxAbsAlongRad = 0.0;
+			for (const FVector2d& Point : ProjectedPoints)
+			{
+				const double AlongRad = FMath::Abs((Point.X * Axis2D.X) + (Point.Y * Axis2D.Y));
+				MaxAbsAlongRad = FMath::Max(MaxAbsAlongRad, AlongRad);
+			}
+			OutBeltLengthEstimateRad = MaxAbsAlongRad * 2.0;
+			return true;
+		};
+
+		const auto ProjectOntoCollisionSuture =
+			[](const FVector3d& CollisionCenter,
+				const FVector3d& SutureAxis,
+				const FVector3d& PerpendicularAxis,
+				const FVector3d& SamplePosition,
+				double& OutAlongRad,
+				double& OutPerpendicularRad)
+		{
+			OutAlongRad = 0.0;
+			OutPerpendicularRad = 0.0;
+			const FVector3d CenterNormal = CollisionCenter.GetSafeNormal();
+			const FVector3d SampleNormal = SamplePosition.GetSafeNormal();
+			const double AngularDistance =
+				ComputeGeodesicDistance(CenterNormal, SampleNormal);
+			if (AngularDistance <= UE_DOUBLE_SMALL_NUMBER)
+			{
+				return;
+			}
+			const FVector3d TangentProjection =
+				SampleNormal - (CenterNormal * FVector3d::DotProduct(SampleNormal, CenterNormal));
+			if (TangentProjection.SquaredLength() <= UE_DOUBLE_SMALL_NUMBER)
+			{
+				return;
+			}
+			const FVector3d TangentDirection = TangentProjection.GetSafeNormal();
+			OutAlongRad =
+				FVector3d::DotProduct(TangentDirection, SutureAxis) * AngularDistance;
+			OutPerpendicularRad =
+				FVector3d::DotProduct(TangentDirection, PerpendicularAxis) * AngularDistance;
+		};
+
+		TArray<FTectonicPlanetV6CollisionShadowTopPair> ExecutionPairs = ShadowDiagnostic.TopPairs;
+		ExecutionPairs.Sort([](
+			const FTectonicPlanetV6CollisionShadowTopPair& Left,
+			const FTectonicPlanetV6CollisionShadowTopPair& Right)
+		{
+			if (Left.bQualified != Right.bQualified) { return Left.bQualified; }
+			if (Left.CollisionSampleCount != Right.CollisionSampleCount)
+			{
+				return Left.CollisionSampleCount > Right.CollisionSampleCount;
+			}
+			if (Left.ObservationCount != Right.ObservationCount)
+			{
+				return Left.ObservationCount > Right.ObservationCount;
+			}
+			if (!FMath::IsNearlyEqual(
+					Left.AccumulatedPenetrationKm,
+					Right.AccumulatedPenetrationKm,
+					TriangleEpsilon))
+			{
+				return Left.AccumulatedPenetrationKm > Right.AccumulatedPenetrationKm;
+			}
+			if (Left.ContinentalQualifiedSampleCount != Right.ContinentalQualifiedSampleCount)
+			{
+				return Left.ContinentalQualifiedSampleCount > Right.ContinentalQualifiedSampleCount;
+			}
+			if (Left.SupportSampleCount != Right.SupportSampleCount)
+			{
+				return Left.SupportSampleCount > Right.SupportSampleCount;
+			}
+			return Left.PlateA < Right.PlateA ||
+				(Left.PlateA == Right.PlateA && Left.PlateB < Right.PlateB);
+		});
+
+		int32 QualifiedCount = 0;
+		for (const FTectonicPlanetV6CollisionShadowTopPair& Pair : ExecutionPairs)
+		{
+			QualifiedCount += Pair.bQualified ? 1 : 0;
+		}
+
+		const auto TryBuildPlan =
+			[&Planet,
+			 &ResolvedSamples,
+			 AverageSampleAreaSr,
+			 TypicalPlateSize,
+			 CollisionGlobalDistanceRad,
+			 MinTerraneDetectionRadiusRad,
+			 MinCollisionRadiusRad,
+			 MinThesisTransferSamples,
+			 MaxThesisTransferSamples](
+				const FTectonicPlanetV6CollisionShadowTopPair& Pair,
+				FPlannedThesisCollisionEvent& OutPlan) -> bool
+		{
+			OutPlan = FPlannedThesisCollisionEvent{};
+			OutPlan.Pair = &Pair;
+			OutPlan.PairKey = MakeOrderedPlatePairKey(Pair.PlateA, Pair.PlateB);
+			OutPlan.OverridingPlateId =
+				IsOverridingPlateLocal(Planet, Pair.PlateA, Pair.PlateB)
+					? Pair.PlateA
+					: Pair.PlateB;
+			OutPlan.SubductingPlateId =
+				OutPlan.OverridingPlateId == Pair.PlateA ? Pair.PlateB : Pair.PlateA;
+
+			FVector3d CenterSum = FVector3d::ZeroVector;
+			for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+			{
+				if (!ResolvedSamples.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+				const FTectonicPlanetV6ResolvedSample& Resolved = ResolvedSamples[SampleIndex];
+				if (!Resolved.bActiveZoneSample ||
+					Resolved.ActiveZonePrimaryPlateId == INDEX_NONE ||
+					Resolved.ActiveZoneSecondaryPlateId == INDEX_NONE ||
+					(Resolved.ActiveZoneCause != ETectonicPlanetV6ActiveZoneCause::ConvergentSubduction &&
+						Resolved.ActiveZoneCause != ETectonicPlanetV6ActiveZoneCause::CollisionContact))
+				{
+					continue;
+				}
+				if (MakeOrderedPlatePairKey(
+						Resolved.ActiveZonePrimaryPlateId,
+						Resolved.ActiveZoneSecondaryPlateId) != OutPlan.PairKey)
+				{
+					continue;
+				}
+
+				OutPlan.SeedSampleIndices.Add(SampleIndex);
+				CenterSum += Planet.Samples[SampleIndex].Position;
+				if (Resolved.ActiveZoneCause == ETectonicPlanetV6ActiveZoneCause::CollisionContact)
+				{
+					OutPlan.CollisionSeedSampleIndices.Add(SampleIndex);
+				}
+			}
+
+			if (OutPlan.SeedSampleIndices.IsEmpty())
+			{
+				return false;
+			}
+
+			OutPlan.CollisionCenter = CenterSum.GetSafeNormal();
+			if (OutPlan.CollisionCenter.IsNearlyZero())
+			{
+				OutPlan.CollisionCenter =
+					Planet.Samples[OutPlan.SeedSampleIndices[0]].Position.GetSafeNormal();
+			}
+			if (OutPlan.CollisionCenter.IsNearlyZero())
+			{
+				return false;
+			}
+
+			const FPlate* OverridingPlate = FindPlateById(Planet, OutPlan.OverridingPlateId);
+			const FPlate* SubductingPlate = FindPlateById(Planet, OutPlan.SubductingPlateId);
+			if (OverridingPlate == nullptr || SubductingPlate == nullptr)
+			{
+				return false;
+			}
+
+			const auto IsRecipientAdjacent =
+				[&Planet, &OutPlan](const int32 SampleIndex) -> bool
+			{
+				if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+				{
+					return false;
+				}
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (Planet.Samples.IsValidIndex(NeighborIndex) &&
+						Planet.Samples[NeighborIndex].PlateId == OutPlan.OverridingPlateId)
+					{
+						return true;
+					}
+				}
+				return false;
+			};
+
+			TArray<int32> DonorSeedSampleIndices;
+			DonorSeedSampleIndices.Reserve(Pair.SupportSampleCount);
+			TArray<int32> BoundaryAnchorSeedSampleIndices;
+			BoundaryAnchorSeedSampleIndices.Reserve(Pair.SupportSampleCount);
+			TArray<uint8> BoundaryLocalFlags;
+			BoundaryLocalFlags.Init(0, Planet.Samples.Num());
+
+			const auto TryAddDonorSeed =
+				[&Planet,
+				 &OutPlan,
+				 &DonorSeedSampleIndices,
+				 &BoundaryAnchorSeedSampleIndices,
+				 &BoundaryLocalFlags,
+				 &IsRecipientAdjacent](const int32 SampleIndex, int32& InOutRejectedByContinentality)
+			{
+				if (!Planet.Samples.IsValidIndex(SampleIndex))
+				{
+					return;
+				}
+
+				const FSample& Sample = Planet.Samples[SampleIndex];
+				if (Sample.PlateId == OutPlan.SubductingPlateId &&
+					Sample.ContinentalWeight >= 0.5f)
+				{
+					DonorSeedSampleIndices.AddUnique(SampleIndex);
+					if (IsRecipientAdjacent(SampleIndex))
+					{
+						BoundaryAnchorSeedSampleIndices.AddUnique(SampleIndex);
+						BoundaryLocalFlags[SampleIndex] = 1;
+					}
+				}
+				else if (Sample.PlateId == OutPlan.SubductingPlateId)
+				{
+					++InOutRejectedByContinentality;
+				}
+			};
+
+			for (const int32 SampleIndex : OutPlan.CollisionSeedSampleIndices)
+			{
+				TryAddDonorSeed(SampleIndex, OutPlan.TransferRejectedByContinentalityCount);
+			}
+			for (const int32 SampleIndex : OutPlan.SeedSampleIndices)
+			{
+				TryAddDonorSeed(SampleIndex, OutPlan.TransferRejectedByContinentalityCount);
+			}
+			if (DonorSeedSampleIndices.IsEmpty())
+			{
+				for (const int32 SeedSampleIndex : OutPlan.SeedSampleIndices)
+				{
+					if (!Planet.SampleAdjacency.IsValidIndex(SeedSampleIndex))
+					{
+						continue;
+					}
+					for (const int32 NeighborIndex : Planet.SampleAdjacency[SeedSampleIndex])
+					{
+						TryAddDonorSeed(NeighborIndex, OutPlan.TransferRejectedByContinentalityCount);
+					}
+				}
+			}
+			if (DonorSeedSampleIndices.IsEmpty())
+			{
+				return false;
+			}
+
+			for (const int32 AnchorSampleIndex : BoundaryAnchorSeedSampleIndices)
+			{
+				if (!Planet.SampleAdjacency.IsValidIndex(AnchorSampleIndex))
+				{
+					continue;
+				}
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[AnchorSampleIndex])
+				{
+					if (!Planet.Samples.IsValidIndex(NeighborIndex))
+					{
+						continue;
+					}
+					const FSample& NeighborSample = Planet.Samples[NeighborIndex];
+					if (NeighborSample.PlateId == OutPlan.SubductingPlateId &&
+						NeighborSample.ContinentalWeight >= 0.5f)
+					{
+						BoundaryLocalFlags[NeighborIndex] = 1;
+					}
+				}
+			}
+
+			const FVector3d OverridingAxis = OverridingPlate->RotationAxis.IsNearlyZero()
+				? FVector3d::ZeroVector
+				: OverridingPlate->RotationAxis.GetSafeNormal();
+			const FVector3d SubductingAxis = SubductingPlate->RotationAxis.IsNearlyZero()
+				? FVector3d::ZeroVector
+				: SubductingPlate->RotationAxis.GetSafeNormal();
+			const FVector3d OverridingVelocity =
+				FVector3d::CrossProduct(
+					OverridingAxis * OverridingPlate->AngularSpeed,
+					OutPlan.CollisionCenter);
+			const FVector3d SubductingVelocity =
+				FVector3d::CrossProduct(
+					SubductingAxis * SubductingPlate->AngularSpeed,
+					OutPlan.CollisionCenter);
+			const FVector3d RelativeVelocity =
+				OverridingVelocity - SubductingVelocity;
+			OutPlan.RelativeSpeedKmPerMy =
+				(RelativeVelocity.Length() * Planet.PlanetRadiusKm) /
+				FMath::Max(DeltaTimeMyears, UE_DOUBLE_SMALL_NUMBER);
+			OutPlan.SutureFallbackAxis =
+				FVector3d::CrossProduct(
+					OutPlan.CollisionCenter,
+					RelativeVelocity).GetSafeNormal();
+
+			const double SpeedFraction = FMath::Clamp(
+				FMath::Max(OutPlan.RelativeSpeedKmPerMy, 0.0) /
+					FMath::Max(MaxPlateSpeedKmPerMy, UE_DOUBLE_SMALL_NUMBER),
+				0.0,
+				4.0);
+			const double SupportAreaFraction =
+				static_cast<double>(FMath::Max3(
+					Pair.ContinentalQualifiedSampleCount,
+					FMath::Max(Pair.SupportSampleCount / 2, 1),
+					FMath::Max(OutPlan.SeedSampleIndices.Num(), 1))) /
+				FMath::Max(TypicalPlateSize, 1.0);
+			const double PreliminaryXi =
+				FMath::Sqrt(FMath::Clamp(SpeedFraction * SupportAreaFraction, 0.0, 4.0));
+			const double TerraneDetectionRadiusRad = FMath::Min(
+				CollisionGlobalDistanceRad,
+				FMath::Max(
+					CollisionGlobalDistanceRad * FMath::Max(PreliminaryXi, 0.22),
+					MinTerraneDetectionRadiusRad));
+			const double MaxTerraneDetectionDistanceKm =
+				TerraneDetectionRadiusRad * Planet.PlanetRadiusKm;
+
+			TArray<double> BestTerraneDistanceKm;
+			BestTerraneDistanceKm.Init(TNumericLimits<double>::Max(), Planet.Samples.Num());
+			TArray<uint8> TerraneFlags;
+			TerraneFlags.Init(0, Planet.Samples.Num());
+			TArray<int32> TerraneFrontier =
+				!BoundaryAnchorSeedSampleIndices.IsEmpty()
+					? BoundaryAnchorSeedSampleIndices
+					: DonorSeedSampleIndices;
+			for (const int32 SeedIndex : TerraneFrontier)
+			{
+				if (BestTerraneDistanceKm.IsValidIndex(SeedIndex))
+				{
+					BestTerraneDistanceKm[SeedIndex] = 0.0;
+				}
+			}
+
+			while (!TerraneFrontier.IsEmpty())
+			{
+				int32 BestFrontierIndex = 0;
+				double BestFrontierDistanceKm = BestTerraneDistanceKm[TerraneFrontier[0]];
+				for (int32 FrontierIndex = 1; FrontierIndex < TerraneFrontier.Num(); ++FrontierIndex)
+				{
+					const double CandidateDistanceKm = BestTerraneDistanceKm[TerraneFrontier[FrontierIndex]];
+					if (CandidateDistanceKm < BestFrontierDistanceKm)
+					{
+						BestFrontierIndex = FrontierIndex;
+						BestFrontierDistanceKm = CandidateDistanceKm;
+					}
+				}
+
+				const int32 SampleIndex = TerraneFrontier[BestFrontierIndex];
+				TerraneFrontier.RemoveAtSwap(BestFrontierIndex, 1, EAllowShrinking::No);
+				if (!Planet.Samples.IsValidIndex(SampleIndex) || TerraneFlags[SampleIndex] != 0)
+				{
+					continue;
+				}
+
+				const FSample& Sample = Planet.Samples[SampleIndex];
+				if (Sample.PlateId != OutPlan.SubductingPlateId ||
+					Sample.ContinentalWeight < 0.5f)
+				{
+					continue;
+				}
+
+				const double CenterDistanceKm =
+					ComputeGeodesicDistance(
+						Sample.Position.GetSafeNormal(),
+						OutPlan.CollisionCenter) * Planet.PlanetRadiusKm;
+				if (CenterDistanceKm > MaxTerraneDetectionDistanceKm + UE_DOUBLE_SMALL_NUMBER ||
+					BestFrontierDistanceKm > MaxTerraneDetectionDistanceKm + UE_DOUBLE_SMALL_NUMBER)
+				{
+					continue;
+				}
+
+				TerraneFlags[SampleIndex] = 1;
+				OutPlan.TerraneComponentIndices.Add(SampleIndex);
+				if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				const FVector3d SamplePosition = Sample.Position.GetSafeNormal();
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (!Planet.Samples.IsValidIndex(NeighborIndex) || TerraneFlags[NeighborIndex] != 0)
+					{
+						continue;
+					}
+					const FSample& NeighborSample = Planet.Samples[NeighborIndex];
+					if (NeighborSample.PlateId != OutPlan.SubductingPlateId ||
+						NeighborSample.ContinentalWeight < 0.5f)
+					{
+						continue;
+					}
+
+					const double EdgeDistanceKm =
+						ComputeGeodesicDistance(
+							SamplePosition,
+							NeighborSample.Position.GetSafeNormal()) * Planet.PlanetRadiusKm;
+					const double CandidateDistanceKm = BestFrontierDistanceKm + EdgeDistanceKm;
+					if (CandidateDistanceKm + UE_DOUBLE_SMALL_NUMBER < BestTerraneDistanceKm[NeighborIndex] &&
+						CandidateDistanceKm <= MaxTerraneDetectionDistanceKm + UE_DOUBLE_SMALL_NUMBER)
+					{
+						BestTerraneDistanceKm[NeighborIndex] = CandidateDistanceKm;
+						TerraneFrontier.Add(NeighborIndex);
+					}
+				}
+			}
+
+			OutPlan.DonorTerraneComponentSize = OutPlan.TerraneComponentIndices.Num();
+			if (OutPlan.DonorTerraneComponentSize == 0)
+			{
+				return false;
+			}
+
+			OutPlan.TerraneAreaSr =
+				static_cast<double>(OutPlan.DonorTerraneComponentSize) * AverageSampleAreaSr;
+			const double A0Sr =
+				(4.0 * PI) / static_cast<double>(FMath::Max(Planet.Plates.Num(), 1));
+			const double TerraneAreaFraction =
+				OutPlan.TerraneAreaSr / FMath::Max(A0Sr, UE_DOUBLE_SMALL_NUMBER);
+			OutPlan.Xi =
+				FMath::Sqrt(FMath::Clamp(SpeedFraction * TerraneAreaFraction, 0.0, 4.0));
+
+			const double ObservationStrength = FMath::Clamp(
+				(static_cast<double>(Pair.ObservationCount) - 3.0) / 9.0,
+				0.0,
+				1.0);
+			const double PenetrationStrength = FMath::Clamp(
+				(Pair.AccumulatedPenetrationKm - 3000.0) / 9000.0,
+				0.0,
+				1.0);
+			const double ContinentalStrength = FMath::Clamp(
+				static_cast<double>(Pair.ContinentalQualifiedSampleCount) / 24.0,
+				0.0,
+				1.0);
+			OutPlan.CollisionStrength01 = FMath::Clamp(
+				(0.45 * ObservationStrength) +
+				(0.35 * PenetrationStrength) +
+				(0.20 * ContinentalStrength),
+				0.0,
+				1.0);
+			OutPlan.CollisionCoefficientScale = 1.0 + (0.85 * OutPlan.CollisionStrength01);
+			OutPlan.SurgeRadiusRad = FMath::Min(
+				CollisionGlobalDistanceRad,
+				FMath::Max(
+					CollisionGlobalDistanceRad * FMath::Min(OutPlan.Xi, 1.0),
+					MinCollisionRadiusRad));
+
+			const double PatchSupportStrength = FMath::Clamp(
+				static_cast<double>(FMath::Max(BoundaryAnchorSeedSampleIndices.Num(), 1)) / 18.0,
+				0.0,
+				1.0);
+			OutPlan.TransferInfluenceRadiusRad = FMath::Min(
+				CollisionGlobalDistanceRad,
+				FMath::Max(
+					MinCollisionRadiusRad * 1.6,
+					OutPlan.SurgeRadiusRad *
+						(1.15 + (0.35 * PenetrationStrength) + (0.20 * ContinentalStrength) +
+							(0.15 * PatchSupportStrength))));
+
+			const double MaxTransferDistanceKm =
+				OutPlan.TransferInfluenceRadiusRad * Planet.PlanetRadiusKm;
+			TArray<double> BestTransferDistanceKm;
+			BestTransferDistanceKm.Init(TNumericLimits<double>::Max(), Planet.Samples.Num());
+			TArray<uint8> AddedTransferCandidateFlags;
+			AddedTransferCandidateFlags.Init(0, Planet.Samples.Num());
+			TArray<int32> TransferFrontier =
+				!BoundaryAnchorSeedSampleIndices.IsEmpty()
+					? BoundaryAnchorSeedSampleIndices
+					: DonorSeedSampleIndices;
+			for (const int32 SeedIndex : TransferFrontier)
+			{
+				if (BestTransferDistanceKm.IsValidIndex(SeedIndex))
+				{
+					BestTransferDistanceKm[SeedIndex] = 0.0;
+				}
+			}
+
+			while (!TransferFrontier.IsEmpty())
+			{
+				int32 BestFrontierIndex = 0;
+				double BestFrontierDistanceKm = BestTransferDistanceKm[TransferFrontier[0]];
+				for (int32 FrontierIndex = 1; FrontierIndex < TransferFrontier.Num(); ++FrontierIndex)
+				{
+					const double CandidateDistanceKm = BestTransferDistanceKm[TransferFrontier[FrontierIndex]];
+					if (CandidateDistanceKm < BestFrontierDistanceKm)
+					{
+						BestFrontierIndex = FrontierIndex;
+						BestFrontierDistanceKm = CandidateDistanceKm;
+					}
+				}
+
+				const int32 SampleIndex = TransferFrontier[BestFrontierIndex];
+				TransferFrontier.RemoveAtSwap(BestFrontierIndex, 1, EAllowShrinking::No);
+				if (!Planet.Samples.IsValidIndex(SampleIndex) ||
+					AddedTransferCandidateFlags[SampleIndex] != 0)
+				{
+					continue;
+				}
+
+				const FSample& Sample = Planet.Samples[SampleIndex];
+				if (Sample.PlateId != OutPlan.SubductingPlateId ||
+					Sample.ContinentalWeight < 0.5f)
+				{
+					++OutPlan.TransferRejectedByContinentalityCount;
+					continue;
+				}
+				if (TerraneFlags[SampleIndex] == 0)
+				{
+					++OutPlan.TransferRejectedByConnectivityCount;
+					continue;
+				}
+
+				const double CenterDistanceKm =
+					ComputeGeodesicDistance(
+						Sample.Position.GetSafeNormal(),
+						OutPlan.CollisionCenter) * Planet.PlanetRadiusKm;
+				if (CenterDistanceKm > (MaxTransferDistanceKm * 1.20) + UE_DOUBLE_SMALL_NUMBER ||
+					BestFrontierDistanceKm > MaxTransferDistanceKm + UE_DOUBLE_SMALL_NUMBER)
+				{
+					++OutPlan.TransferRejectedByLocalityCount;
+					continue;
+				}
+
+				const bool bDirectBoundaryLocal =
+					OutPlan.CollisionSeedSampleIndices.Contains(SampleIndex) ||
+					IsRecipientAdjacent(SampleIndex);
+				const bool bBoundaryLocal =
+					bDirectBoundaryLocal ||
+					(BoundaryLocalFlags.IsValidIndex(SampleIndex) &&
+						BoundaryLocalFlags[SampleIndex] != 0);
+				if (!bBoundaryLocal &&
+					BestFrontierDistanceKm > (MaxTransferDistanceKm * 0.55) + UE_DOUBLE_SMALL_NUMBER)
+				{
+					++OutPlan.TransferRejectedByLocalityCount;
+					continue;
+				}
+
+				AddedTransferCandidateFlags[SampleIndex] = 1;
+				OutPlan.TransferCandidates.Add(
+					{ SampleIndex, BestFrontierDistanceKm, bBoundaryLocal });
+
+				if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				const FVector3d SamplePosition = Sample.Position.GetSafeNormal();
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (!Planet.Samples.IsValidIndex(NeighborIndex) ||
+						AddedTransferCandidateFlags[NeighborIndex] != 0 ||
+						TerraneFlags[NeighborIndex] == 0)
+					{
+						continue;
+					}
+					const FSample& NeighborSample = Planet.Samples[NeighborIndex];
+					if (NeighborSample.PlateId != OutPlan.SubductingPlateId ||
+						NeighborSample.ContinentalWeight < 0.5f)
+					{
+						continue;
+					}
+
+					const double EdgeDistanceKm =
+						ComputeGeodesicDistance(
+							SamplePosition,
+							NeighborSample.Position.GetSafeNormal()) * Planet.PlanetRadiusKm;
+					const double CandidateDistanceKm = BestFrontierDistanceKm + EdgeDistanceKm;
+					if (CandidateDistanceKm + UE_DOUBLE_SMALL_NUMBER < BestTransferDistanceKm[NeighborIndex] &&
+						CandidateDistanceKm <= MaxTransferDistanceKm + UE_DOUBLE_SMALL_NUMBER)
+					{
+						BestTransferDistanceKm[NeighborIndex] = CandidateDistanceKm;
+						TransferFrontier.Add(NeighborIndex);
+					}
+				}
+			}
+
+			OutPlan.TransferCandidateSupportCount = OutPlan.TransferCandidates.Num();
+			OutPlan.TransferAnchorSeedCount =
+				!BoundaryAnchorSeedSampleIndices.IsEmpty()
+					? BoundaryAnchorSeedSampleIndices.Num()
+					: DonorSeedSampleIndices.Num();
+			if (OutPlan.TransferCandidates.IsEmpty())
+			{
+				return false;
+			}
+
+			OutPlan.TransferCandidates.Sort([](
+				const FThesisTransferCandidate& Left,
+				const FThesisTransferCandidate& Right)
+			{
+				if (Left.bBoundaryLocal != Right.bBoundaryLocal)
+				{
+					return Left.bBoundaryLocal;
+				}
+				if (!FMath::IsNearlyEqual(
+						Left.DistanceFromFrontKm,
+						Right.DistanceFromFrontKm,
+						TriangleEpsilon))
+				{
+					return Left.DistanceFromFrontKm < Right.DistanceFromFrontKm;
+				}
+				return Left.SampleIndex < Right.SampleIndex;
+			});
+
+			OutPlan.MaxTransferSamples = FMath::Clamp(
+				FMath::Max3(
+					MinThesisTransferSamples,
+					FMath::Min(
+						OutPlan.TransferCandidateSupportCount,
+						FMath::Max(
+							Pair.ContinentalQualifiedSampleCount * 2,
+							FMath::Max(12, OutPlan.TransferAnchorSeedCount * 3))),
+					FMath::Min(
+						OutPlan.TransferCandidateSupportCount,
+						FMath::Max(
+							OutPlan.DonorTerraneComponentSize / 3,
+							FMath::Max(Pair.SupportSampleCount / 2, 18)))),
+				MinThesisTransferSamples,
+				MaxThesisTransferSamples);
+			OutPlan.EffectiveMassSampleCount = FMath::Max3(
+				OutPlan.DonorTerraneComponentSize,
+				FMath::Max(Pair.SupportSampleCount, 1),
+				FMath::Max(Pair.ContinentalQualifiedSampleCount * 2, 1));
+			return true;
+		};
+
+		TSet<int32> UsedPlateIds;
+		TArray<FReservedInfluenceZone> ReservedZones;
+		ReservedZones.Reserve(MaxCollisionExecutionsPerSolve);
+		int32 ExecutedCollisionCount = 0;
+		int32 CurrentSolveContinentalGainCount = 0;
+		int32 CurrentSolveOwnershipChangeCount = 0;
+		int32 CurrentSolveTransferredSampleCount = 0;
+		int32 CurrentSolveTransferredContinentalSampleCount = 0;
+		double CurrentSolveTotalElevationDeltaKm = 0.0;
+		double CurrentSolveMaxElevationDeltaKm = 0.0;
+		bool bRepresentativeEventSet = false;
+
+		for (const FTectonicPlanetV6CollisionShadowTopPair& Pair : ExecutionPairs)
+		{
+			if (!Pair.bQualified)
+			{
+				continue;
+			}
+
+			const uint64 PairKey = MakeOrderedPlatePairKey(Pair.PlateA, Pair.PlateB);
+			if (const int32* LastExecutedSolveIndex = InOutLastExecutedSolveIndexByKey.Find(PairKey))
+			{
+				if ((CurrentSolveIndex - *LastExecutedSolveIndex) <= CollisionExecutionPairCooldownSolves)
+				{
+					++OutDiagnostic.CooldownSuppressedQualifiedCount;
+					continue;
+				}
+			}
+
+			if (UsedPlateIds.Contains(Pair.PlateA) || UsedPlateIds.Contains(Pair.PlateB))
+			{
+				++OutDiagnostic.PlateConflictSuppressedQualifiedCount;
+				continue;
+			}
+
+			FPlannedThesisCollisionEvent Plan;
+			if (!TryBuildPlan(Pair, Plan))
+			{
+				continue;
+			}
+
+			bool bOverlapsReservedZone = false;
+			for (const FReservedInfluenceZone& Zone : ReservedZones)
+			{
+				const double CenterDistanceRad =
+					ComputeGeodesicDistance(Plan.CollisionCenter, Zone.Center);
+				if (CenterDistanceRad <
+					(Plan.SurgeRadiusRad + Zone.RadiusRad) * MaxAllowedEventOverlapFraction)
+				{
+					bOverlapsReservedZone = true;
+					break;
+				}
+			}
+			if (bOverlapsReservedZone)
+			{
+				++OutDiagnostic.OverlapSuppressedQualifiedCount;
+				continue;
+			}
+
+			for (const int32 SampleIndex : Plan.TerraneComponentIndices)
+			{
+				OutTerraneComponentMask[SampleIndex] = 1;
+			}
+
+			const int32 DonorSamplesBefore = CountSamplesForPlate(Plan.SubductingPlateId);
+			const int32 RecipientSamplesBefore = CountSamplesForPlate(Plan.OverridingPlateId);
+			const double InverseSampleCount = 1.0 / static_cast<double>(Planet.Samples.Num());
+
+			TArray<int32> TransferredSampleIndices;
+			TransferredSampleIndices.Reserve(Plan.MaxTransferSamples);
+			int32 EventTransferredContinentalCount = 0;
+			int32 EventTransferBoundaryLocalCount = 0;
+			double EventTotalElevationDeltaKm = 0.0;
+			double EventMaxElevationDeltaKm = 0.0;
+
+			for (const FThesisTransferCandidate& Candidate : Plan.TransferCandidates)
+			{
+				if (TransferredSampleIndices.Num() >= Plan.MaxTransferSamples)
+				{
+					++Plan.TransferRejectedByCapCount;
+					continue;
+				}
+				if (!Planet.Samples.IsValidIndex(Candidate.SampleIndex))
+				{
+					continue;
+				}
+
+				FSample& Sample = Planet.Samples[Candidate.SampleIndex];
+				if (Sample.PlateId != Plan.SubductingPlateId ||
+					Sample.ContinentalWeight < 0.5f)
+				{
+					continue;
+				}
+
+				const float PreviousElevation = Sample.Elevation;
+				const double TransferKernel = FTectonicPlanet::CollisionBiweightKernel(
+					ComputeGeodesicDistance(
+						Sample.Position.GetSafeNormal(),
+						Plan.CollisionCenter),
+					FMath::Max(Plan.TransferInfluenceRadiusRad, MinCollisionRadiusRad));
+				const double StructuralElevationDeltaKm = FMath::Min(
+					MaxPerSampleTransferDeltaKm,
+					0.35 *
+						(0.95 + (0.45 * Plan.CollisionStrength01)) *
+						FMath::Max(TransferKernel, 0.30));
+
+				RemoveV6CarriedSampleForCanonicalVertex(
+					Planet, Plan.SubductingPlateId, Candidate.SampleIndex);
+				Sample.PlateId = Plan.OverridingPlateId;
+				Sample.ContinentalWeight = 1.0f;
+				Sample.Thickness = FMath::Max(
+					Sample.Thickness,
+					static_cast<float>(ContinentalThicknessKm));
+				Sample.Elevation = FMath::Clamp(
+					static_cast<float>(
+						static_cast<double>(Sample.Elevation) + StructuralElevationDeltaKm),
+					0.0f,
+					static_cast<float>(ElevationCeilingKm));
+				Sample.OrogenyType = EOrogenyType::Himalayan;
+				UpsertV6CarriedSampleForCanonicalVertex(
+					Planet, Plan.OverridingPlateId, Candidate.SampleIndex);
+
+				const double AppliedElevationDeltaKm =
+					static_cast<double>(Sample.Elevation - PreviousElevation);
+				EventTotalElevationDeltaKm += AppliedElevationDeltaKm;
+				EventMaxElevationDeltaKm =
+					FMath::Max(EventMaxElevationDeltaKm, AppliedElevationDeltaKm);
+				++EventTransferredContinentalCount;
+				EventTransferBoundaryLocalCount += Candidate.bBoundaryLocal ? 1 : 0;
+				TransferredSampleIndices.Add(Candidate.SampleIndex);
+				OutTransferMask[Candidate.SampleIndex] = 1;
+				InOutCumulativeTransferMask[Candidate.SampleIndex] = 1;
+				OutExecutionMask[Candidate.SampleIndex] = 1;
+				InOutCumulativeExecutionMask[Candidate.SampleIndex] = 1;
+				InOutCumulativeElevationDeltaMaskKm[Candidate.SampleIndex] +=
+					static_cast<float>(AppliedElevationDeltaKm);
+			}
+
+			if (TransferredSampleIndices.IsEmpty())
+			{
+				continue;
+			}
+
+			RebuildV6MembershipFromCanonical(Planet);
+			RecomputeV6BoundaryFlagsFromCanonical(Planet);
+
+			TArray<int32> EventAffectedSampleIndices;
+			EventAffectedSampleIndices.Reserve(Planet.Samples.Num() / 24);
+			int32 EventContinentalGainCount = 0;
+			FVector3d EventSutureAxis = FVector3d::ZeroVector;
+			FVector3d EventPerpendicularAxis = FVector3d::ZeroVector;
+			double EventSutureHalfWidthRad = 0.0;
+			double EventBeltLengthEstimateRad = 0.0;
+			double EventMeanAbsAlongSutureRad = 0.0;
+			double EventMeanAbsPerpendicularRad = 0.0;
+			int32 EventRidgeCoreAffectedCount = 0;
+			int32 EventRidgeFlankAffectedCount = 0;
+			const double TerraneAreaFraction =
+				static_cast<double>(Plan.DonorTerraneComponentSize) /
+				FMath::Max(TypicalPlateSize, 1.0);
+			const double SurgeMassFactor = FMath::Clamp(
+				(TerraneAreaFraction * 0.20) +
+					(static_cast<double>(Plan.Pair->ContinentalQualifiedSampleCount) /
+						FMath::Max(TypicalPlateSize, 1.0) * 0.08),
+				0.012,
+				0.085);
+			if (bUseRidgeConcentratedSurge)
+			{
+				BuildCollisionSutureFrame(
+					Plan.CollisionCenter,
+					TransferredSampleIndices,
+					Plan.CollisionSeedSampleIndices,
+					Plan.SutureFallbackAxis,
+					EventSutureAxis,
+					EventPerpendicularAxis,
+					EventBeltLengthEstimateRad);
+				EventSutureHalfWidthRad = FMath::Clamp(
+					Plan.SurgeRadiusRad * (0.24 + (0.04 * Plan.CollisionStrength01)),
+					0.015,
+					Plan.SurgeRadiusRad * 0.32);
+				EventBeltLengthEstimateRad = FMath::Max(
+					EventBeltLengthEstimateRad,
+					Plan.SurgeRadiusRad * 2.0);
+			}
+			const double RidgeEnergyCompensation =
+				(bUseRidgeConcentratedSurge && EventSutureHalfWidthRad > UE_DOUBLE_SMALL_NUMBER)
+					? FMath::Clamp(Plan.SurgeRadiusRad / EventSutureHalfWidthRad, 1.0, 4.0)
+					: 1.0;
+
+			for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+			{
+				FSample& Sample = Planet.Samples[SampleIndex];
+				const FVector3d SamplePosition = Sample.Position.GetSafeNormal();
+				double Kernel = 0.0;
+				double AlongSutureRad = 0.0;
+				double PerpendicularRad = 0.0;
+				if (bUseRidgeConcentratedSurge &&
+					!EventSutureAxis.IsNearlyZero() &&
+					!EventPerpendicularAxis.IsNearlyZero())
+				{
+					ProjectOntoCollisionSuture(
+						Plan.CollisionCenter,
+						EventSutureAxis,
+						EventPerpendicularAxis,
+						SamplePosition,
+						AlongSutureRad,
+						PerpendicularRad);
+					if (FMath::Abs(AlongSutureRad) >= Plan.SurgeRadiusRad ||
+						FMath::Abs(PerpendicularRad) >= EventSutureHalfWidthRad)
+					{
+						continue;
+					}
+					const double AlongKernel =
+						FTectonicPlanet::CollisionBiweightKernel(
+							FMath::Abs(AlongSutureRad),
+							Plan.SurgeRadiusRad);
+					const double PerpendicularKernel =
+						FTectonicPlanet::CollisionBiweightKernel(
+							FMath::Abs(PerpendicularRad),
+							EventSutureHalfWidthRad);
+					Kernel = AlongKernel * PerpendicularKernel * RidgeEnergyCompensation;
+				}
+				else
+				{
+					const double DistanceRad = ComputeGeodesicDistance(
+						SamplePosition,
+						Plan.CollisionCenter);
+					if (DistanceRad >= Plan.SurgeRadiusRad)
+					{
+						continue;
+					}
+					Kernel =
+						FTectonicPlanet::CollisionBiweightKernel(
+							DistanceRad,
+							Plan.SurgeRadiusRad);
+				}
+				if (Kernel <= 0.0)
+				{
+					continue;
+				}
+
+				const float PreviousContinentalWeight = Sample.ContinentalWeight;
+				const float PreviousElevation = Sample.Elevation;
+				const double RawElevationDeltaKm =
+					CollisionCoefficient *
+					Plan.CollisionCoefficientScale *
+					SurgeMassFactor *
+					Kernel *
+					Planet.PlanetRadiusKm;
+				const double ElevationDeltaKm =
+					FMath::Min(
+						RawElevationDeltaKm,
+						MaxPerSampleSurgeDeltaKm * FMath::Max(Kernel, 0.25));
+
+				Sample.Elevation = FMath::Clamp(
+					static_cast<float>(static_cast<double>(Sample.Elevation) + ElevationDeltaKm),
+					static_cast<float>(TrenchElevationKm),
+					static_cast<float>(ElevationCeilingKm));
+				if (Sample.Elevation < 0.0f)
+				{
+					Sample.Elevation = 0.0f;
+				}
+				if (Sample.Elevation > 0.0f)
+				{
+					Sample.OrogenyType = EOrogenyType::Himalayan;
+				}
+				Sample.ContinentalWeight = 1.0f;
+				Sample.Thickness = FMath::Max(
+					Sample.Thickness,
+					static_cast<float>(ContinentalThicknessKm));
+
+				const bool bContinentalGain =
+					PreviousContinentalWeight < 0.5f &&
+					Sample.ContinentalWeight >= 0.5f;
+				EventContinentalGainCount += bContinentalGain ? 1 : 0;
+				const double AppliedElevationDeltaKm =
+					static_cast<double>(Sample.Elevation - PreviousElevation);
+				EventTotalElevationDeltaKm += AppliedElevationDeltaKm;
+				EventMaxElevationDeltaKm =
+					FMath::Max(EventMaxElevationDeltaKm, AppliedElevationDeltaKm);
+				EventAffectedSampleIndices.Add(SampleIndex);
+				if (bUseRidgeConcentratedSurge)
+				{
+					EventMeanAbsAlongSutureRad += FMath::Abs(AlongSutureRad);
+					EventMeanAbsPerpendicularRad += FMath::Abs(PerpendicularRad);
+					if (FMath::Abs(PerpendicularRad) <= (EventSutureHalfWidthRad * 0.5))
+					{
+						++EventRidgeCoreAffectedCount;
+					}
+					else
+					{
+						++EventRidgeFlankAffectedCount;
+					}
+				}
+				if (OutExecutionMask[SampleIndex] == 0)
+				{
+					OutExecutionMask[SampleIndex] = 1;
+					InOutCumulativeExecutionMask[SampleIndex] = 1;
+				}
+				InOutCumulativeElevationDeltaMaskKm[SampleIndex] +=
+					static_cast<float>(AppliedElevationDeltaKm);
+				if (bContinentalGain)
+				{
+					InOutCumulativeContinentalGainMask[SampleIndex] += 1.0f;
+				}
+			}
+
+			if (bUseRidgeConcentratedSurge && !EventAffectedSampleIndices.IsEmpty())
+			{
+				EventMeanAbsAlongSutureRad /=
+					static_cast<double>(EventAffectedSampleIndices.Num());
+				EventMeanAbsPerpendicularRad /=
+					static_cast<double>(EventAffectedSampleIndices.Num());
+			}
+
+			SyncV6CarriedSamplesFromCanonicalIndices(Planet, EventAffectedSampleIndices);
+			Planet.ComputePlateScores();
+
+			const int32 DonorSamplesAfter = CountSamplesForPlate(Plan.SubductingPlateId);
+			const int32 RecipientSamplesAfter = CountSamplesForPlate(Plan.OverridingPlateId);
+			const double DonorPlateShareBefore =
+				static_cast<double>(DonorSamplesBefore) * InverseSampleCount;
+			const double DonorPlateShareAfter =
+				static_cast<double>(DonorSamplesAfter) * InverseSampleCount;
+			const double RecipientPlateShareBefore =
+				static_cast<double>(RecipientSamplesBefore) * InverseSampleCount;
+			const double RecipientPlateShareAfter =
+				static_cast<double>(RecipientSamplesAfter) * InverseSampleCount;
+
+			InOutLastExecutedSolveIndexByKey.Add(Plan.PairKey, CurrentSolveIndex);
+			++ExecutedCollisionCount;
+			++InOutCumulativeExecutionCount;
+			InOutCumulativeAffectedSampleVisits += EventAffectedSampleIndices.Num();
+			InOutCumulativeContinentalGainCount += EventContinentalGainCount;
+			InOutCumulativeOwnershipChangeCount += TransferredSampleIndices.Num();
+			InOutCumulativeTransferredSampleVisits += TransferredSampleIndices.Num();
+			InOutCumulativeTransferredContinentalSampleCount += EventTransferredContinentalCount;
+			InOutCumulativeElevationDeltaKm += EventTotalElevationDeltaKm;
+			InOutCumulativeMaxElevationDeltaKm =
+				FMath::Max(InOutCumulativeMaxElevationDeltaKm, EventMaxElevationDeltaKm);
+
+			CurrentSolveContinentalGainCount += EventContinentalGainCount;
+			CurrentSolveOwnershipChangeCount += TransferredSampleIndices.Num();
+			CurrentSolveTransferredSampleCount += TransferredSampleIndices.Num();
+			CurrentSolveTransferredContinentalSampleCount += EventTransferredContinentalCount;
+			CurrentSolveTotalElevationDeltaKm += EventTotalElevationDeltaKm;
+			CurrentSolveMaxElevationDeltaKm =
+				FMath::Max(CurrentSolveMaxElevationDeltaKm, EventMaxElevationDeltaKm);
+
+			if (!bRepresentativeEventSet)
+			{
+				bRepresentativeEventSet = true;
+				OutDiagnostic.ExecutedPlateA = Plan.Pair->PlateA;
+				OutDiagnostic.ExecutedPlateB = Plan.Pair->PlateB;
+				OutDiagnostic.ExecutedOverridingPlateId = Plan.OverridingPlateId;
+				OutDiagnostic.ExecutedSubductingPlateId = Plan.SubductingPlateId;
+				OutDiagnostic.ExecutedObservationCount = Plan.Pair->ObservationCount;
+				OutDiagnostic.ExecutedAccumulatedPenetrationKm = Plan.Pair->AccumulatedPenetrationKm;
+				OutDiagnostic.ExecutedMeanConvergenceKmPerMy = Plan.Pair->MeanConvergenceKmPerMy;
+				OutDiagnostic.ExecutedMaxConvergenceKmPerMy = Plan.Pair->MaxConvergenceKmPerMy;
+				OutDiagnostic.ExecutedSupportSampleCount = Plan.Pair->SupportSampleCount;
+				OutDiagnostic.ExecutedSupportTriangleCount = Plan.Pair->SupportTriangleCount;
+				OutDiagnostic.ExecutedContinentalSupportPlateACount =
+					Plan.Pair->ContinentalSupportPlateACount;
+				OutDiagnostic.ExecutedContinentalSupportPlateBCount =
+					Plan.Pair->ContinentalSupportPlateBCount;
+				OutDiagnostic.ExecutedContinentalQualifiedSampleCount =
+					Plan.Pair->ContinentalQualifiedSampleCount;
+				OutDiagnostic.ExecutedSeedSampleCount = Plan.SeedSampleIndices.Num();
+				OutDiagnostic.ExecutedCollisionSeedSampleCount = Plan.CollisionSeedSampleIndices.Num();
+				OutDiagnostic.ExecutedEffectiveMassSampleCount = Plan.EffectiveMassSampleCount;
+				OutDiagnostic.ExecutedTransferRejectedByLocalityCount =
+					Plan.TransferRejectedByLocalityCount;
+				OutDiagnostic.ExecutedTransferRejectedByContinentalityCount =
+					Plan.TransferRejectedByContinentalityCount;
+				OutDiagnostic.ExecutedTransferRejectedByCapCount =
+					Plan.TransferRejectedByCapCount;
+				OutDiagnostic.ExecutedTransferRejectedByConnectivityCount =
+					Plan.TransferRejectedByConnectivityCount;
+				OutDiagnostic.ExecutedTransferBoundaryLocalSampleCount =
+					EventTransferBoundaryLocalCount;
+				OutDiagnostic.ExecutedTransferCandidateSupportCount =
+					Plan.TransferCandidateSupportCount;
+				OutDiagnostic.ExecutedTransferAnchorSeedCount =
+					Plan.TransferAnchorSeedCount;
+				OutDiagnostic.ExecutedDonorTerraneComponentSize =
+					Plan.DonorTerraneComponentSize;
+				OutDiagnostic.ExecutedTransferredComponentSize =
+					TransferredSampleIndices.Num();
+				OutDiagnostic.ExecutedTerraneAreaSr = Plan.TerraneAreaSr;
+				OutDiagnostic.ExecutedXi = Plan.Xi;
+				OutDiagnostic.ExecutedRelativeSpeedKmPerMy = Plan.RelativeSpeedKmPerMy;
+				OutDiagnostic.ExecutedSutureAxis = EventSutureAxis;
+				OutDiagnostic.ExecutedSutureHalfWidthRad = EventSutureHalfWidthRad;
+				OutDiagnostic.ExecutedSutureBeltLengthEstimateRad = EventBeltLengthEstimateRad;
+				OutDiagnostic.ExecutedMeanAbsAlongSutureRad = EventMeanAbsAlongSutureRad;
+				OutDiagnostic.ExecutedMeanAbsPerpendicularRad = EventMeanAbsPerpendicularRad;
+				OutDiagnostic.ExecutedRidgeCoreAffectedSampleCount = EventRidgeCoreAffectedCount;
+				OutDiagnostic.ExecutedRidgeFlankAffectedSampleCount = EventRidgeFlankAffectedCount;
+				OutDiagnostic.ExecutedInfluenceRadiusRad = Plan.SurgeRadiusRad;
+				OutDiagnostic.ExecutedTransferInfluenceRadiusRad =
+					Plan.TransferInfluenceRadiusRad;
+				OutDiagnostic.ExecutedMeanElevationDeltaKm =
+					EventAffectedSampleIndices.IsEmpty()
+						? 0.0
+						: EventTotalElevationDeltaKm /
+							static_cast<double>(EventAffectedSampleIndices.Num());
+				OutDiagnostic.ExecutedMaxElevationDeltaKm = EventMaxElevationDeltaKm;
+				OutDiagnostic.ExecutedStrengthScale = Plan.CollisionCoefficientScale;
+				OutDiagnostic.ExecutedDonorPlateShareBefore = DonorPlateShareBefore;
+				OutDiagnostic.ExecutedDonorPlateShareAfter = DonorPlateShareAfter;
+				OutDiagnostic.ExecutedDonorPlateShareDelta =
+					DonorPlateShareAfter - DonorPlateShareBefore;
+				OutDiagnostic.ExecutedRecipientPlateShareBefore = RecipientPlateShareBefore;
+				OutDiagnostic.ExecutedRecipientPlateShareAfter = RecipientPlateShareAfter;
+				OutDiagnostic.ExecutedRecipientPlateShareDelta =
+					RecipientPlateShareAfter - RecipientPlateShareBefore;
+			}
+
+			ReservedZones.Add({ Plan.CollisionCenter, Plan.SurgeRadiusRad });
+			UsedPlateIds.Add(Plan.Pair->PlateA);
+			UsedPlateIds.Add(Plan.Pair->PlateB);
+
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[V9ThesisCollisionEvent Step=%d idx=%d] pair=(%d,%d) over_plate=%d sub_plate=%d obs=%d accumulated_penetration_km=%.1f mean_convergence_km_per_my=%.3f max_convergence_km_per_my=%.3f support=%d collision_support=%d continental_qualified=%d seed_samples=%d collision_seeds=%d terrane_component=%d terrane_area_sr=%.6f xi=%.6f rel_speed_km_per_my=%.3f effective_mass=%d surge_radius_rad=%.6f transfer_radius_rad=%.6f suture_axis=(%.4f,%.4f,%.4f) ridge_half_width_rad=%.6f belt_length_rad=%.6f mean_abs_along_rad=%.6f mean_abs_perp_rad=%.6f ridge_core=%d ridge_flank=%d transfer_candidates=%d transfer_anchor_seeds=%d transferred=%d transferred_continental=%d boundary_local=%d reject_locality=%d reject_continentality=%d reject_cap=%d reject_connectivity=%d affected=%d continental_gain=%d mean_elev_delta_km=%.6f max_elev_delta_km=%.6f donor_share=%.6f->%.6f recipient_share=%.6f->%.6f"),
+				Planet.CurrentStep,
+				ExecutedCollisionCount,
+				Plan.Pair->PlateA,
+				Plan.Pair->PlateB,
+				Plan.OverridingPlateId,
+				Plan.SubductingPlateId,
+				Plan.Pair->ObservationCount,
+				Plan.Pair->AccumulatedPenetrationKm,
+				Plan.Pair->MeanConvergenceKmPerMy,
+				Plan.Pair->MaxConvergenceKmPerMy,
+				Plan.Pair->SupportSampleCount,
+				Plan.Pair->CollisionSampleCount,
+				Plan.Pair->ContinentalQualifiedSampleCount,
+				Plan.SeedSampleIndices.Num(),
+				Plan.CollisionSeedSampleIndices.Num(),
+				Plan.DonorTerraneComponentSize,
+				Plan.TerraneAreaSr,
+				Plan.Xi,
+				Plan.RelativeSpeedKmPerMy,
+				Plan.EffectiveMassSampleCount,
+				Plan.SurgeRadiusRad,
+				Plan.TransferInfluenceRadiusRad,
+				EventSutureAxis.X,
+				EventSutureAxis.Y,
+				EventSutureAxis.Z,
+				EventSutureHalfWidthRad,
+				EventBeltLengthEstimateRad,
+				EventMeanAbsAlongSutureRad,
+				EventMeanAbsPerpendicularRad,
+				EventRidgeCoreAffectedCount,
+				EventRidgeFlankAffectedCount,
+				Plan.TransferCandidateSupportCount,
+				Plan.TransferAnchorSeedCount,
+				TransferredSampleIndices.Num(),
+				EventTransferredContinentalCount,
+				EventTransferBoundaryLocalCount,
+				Plan.TransferRejectedByLocalityCount,
+				Plan.TransferRejectedByContinentalityCount,
+				Plan.TransferRejectedByCapCount,
+				Plan.TransferRejectedByConnectivityCount,
+				EventAffectedSampleIndices.Num(),
+				EventContinentalGainCount,
+				EventAffectedSampleIndices.IsEmpty()
+					? 0.0
+					: EventTotalElevationDeltaKm /
+						static_cast<double>(EventAffectedSampleIndices.Num()),
+				EventMaxElevationDeltaKm,
+				DonorPlateShareBefore,
+				DonorPlateShareAfter,
+				RecipientPlateShareBefore,
+				RecipientPlateShareAfter);
+
+			if (ExecutedCollisionCount >= MaxCollisionExecutionsPerSolve)
+			{
+				break;
+			}
+		}
+
+		OutDiagnostic.ExecutedCollisionCount = ExecutedCollisionCount;
+		OutDiagnostic.QualifiedButUnexecutedCount =
+			FMath::Max(0, QualifiedCount - ExecutedCollisionCount);
+		OutDiagnostic.CumulativeExecutedCollisionCount = InOutCumulativeExecutionCount;
+		OutDiagnostic.CumulativeCollisionAffectedSampleVisits = InOutCumulativeAffectedSampleVisits;
+		OutDiagnostic.CumulativeCollisionDrivenContinentalGainCount =
+			InOutCumulativeContinentalGainCount;
+		OutDiagnostic.CumulativeCollisionDrivenOwnershipChangeCount =
+			InOutCumulativeOwnershipChangeCount;
+		OutDiagnostic.CumulativeCollisionTransferredSampleVisits =
+			InOutCumulativeTransferredSampleVisits;
+		OutDiagnostic.CumulativeCollisionTransferredContinentalSampleCount =
+			InOutCumulativeTransferredContinentalSampleCount;
+		OutDiagnostic.CollisionDrivenContinentalGainCount = CurrentSolveContinentalGainCount;
+		OutDiagnostic.CollisionDrivenOwnershipChangeCount = CurrentSolveOwnershipChangeCount;
+		OutDiagnostic.CollisionTransferredSampleCount = CurrentSolveTransferredSampleCount;
+		OutDiagnostic.CollisionTransferredContinentalSampleCount =
+			CurrentSolveTransferredContinentalSampleCount;
+		OutDiagnostic.bExecutedFromShadowQualifiedState = ExecutedCollisionCount > 0;
+
+		int32 CurrentSolveAffectedSampleCount = 0;
+		for (const uint8 Value : OutExecutionMask)
+		{
+			CurrentSolveAffectedSampleCount += Value != 0 ? 1 : 0;
+		}
+		OutDiagnostic.CollisionAffectedSampleCount = CurrentSolveAffectedSampleCount;
+		OutDiagnostic.CumulativeCollisionAffectedSampleCount = 0;
+		for (const uint8 Value : InOutCumulativeExecutionMask)
+		{
+			OutDiagnostic.CumulativeCollisionAffectedSampleCount += Value != 0 ? 1 : 0;
+		}
+		OutDiagnostic.CumulativeCollisionTransferredSampleCount = 0;
+		for (const uint8 Value : InOutCumulativeTransferMask)
+		{
+			OutDiagnostic.CumulativeCollisionTransferredSampleCount += Value != 0 ? 1 : 0;
+		}
+		OutDiagnostic.CumulativeMeanElevationDeltaKm =
+			InOutCumulativeAffectedSampleVisits > 0
+				? InOutCumulativeElevationDeltaKm /
+					static_cast<double>(InOutCumulativeAffectedSampleVisits)
+				: 0.0;
+		OutDiagnostic.CumulativeMaxElevationDeltaKm = InOutCumulativeMaxElevationDeltaKm;
+
+		if (ExecutedCollisionCount == 0)
+		{
+			return;
+		}
+
+		FResamplingStats& LegacyStats = Planet.LastResamplingStats;
+		LegacyStats.CollisionCount = ExecutedCollisionCount;
+		LegacyStats.CollisionTerraneId = INDEX_NONE;
+		LegacyStats.CollisionTerraneSampleCount = CurrentSolveTransferredSampleCount;
+		LegacyStats.CollisionOverridingPlateId = OutDiagnostic.ExecutedOverridingPlateId;
+		LegacyStats.CollisionSubductingPlateId = OutDiagnostic.ExecutedSubductingPlateId;
+		LegacyStats.CollisionSurgeAffectedCount = CurrentSolveAffectedSampleCount;
+		LegacyStats.CollisionContinentalGainCount = CurrentSolveContinentalGainCount;
+		LegacyStats.CollisionSurgeRadiusRad = OutDiagnostic.ExecutedInfluenceRadiusRad;
+		LegacyStats.CollisionSurgeMeanElevationDelta =
+			CurrentSolveAffectedSampleCount > 0
+				? CurrentSolveTotalElevationDeltaKm /
+					static_cast<double>(CurrentSolveAffectedSampleCount)
+				: 0.0;
+
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[V9ThesisCollision Step=%d] executed=%d cooldown_suppressed=%d plate_conflict_suppressed=%d overlap_suppressed=%d qualified_unexecuted=%d cumulative_exec=%d current_affected=%d cumulative_affected=%d current_transfer=%d cumulative_transfer=%d current_ownership_change=%d cumulative_ownership_change=%d current_continental_gain=%d cumulative_continental_gain=%d current_mean_elev_delta_km=%.6f current_max_elev_delta_km=%.6f cumulative_mean_elev_delta_km=%.6f cumulative_max_elev_delta_km=%.6f representative_pair=(%d,%d) representative_terrane=%d representative_transfer=%d representative_xi=%.6f representative_rel_speed_km_per_my=%.3f representative_radius_rad=%.6f"),
+			Planet.CurrentStep,
+			ExecutedCollisionCount,
+			OutDiagnostic.CooldownSuppressedQualifiedCount,
+			OutDiagnostic.PlateConflictSuppressedQualifiedCount,
+			OutDiagnostic.OverlapSuppressedQualifiedCount,
+			OutDiagnostic.QualifiedButUnexecutedCount,
+			InOutCumulativeExecutionCount,
+			CurrentSolveAffectedSampleCount,
+			OutDiagnostic.CumulativeCollisionAffectedSampleCount,
+			CurrentSolveTransferredSampleCount,
+			OutDiagnostic.CumulativeCollisionTransferredSampleCount,
+			CurrentSolveOwnershipChangeCount,
+			InOutCumulativeOwnershipChangeCount,
+			CurrentSolveContinentalGainCount,
+			InOutCumulativeContinentalGainCount,
+			CurrentSolveAffectedSampleCount > 0
+				? CurrentSolveTotalElevationDeltaKm /
+					static_cast<double>(CurrentSolveAffectedSampleCount)
+				: 0.0,
+			CurrentSolveMaxElevationDeltaKm,
+			OutDiagnostic.CumulativeMeanElevationDeltaKm,
+			OutDiagnostic.CumulativeMaxElevationDeltaKm,
+			OutDiagnostic.ExecutedPlateA,
+			OutDiagnostic.ExecutedPlateB,
+			OutDiagnostic.ExecutedDonorTerraneComponentSize,
+			OutDiagnostic.ExecutedTransferredComponentSize,
+			OutDiagnostic.ExecutedXi,
+			OutDiagnostic.ExecutedRelativeSpeedKmPerMy,
+			OutDiagnostic.ExecutedInfluenceRadiusRad);
+	}
+
 	const FPlate* FindPlateById(const FTectonicPlanet& Planet, const int32 PlateId)
 	{
 		for (const FPlate& Plate : Planet.Plates)
@@ -10744,6 +12230,7 @@ void FTectonicPlanetV6::Initialize(
 	bEnableV9CollisionExecutionEnhancedConsequencesForTest = false;
 	bEnableV9CollisionExecutionStructuralTransferForTest = false;
 	bEnableV9CollisionExecutionRefinedStructuralTransferForTest = false;
+	bEnableV9ThesisShapedCollisionRidgeSurgeForTest = false;
 	PreviousIntervalMeanSubductionDistanceKm = -1.0;
 	PreviousIntervalSubductionSampleCount = 0;
 	PreviousIntervalTrackedTriangleCount = 0;
@@ -13705,10 +15192,11 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	{
 		if (bEnableV9ThesisShapedCollisionExecutionForTest)
 		{
-			ExecuteV9ThesisShapedCollisionEvent(
+			ExecuteV9ThesisShapedCollisionEventRedesign(
 				Planet,
 				LastResolvedSamples,
 				CurrentSolveCollisionShadowDiagnostic,
+				bEnableV9ThesisShapedCollisionRidgeSurgeForTest,
 				V9CollisionExecutionLastSolveIndexByKey,
 				PeriodicSolveCount + 1,
 				CurrentSolveCollisionExecutionMask,
@@ -16893,6 +18381,7 @@ void FTectonicPlanetV6::SetV9CollisionExecutionForTest(const bool bEnable)
 {
 	bEnableV9CollisionExecutionForTest = bEnable;
 	bEnableV9CollisionExecutionRefinedStructuralTransferForTest = false;
+	bEnableV9ThesisShapedCollisionRidgeSurgeForTest = false;
 	CurrentSolveCollisionExecutionMask.Reset();
 	CurrentSolveCollisionTransferMask.Reset();
 	CumulativeCollisionExecutionMask.Reset();
@@ -16939,12 +18428,18 @@ void FTectonicPlanetV6::SetV9CollisionExecutionRefinedStructuralTransferForTest(
 void FTectonicPlanetV6::SetV9ThesisShapedCollisionExecutionForTest(const bool bEnable)
 {
 	bEnableV9ThesisShapedCollisionExecutionForTest = bEnable;
+	bEnableV9ThesisShapedCollisionRidgeSurgeForTest = false;
 	CurrentSolveThesisCollisionTerraneComponentMask.Reset();
 	CurrentSolveCollisionTransferMask.Reset();
 	CumulativeCollisionTransferMask.Reset();
 	V9CollisionExecutionCumulativeOwnershipChangeCount = 0;
 	V9CollisionExecutionCumulativeTransferredSampleVisits = 0;
 	V9CollisionExecutionCumulativeTransferredContinentalSampleCount = 0;
+}
+
+void FTectonicPlanetV6::SetV9ThesisShapedCollisionRidgeSurgeForTest(const bool bEnable)
+{
+	bEnableV9ThesisShapedCollisionRidgeSurgeForTest = bEnable;
 }
 
 void FTectonicPlanetV6::SetUseLinearConvergentMaintenanceSpeedFactorForTest(
