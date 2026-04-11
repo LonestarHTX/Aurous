@@ -1358,6 +1358,291 @@ namespace
 		}
 	}
 
+	// --- Continental Mass Diagnostic Structs and Logging ---
+
+	struct FV9ContinentalMassDiagnostic
+	{
+		// Diagnostic 1: Area and connectivity
+		double ContinentalAreaFraction = 0.0;
+		int32 ContinentalSampleCount = 0;
+		int32 ComponentCount = 0;
+		int32 LargestComponentSize = 0;
+		TArray<int32> Top5ComponentSizes;
+		int32 SingletonCount = 0;
+		int32 TinyComponentCount = 0; // <= 10 samples
+
+		// Diagnostic 2: Boundary-local vs interior distribution
+		int32 ActiveZoneContinentalCount = 0;
+		int32 BoundaryBandContinentalCount = 0;
+		int32 DeepInteriorContinentalCount = 0;
+		double ActiveZoneContinentalFraction = 0.0;
+		double BoundaryBandContinentalFraction = 0.0;
+		double DeepInteriorContinentalFraction = 0.0;
+		double MeanDistToActiveZoneHops = 0.0;
+		double P50DistToActiveZone = 0.0;
+		double P90DistToActiveZone = 0.0;
+
+		// Diagnostic 4: Width proxy (BFS depth from coastline)
+		double MeanCoastDistHops = 0.0;
+		double P50CoastDist = 0.0;
+		double P90CoastDist = 0.0;
+		double MaxCoastDist = 0.0;
+
+		// Diagnostic 5: Largest continent profile
+		int32 LargestComponentId = -1;
+		double LargestMeanElevationKm = 0.0;
+		double LargestP95ElevationKm = 0.0;
+		double LargestMeanCoastDist = 0.0;
+		double LargestActiveZoneFraction = 0.0;
+		double LargestBoundaryFraction = 0.0;
+
+		// Per-sample auxiliary data (transient, for export overlays)
+		TArray<int32> SampleComponentId; // -1 for non-continental
+		TArray<int32> SampleCoastDistHops; // -1 for non-continental
+	};
+
+	struct FV9ContinentalLossAttribution
+	{
+		int32 TotalLostSamples = 0;
+		int32 LostViaDirectHit = 0;
+		int32 LostViaOverlapWinner = 0;
+		int32 LostViaNearestTriangleRecovery = 0;
+		int32 LostViaNearestMemberFallback = 0;
+		int32 LostViaExplicitFallback = 0;
+		int32 LostViaSyntheticDivergenceFill = 0;
+		int32 LostViaDestructiveGapFill = 0;
+		int32 LostViaOceanicCreation = 0;
+		int32 LostViaBoundaryOceanic = 0;
+		int32 LostViaRetainedOutsideActiveZone = 0;
+		int32 LostViaTransferFallback = 0;
+		int32 LostViaRetainedSyntheticCoverage = 0;
+		int32 LostViaOther = 0;
+		int32 TotalGainedSamples = 0;
+		int32 NetChange = 0;
+
+		// Sub-bucket: retained_outside_az losses by transfer source kind
+		int32 RetainedOazViaTriangle = 0;
+		int32 RetainedOazViaSingleSource = 0;
+		int32 RetainedOazViaStructuredSynthetic = 0;
+		int32 RetainedOazViaOceanicCreation = 0;
+		int32 RetainedOazViaDefaulted = 0;
+		int32 RetainedOazViaOtherSource = 0;
+		// Sub-bucket: CW threshold mismatch (barycentric blend >= 0.5 but dominant < 0.5)
+		int32 RetainedOazWithCwThresholdMismatch = 0;
+	};
+
+	void AddV6ContinentalMassDiagnosticInfo(
+		FAutomationTestBase& Test,
+		const FString& Tag,
+		const FV9ContinentalMassDiagnostic& D)
+	{
+		// Diagnostic 1: Area and connectivity
+		{
+			FString Top5Str;
+			for (int32 I = 0; I < D.Top5ComponentSizes.Num(); ++I)
+			{
+				if (I > 0) { Top5Str += TEXT(","); }
+				Top5Str += FString::FromInt(D.Top5ComponentSizes[I]);
+			}
+			const FString Msg = FString::Printf(
+				TEXT("%s continental_area_fraction=%.4f continental_samples=%d components=%d largest=%d top5=[%s] singletons=%d tiny_le10=%d"),
+				*Tag,
+				D.ContinentalAreaFraction,
+				D.ContinentalSampleCount,
+				D.ComponentCount,
+				D.LargestComponentSize,
+				*Top5Str,
+				D.SingletonCount,
+				D.TinyComponentCount);
+			Test.AddInfo(Msg);
+			UE_LOG(LogTemp, Log, TEXT("%s"), *Msg);
+		}
+
+		// Diagnostic 2: Boundary-local vs interior
+		{
+			const FString Msg = FString::Printf(
+				TEXT("%s active_zone_continental=%d(%.4f) boundary_band=%d(%.4f) deep_interior=%d(%.4f) mean_dist_to_active=%.2f p50=%.1f p90=%.1f"),
+				*Tag,
+				D.ActiveZoneContinentalCount,
+				D.ActiveZoneContinentalFraction,
+				D.BoundaryBandContinentalCount,
+				D.BoundaryBandContinentalFraction,
+				D.DeepInteriorContinentalCount,
+				D.DeepInteriorContinentalFraction,
+				D.MeanDistToActiveZoneHops,
+				D.P50DistToActiveZone,
+				D.P90DistToActiveZone);
+			Test.AddInfo(Msg);
+			UE_LOG(LogTemp, Log, TEXT("%s"), *Msg);
+		}
+
+		// Diagnostic 4: Width proxy
+		{
+			const FString Msg = FString::Printf(
+				TEXT("%s coast_dist_mean=%.2f p50=%.1f p90=%.1f max=%.1f"),
+				*Tag,
+				D.MeanCoastDistHops,
+				D.P50CoastDist,
+				D.P90CoastDist,
+				D.MaxCoastDist);
+			Test.AddInfo(Msg);
+			UE_LOG(LogTemp, Log, TEXT("%s"), *Msg);
+		}
+
+		// Diagnostic 5: Largest continent profile
+		{
+			const FString Msg = FString::Printf(
+				TEXT("%s largest_size=%d largest_mean_elev=%.4f largest_p95_elev=%.4f largest_mean_coast_dist=%.2f largest_active_frac=%.4f largest_boundary_frac=%.4f"),
+				*Tag,
+				D.LargestComponentSize,
+				D.LargestMeanElevationKm,
+				D.LargestP95ElevationKm,
+				D.LargestMeanCoastDist,
+				D.LargestActiveZoneFraction,
+				D.LargestBoundaryFraction);
+			Test.AddInfo(Msg);
+			UE_LOG(LogTemp, Log, TEXT("%s"), *Msg);
+		}
+	}
+
+	void AddV6ContinentalLossAttributionInfo(
+		FAutomationTestBase& Test,
+		const FString& Tag,
+		const FV9ContinentalLossAttribution& A)
+	{
+		const FString Msg = FString::Printf(
+			TEXT("%s loss_total=%d gain_total=%d net=%d direct_hit=%d overlap_winner=%d tri_recovery=%d member_fallback=%d explicit_fallback=%d synth_divergence=%d destructive_gap=%d oceanic_creation=%d boundary_oceanic=%d retained_outside_az=%d transfer_fallback=%d retained_synth=%d other=%d"),
+			*Tag,
+			A.TotalLostSamples,
+			A.TotalGainedSamples,
+			A.NetChange,
+			A.LostViaDirectHit,
+			A.LostViaOverlapWinner,
+			A.LostViaNearestTriangleRecovery,
+			A.LostViaNearestMemberFallback,
+			A.LostViaExplicitFallback,
+			A.LostViaSyntheticDivergenceFill,
+			A.LostViaDestructiveGapFill,
+			A.LostViaOceanicCreation,
+			A.LostViaBoundaryOceanic,
+			A.LostViaRetainedOutsideActiveZone,
+			A.LostViaTransferFallback,
+			A.LostViaRetainedSyntheticCoverage,
+			A.LostViaOther);
+		Test.AddInfo(Msg);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Msg);
+
+		if (A.LostViaRetainedOutsideActiveZone > 0)
+		{
+			const FString SubMsg = FString::Printf(
+				TEXT("%s retained_oaz_sub: triangle=%d single_source=%d structured_synth=%d oceanic_creation=%d defaulted=%d other_source=%d cw_threshold_mismatch=%d"),
+				*Tag,
+				A.RetainedOazViaTriangle,
+				A.RetainedOazViaSingleSource,
+				A.RetainedOazViaStructuredSynthetic,
+				A.RetainedOazViaOceanicCreation,
+				A.RetainedOazViaDefaulted,
+				A.RetainedOazViaOtherSource,
+				A.RetainedOazWithCwThresholdMismatch);
+			Test.AddInfo(SubMsg);
+			UE_LOG(LogTemp, Log, TEXT("%s"), *SubMsg);
+		}
+	}
+
+	bool ExportContinentalMassOverlays(
+		FAutomationTestBase& Test,
+		const FTectonicPlanetV6& Planet,
+		const FV9ContinentalMassDiagnostic& Diag,
+		const FString& ExportRoot,
+		const int32 Step)
+	{
+		const FString OutputDirectory = FPaths::Combine(ExportRoot, FString::Printf(TEXT("step_%03d"), Step));
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		const int32 SampleCount = PlanetData.Samples.Num();
+		if (SampleCount == 0) { return false; }
+
+		bool bAllSucceeded = true;
+		FString Error;
+
+		// ActiveZoneMask
+		{
+			const TArray<uint8>& ActiveZoneFlags = Planet.GetCurrentSolveActiveZoneFlagsForTest();
+			if (ActiveZoneFlags.Num() == SampleCount)
+			{
+				TArray<float> Values;
+				Values.SetNum(SampleCount);
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					Values[I] = ActiveZoneFlags[I] ? 1.0f : 0.0f;
+				}
+				const FString Path = FPaths::Combine(OutputDirectory, TEXT("ActiveZoneMask.png"));
+				if (!TectonicMollweideExporter::ExportScalarOverlay(
+					PlanetData, Values, 0.0f, 1.0f, Path, TestExportWidth, TestExportHeight, Error))
+				{
+					Test.AddError(FString::Printf(TEXT("ActiveZoneMask export step %d failed: %s"), Step, *Error));
+					bAllSucceeded = false;
+				}
+			}
+		}
+
+		// ContinentalComponentMask (component ID → scalar, top 5 components get distinct values)
+		if (Diag.SampleComponentId.Num() == SampleCount)
+		{
+			TArray<float> Values;
+			Values.SetNum(SampleCount);
+			for (int32 I = 0; I < SampleCount; ++I)
+			{
+				if (Diag.SampleComponentId[I] < 0)
+				{
+					Values[I] = 0.0f;
+				}
+				else
+				{
+					// Map top-5 components to distinct bands, rest to low value
+					int32 Rank = -1;
+					for (int32 R = 0; R < Diag.Top5ComponentSizes.Num(); ++R)
+					{
+						// Find which rank this component has by matching sizes
+						// (approximate — just maps component to band based on ID order)
+						if (Diag.SampleComponentId[I] == R) { Rank = R; break; }
+					}
+					Values[I] = Rank >= 0
+						? static_cast<float>(Rank + 1) * 2.0f
+						: 0.5f;
+				}
+			}
+			const FString Path = FPaths::Combine(OutputDirectory, TEXT("ContinentalComponentMask.png"));
+			if (!TectonicMollweideExporter::ExportScalarOverlay(
+				PlanetData, Values, 0.0f, 10.0f, Path, TestExportWidth, TestExportHeight, Error))
+			{
+				Test.AddError(FString::Printf(TEXT("ContinentalComponentMask export step %d failed: %s"), Step, *Error));
+				bAllSucceeded = false;
+			}
+		}
+
+		// ContinentalInteriorDepthMask (coast distance in hops)
+		if (Diag.SampleCoastDistHops.Num() == SampleCount)
+		{
+			TArray<float> Values;
+			Values.SetNum(SampleCount);
+			for (int32 I = 0; I < SampleCount; ++I)
+			{
+				Values[I] = Diag.SampleCoastDistHops[I] > 0
+					? static_cast<float>(Diag.SampleCoastDistHops[I])
+					: 0.0f;
+			}
+			const FString Path = FPaths::Combine(OutputDirectory, TEXT("ContinentalInteriorDepthMask.png"));
+			if (!TectonicMollweideExporter::ExportScalarOverlay(
+				PlanetData, Values, 0.0f, 20.0f, Path, TestExportWidth, TestExportHeight, Error))
+			{
+				Test.AddError(FString::Printf(TEXT("ContinentalInteriorDepthMask export step %d failed: %s"), Step, *Error));
+				bAllSucceeded = false;
+			}
+		}
+
+		return bAllSucceeded;
+	}
+
 	const TCHAR* GetCopiedFrontierMotionClassName(const ETectonicPlanetV6CopiedFrontierMotionClass MotionClass)
 	{
 		switch (MotionClass)
@@ -2277,6 +2562,441 @@ namespace
 			Count += Sample.OrogenyType == EOrogenyType::Andean ? 1 : 0;
 		}
 		return Count;
+	}
+
+	// --- Continental Mass Diagnostic Compute Functions ---
+
+	FV9ContinentalMassDiagnostic ComputeContinentalMassDiagnostic(const FTectonicPlanetV6& Planet)
+	{
+		FV9ContinentalMassDiagnostic Result;
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		const int32 SampleCount = PlanetData.Samples.Num();
+		if (SampleCount == 0) { return Result; }
+
+		// Continental flag per sample
+		TArray<uint8> IsContinental;
+		IsContinental.SetNumZeroed(SampleCount);
+		for (int32 I = 0; I < SampleCount; ++I)
+		{
+			IsContinental[I] = PlanetData.Samples[I].ContinentalWeight >= 0.5f ? 1 : 0;
+			Result.ContinentalSampleCount += IsContinental[I];
+		}
+		Result.ContinentalAreaFraction = static_cast<double>(Result.ContinentalSampleCount) / static_cast<double>(SampleCount);
+
+		// --- Connected Components (BFS on adjacency, continental only) ---
+		Result.SampleComponentId.SetNum(SampleCount);
+		for (int32 I = 0; I < SampleCount; ++I) { Result.SampleComponentId[I] = -1; }
+
+		int32 NextComponentId = 0;
+		TArray<int32> ComponentSizes;
+		TArray<int32> BfsQueue;
+		BfsQueue.Reserve(SampleCount);
+
+		for (int32 Seed = 0; Seed < SampleCount; ++Seed)
+		{
+			if (!IsContinental[Seed] || Result.SampleComponentId[Seed] >= 0) { continue; }
+
+			const int32 CompId = NextComponentId++;
+			int32 CompSize = 0;
+			BfsQueue.Reset();
+			BfsQueue.Add(Seed);
+			Result.SampleComponentId[Seed] = CompId;
+
+			int32 Head = 0;
+			while (Head < BfsQueue.Num())
+			{
+				const int32 Current = BfsQueue[Head++];
+				++CompSize;
+
+				if (PlanetData.SampleAdjacency.IsValidIndex(Current))
+				{
+					for (const int32 Neighbor : PlanetData.SampleAdjacency[Current])
+					{
+						if (IsContinental[Neighbor] && Result.SampleComponentId[Neighbor] < 0)
+						{
+							Result.SampleComponentId[Neighbor] = CompId;
+							BfsQueue.Add(Neighbor);
+						}
+					}
+				}
+			}
+			ComponentSizes.Add(CompSize);
+		}
+
+		Result.ComponentCount = ComponentSizes.Num();
+		ComponentSizes.Sort([](const int32 A, const int32 B) { return A > B; });
+		Result.LargestComponentSize = ComponentSizes.Num() > 0 ? ComponentSizes[0] : 0;
+		for (int32 I = 0; I < FMath::Min(5, ComponentSizes.Num()); ++I)
+		{
+			Result.Top5ComponentSizes.Add(ComponentSizes[I]);
+		}
+		for (const int32 Size : ComponentSizes)
+		{
+			if (Size == 1) { ++Result.SingletonCount; }
+			if (Size <= 10) { ++Result.TinyComponentCount; }
+		}
+
+		// --- Coast Distance (multi-source BFS from oceanic samples) ---
+		Result.SampleCoastDistHops.SetNum(SampleCount);
+		for (int32 I = 0; I < SampleCount; ++I) { Result.SampleCoastDistHops[I] = -1; }
+
+		TArray<int32> DistQueue;
+		DistQueue.Reserve(SampleCount);
+		// Seed: all oceanic samples adjacent to at least one continental sample
+		for (int32 I = 0; I < SampleCount; ++I)
+		{
+			if (IsContinental[I]) { continue; }
+			if (PlanetData.SampleAdjacency.IsValidIndex(I))
+			{
+				for (const int32 Neighbor : PlanetData.SampleAdjacency[I])
+				{
+					if (IsContinental[Neighbor] && Result.SampleCoastDistHops[Neighbor] < 0)
+					{
+						Result.SampleCoastDistHops[Neighbor] = 1;
+						DistQueue.Add(Neighbor);
+					}
+				}
+			}
+		}
+		{
+			int32 Head = 0;
+			while (Head < DistQueue.Num())
+			{
+				const int32 Current = DistQueue[Head++];
+				const int32 CurrentDist = Result.SampleCoastDistHops[Current];
+				if (PlanetData.SampleAdjacency.IsValidIndex(Current))
+				{
+					for (const int32 Neighbor : PlanetData.SampleAdjacency[Current])
+					{
+						if (IsContinental[Neighbor] && Result.SampleCoastDistHops[Neighbor] < 0)
+						{
+							Result.SampleCoastDistHops[Neighbor] = CurrentDist + 1;
+							DistQueue.Add(Neighbor);
+						}
+					}
+				}
+			}
+		}
+
+		// Collect coast distance stats for continental samples
+		TArray<int32> CoastDistValues;
+		CoastDistValues.Reserve(Result.ContinentalSampleCount);
+		for (int32 I = 0; I < SampleCount; ++I)
+		{
+			if (IsContinental[I] && Result.SampleCoastDistHops[I] > 0)
+			{
+				CoastDistValues.Add(Result.SampleCoastDistHops[I]);
+			}
+		}
+		if (!CoastDistValues.IsEmpty())
+		{
+			CoastDistValues.Sort();
+			double Sum = 0.0;
+			for (const int32 D : CoastDistValues) { Sum += D; }
+			Result.MeanCoastDistHops = Sum / static_cast<double>(CoastDistValues.Num());
+			Result.P50CoastDist = CoastDistValues[CoastDistValues.Num() / 2];
+			Result.P90CoastDist = CoastDistValues[FMath::Min(
+				static_cast<int32>(static_cast<double>(CoastDistValues.Num()) * 0.90),
+				CoastDistValues.Num() - 1)];
+			Result.MaxCoastDist = CoastDistValues.Last();
+		}
+
+		// --- Active zone and boundary distribution ---
+		const TArray<uint8>& ActiveZoneFlags = Planet.GetCurrentSolveActiveZoneFlagsForTest();
+		const bool bHasActiveZone = ActiveZoneFlags.Num() == SampleCount;
+
+		// Distance to nearest active-zone sample (BFS from active zone, continental only)
+		TArray<int32> DistToActiveZone;
+		DistToActiveZone.SetNum(SampleCount);
+		for (int32 I = 0; I < SampleCount; ++I) { DistToActiveZone[I] = -1; }
+
+		if (bHasActiveZone)
+		{
+			TArray<int32> AzQueue;
+			AzQueue.Reserve(SampleCount);
+
+			for (int32 I = 0; I < SampleCount; ++I)
+			{
+				if (IsContinental[I] && ActiveZoneFlags[I])
+				{
+					DistToActiveZone[I] = 0;
+					AzQueue.Add(I);
+					++Result.ActiveZoneContinentalCount;
+				}
+			}
+
+			{
+				int32 Head = 0;
+				while (Head < AzQueue.Num())
+				{
+					const int32 Current = AzQueue[Head++];
+					const int32 CurrentDist = DistToActiveZone[Current];
+					if (PlanetData.SampleAdjacency.IsValidIndex(Current))
+					{
+						for (const int32 Neighbor : PlanetData.SampleAdjacency[Current])
+						{
+							if (IsContinental[Neighbor] && DistToActiveZone[Neighbor] < 0)
+							{
+								DistToActiveZone[Neighbor] = CurrentDist + 1;
+								AzQueue.Add(Neighbor);
+							}
+						}
+					}
+				}
+			}
+
+			// Boundary band: continental samples that are boundary or 1-ring of boundary
+			for (int32 I = 0; I < SampleCount; ++I)
+			{
+				if (!IsContinental[I]) { continue; }
+				if (PlanetData.Samples[I].bIsBoundary)
+				{
+					++Result.BoundaryBandContinentalCount;
+				}
+			}
+
+			Result.DeepInteriorContinentalCount =
+				Result.ContinentalSampleCount - Result.ActiveZoneContinentalCount -
+				FMath::Max(0, Result.BoundaryBandContinentalCount - Result.ActiveZoneContinentalCount);
+
+			if (Result.ContinentalSampleCount > 0)
+			{
+				Result.ActiveZoneContinentalFraction =
+					static_cast<double>(Result.ActiveZoneContinentalCount) / static_cast<double>(Result.ContinentalSampleCount);
+				Result.BoundaryBandContinentalFraction =
+					static_cast<double>(Result.BoundaryBandContinentalCount) / static_cast<double>(Result.ContinentalSampleCount);
+				Result.DeepInteriorContinentalFraction =
+					static_cast<double>(Result.DeepInteriorContinentalCount) / static_cast<double>(Result.ContinentalSampleCount);
+			}
+
+			// Distance-to-active-zone stats
+			TArray<int32> AzDistValues;
+			AzDistValues.Reserve(Result.ContinentalSampleCount);
+			for (int32 I = 0; I < SampleCount; ++I)
+			{
+				if (IsContinental[I] && DistToActiveZone[I] >= 0)
+				{
+					AzDistValues.Add(DistToActiveZone[I]);
+				}
+			}
+			if (!AzDistValues.IsEmpty())
+			{
+				AzDistValues.Sort();
+				double Sum = 0.0;
+				for (const int32 D : AzDistValues) { Sum += D; }
+				Result.MeanDistToActiveZoneHops = Sum / static_cast<double>(AzDistValues.Num());
+				Result.P50DistToActiveZone = AzDistValues[AzDistValues.Num() / 2];
+				Result.P90DistToActiveZone = AzDistValues[FMath::Min(
+					static_cast<int32>(static_cast<double>(AzDistValues.Num()) * 0.90),
+					AzDistValues.Num() - 1)];
+			}
+		}
+
+		// --- Largest continent profile ---
+		if (Result.LargestComponentSize > 0)
+		{
+			// Find the component ID of the largest
+			int32 LargestCompId = -1;
+			{
+				TMap<int32, int32> CompIdToSize;
+				for (int32 I = 0; I < SampleCount; ++I)
+				{
+					if (Result.SampleComponentId[I] >= 0)
+					{
+						CompIdToSize.FindOrAdd(Result.SampleComponentId[I], 0)++;
+					}
+				}
+				int32 MaxSize = 0;
+				for (const auto& Pair : CompIdToSize)
+				{
+					if (Pair.Value > MaxSize)
+					{
+						MaxSize = Pair.Value;
+						LargestCompId = Pair.Key;
+					}
+				}
+			}
+			Result.LargestComponentId = LargestCompId;
+
+			TArray<double> LargestElevations;
+			LargestElevations.Reserve(Result.LargestComponentSize);
+			int32 LargestActiveCount = 0;
+			int32 LargestBoundaryCount = 0;
+			double LargestCoastDistSum = 0.0;
+			int32 LargestCoastDistN = 0;
+
+			for (int32 I = 0; I < SampleCount; ++I)
+			{
+				if (Result.SampleComponentId[I] != LargestCompId) { continue; }
+				LargestElevations.Add(static_cast<double>(PlanetData.Samples[I].Elevation));
+				if (bHasActiveZone && ActiveZoneFlags[I]) { ++LargestActiveCount; }
+				if (PlanetData.Samples[I].bIsBoundary) { ++LargestBoundaryCount; }
+				if (Result.SampleCoastDistHops[I] > 0)
+				{
+					LargestCoastDistSum += Result.SampleCoastDistHops[I];
+					++LargestCoastDistN;
+				}
+			}
+
+			if (!LargestElevations.IsEmpty())
+			{
+				double ElevSum = 0.0;
+				for (const double E : LargestElevations) { ElevSum += E; }
+				Result.LargestMeanElevationKm = ElevSum / static_cast<double>(LargestElevations.Num());
+				LargestElevations.Sort();
+				const int32 P95Idx = FMath::Min(
+					static_cast<int32>(static_cast<double>(LargestElevations.Num()) * 0.95),
+					LargestElevations.Num() - 1);
+				Result.LargestP95ElevationKm = LargestElevations[P95Idx];
+			}
+			if (Result.LargestComponentSize > 0)
+			{
+				Result.LargestActiveZoneFraction =
+					static_cast<double>(LargestActiveCount) / static_cast<double>(Result.LargestComponentSize);
+				Result.LargestBoundaryFraction =
+					static_cast<double>(LargestBoundaryCount) / static_cast<double>(Result.LargestComponentSize);
+			}
+			if (LargestCoastDistN > 0)
+			{
+				Result.LargestMeanCoastDist = LargestCoastDistSum / static_cast<double>(LargestCoastDistN);
+			}
+		}
+
+		return Result;
+	}
+
+	FV9ContinentalLossAttribution ComputeContinentalLossAttribution(const FTectonicPlanetV6& Planet)
+	{
+		FV9ContinentalLossAttribution Result;
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		const int32 SampleCount = PlanetData.Samples.Num();
+		const TArray<float>& PreSolveCW = Planet.GetCurrentSolvePreSolveContinentalWeightsForTest();
+		const TArray<FTectonicPlanetV6ResolvedSample>& Resolved = Planet.GetLastResolvedSamplesForTest();
+
+		if (PreSolveCW.Num() != SampleCount || Resolved.Num() != SampleCount)
+		{
+			return Result;
+		}
+
+		for (int32 I = 0; I < SampleCount; ++I)
+		{
+			const bool bWasContinental = PreSolveCW[I] >= 0.5f;
+			const bool bIsContinental = PlanetData.Samples[I].ContinentalWeight >= 0.5f;
+
+			if (bWasContinental && !bIsContinental)
+			{
+				++Result.TotalLostSamples;
+				const ETectonicPlanetV6ResolutionKind Kind = Resolved[I].ResolutionKind;
+				switch (Kind)
+				{
+				case ETectonicPlanetV6ResolutionKind::SingleCandidate:
+				case ETectonicPlanetV6ResolutionKind::ThesisRemeshHit:
+					++Result.LostViaDirectHit;
+					break;
+				case ETectonicPlanetV6ResolutionKind::OverlapWinner:
+					++Result.LostViaOverlapWinner;
+					break;
+				case ETectonicPlanetV6ResolutionKind::NearestTriangleRecovery:
+					++Result.LostViaNearestTriangleRecovery;
+					break;
+				case ETectonicPlanetV6ResolutionKind::NearestMemberRecovery:
+					++Result.LostViaNearestMemberFallback;
+					break;
+				case ETectonicPlanetV6ResolutionKind::ExplicitFallback:
+					++Result.LostViaExplicitFallback;
+					break;
+				case ETectonicPlanetV6ResolutionKind::ThesisRemeshMissOceanic:
+					++Result.LostViaSyntheticDivergenceFill;
+					break;
+				case ETectonicPlanetV6ResolutionKind::ThesisRemeshMissDestructiveExclusion:
+					++Result.LostViaDestructiveGapFill;
+					break;
+				case ETectonicPlanetV6ResolutionKind::ThesisRemeshMissAmbiguous:
+					++Result.LostViaSyntheticDivergenceFill;
+					break;
+				case ETectonicPlanetV6ResolutionKind::BoundaryOceanic:
+					++Result.LostViaBoundaryOceanic;
+					break;
+				case ETectonicPlanetV6ResolutionKind::ThesisRemeshRetainedOutsideActiveZone:
+					++Result.LostViaRetainedOutsideActiveZone;
+					{
+						const FTectonicPlanetV6TransferDebugInfo& TD = Resolved[I].TransferDebug;
+						switch (TD.SourceKind)
+						{
+						case ETectonicPlanetV6TransferSourceKind::Triangle:
+							++Result.RetainedOazViaTriangle;
+							break;
+						case ETectonicPlanetV6TransferSourceKind::SingleSource:
+							++Result.RetainedOazViaSingleSource;
+							break;
+						case ETectonicPlanetV6TransferSourceKind::StructuredSynthetic:
+							++Result.RetainedOazViaStructuredSynthetic;
+							break;
+						case ETectonicPlanetV6TransferSourceKind::OceanicCreation:
+							++Result.RetainedOazViaOceanicCreation;
+							break;
+						case ETectonicPlanetV6TransferSourceKind::Defaulted:
+							++Result.RetainedOazViaDefaulted;
+							break;
+						default:
+							++Result.RetainedOazViaOtherSource;
+							break;
+						}
+						if (TD.bContinentalWeightWouldCrossThresholdUnderBarycentricBlend)
+						{
+							++Result.RetainedOazWithCwThresholdMismatch;
+						}
+					}
+					break;
+				case ETectonicPlanetV6ResolutionKind::ThesisRemeshTransferFallback:
+					++Result.LostViaTransferFallback;
+					break;
+				case ETectonicPlanetV6ResolutionKind::ThesisRemeshRetainedSyntheticCoverage:
+					++Result.LostViaRetainedSyntheticCoverage;
+					break;
+				default:
+					++Result.LostViaOther;
+					break;
+				}
+			}
+			else if (!bWasContinental && bIsContinental)
+			{
+				++Result.TotalGainedSamples;
+			}
+		}
+
+		Result.NetChange = Result.TotalGainedSamples - Result.TotalLostSamples;
+		return Result;
+	}
+
+	FV9ContinentalLossAttribution ComputeCumulativeContinentalLossAttribution(
+		const TArray<float>& BaselineCW,
+		const FTectonicPlanet& CurrentPlanet)
+	{
+		FV9ContinentalLossAttribution Result;
+		const int32 SampleCount = CurrentPlanet.Samples.Num();
+		if (BaselineCW.Num() != SampleCount) { return Result; }
+
+		for (int32 I = 0; I < SampleCount; ++I)
+		{
+			const bool bWasContinental = BaselineCW[I] >= 0.5f;
+			const bool bIsContinental = CurrentPlanet.Samples[I].ContinentalWeight >= 0.5f;
+			if (bWasContinental && !bIsContinental) { ++Result.TotalLostSamples; }
+			else if (!bWasContinental && bIsContinental) { ++Result.TotalGainedSamples; }
+		}
+		Result.NetChange = Result.TotalGainedSamples - Result.TotalLostSamples;
+		return Result;
+	}
+
+	TArray<float> SnapshotContinentalWeights(const FTectonicPlanet& Planet)
+	{
+		TArray<float> CW;
+		CW.SetNum(Planet.Samples.Num());
+		for (int32 I = 0; I < Planet.Samples.Num(); ++I)
+		{
+			CW[I] = Planet.Samples[I].ContinentalWeight;
+		}
+		return CW;
 	}
 
 	enum class EBoundaryFieldCouplingProvenanceBucket : uint8
@@ -10241,5 +10961,255 @@ bool FTectonicPlanetV6V9ForcedRiftValidationHarnessTest::RunTest(const FString& 
 	TestTrue(TEXT("Forced-rift churn stays under relaxed gate"), bChurnPass);
 	TestTrue(TEXT("Forced-rift continental mean elevation stays healthy"), bMeanElevationPass);
 	TestTrue(TEXT("Forced-rift continental p95 elevation stays healthy"), bP95ElevationPass);
+	return true;
+}
+
+// ============================================================================
+// Continental Mass Audit Test
+// ============================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9ContinentalMassAuditTest,
+	"Aurous.TectonicPlanet.V6V9ContinentalMassAuditTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9ContinentalMassAuditTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	constexpr int32 ForcedRiftTriggerStep = 31;
+	constexpr int32 ForcedRiftChildCount = 2;
+	constexpr int32 ForcedRiftSeed = 17017;
+	const FString RunId = TEXT("V9ContinentalMassAudit");
+
+	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+			FixedIntervalSteps,
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			TestRandomSeed);
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+		Planet.SetV9CollisionShadowForTest(true);
+		Planet.SetV9CollisionExecutionForTest(true);
+		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
+		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
+		Planet.SetAutomaticRiftingForTest(false);
+		return Planet;
+	};
+
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
+	CandidatePlanet.SetV9QuietInteriorContinentalRetentionForTest(true);
+
+	const FString ExportRoot = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	const FString BaselineExportRoot = FPaths::Combine(ExportRoot, TEXT("baseline"));
+	const FString CandidateExportRoot = FPaths::Combine(ExportRoot, TEXT("retention"));
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*BaselineExportRoot);
+	PlatformFile.CreateDirectoryTree(*CandidateExportRoot);
+
+	// --- Capture full diagnostic checkpoint ---
+	const auto CaptureFullCheckpoint =
+		[this](
+			FTectonicPlanetV6& Planet,
+			const FString& VariantTag,
+			const FString& VariantExportRoot,
+			const int32 Step,
+			const TArray<float>& BaselineCW,
+			const bool bExport) -> FV9ContinentalMassDiagnostic
+	{
+		const FString Tag = FString::Printf(TEXT("[V9MassAudit %s step=%d]"), *VariantTag, Step);
+
+		// Standard snapshot + existing diagnostics
+		if (bExport)
+		{
+			ExportV6CheckpointMaps(*this, Planet, VariantExportRoot, Step);
+			ExportV6DebugOverlays(*this, Planet, VariantExportRoot, Step);
+		}
+
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+		AddV6BoundaryCoherenceInfo(*this, Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, Tag, Snapshot);
+		AddV6CollisionExecutionInfo(*this, Tag, Snapshot);
+
+		const FV9ContinentalElevationStats ElevStats = ComputeContinentalElevationStats(Planet);
+		const FTectonicPlanetV6PeriodicSolveStats& SolveStats =
+			Planet.GetPeriodicSolveCount() > 0
+				? Planet.GetLastSolveStats()
+				: Planet.BuildCurrentDiagnosticSnapshotForTest();
+		AddInfo(FString::Printf(
+			TEXT("%s elevation: mean=%.4f p95=%.4f max=%.4f above_2km=%d above_5km=%d continental_samples=%d retention_guard=%d(tri=%d,ss=%d)"),
+			*Tag,
+			ElevStats.MeanElevationKm,
+			ElevStats.P95ElevationKm,
+			ElevStats.MaxElevationKm,
+			ElevStats.SamplesAbove2Km,
+			ElevStats.SamplesAbove5Km,
+			ElevStats.ContinentalSampleCount,
+			SolveStats.QuietInteriorContinentalRetentionCount,
+			SolveStats.QuietInteriorContinentalRetentionTriangleCount,
+			SolveStats.QuietInteriorContinentalRetentionSingleSourceCount));
+
+		// Continental mass diagnostics (1, 2, 4, 5)
+		const FV9ContinentalMassDiagnostic MassDiag = ComputeContinentalMassDiagnostic(Planet);
+		AddV6ContinentalMassDiagnosticInfo(*this, Tag, MassDiag);
+
+		// Continental loss attribution (3) — last solve
+		const FV9ContinentalLossAttribution SolveLoss = ComputeContinentalLossAttribution(Planet);
+		AddV6ContinentalLossAttributionInfo(
+			*this,
+			FString::Printf(TEXT("%s last_solve_loss"), *Tag),
+			SolveLoss);
+
+		// Cumulative loss from baseline
+		if (!BaselineCW.IsEmpty())
+		{
+			const FV9ContinentalLossAttribution CumulLoss =
+				ComputeCumulativeContinentalLossAttribution(BaselineCW, Planet.GetPlanet());
+			AddV6ContinentalLossAttributionInfo(
+				*this,
+				FString::Printf(TEXT("%s cumulative_loss_from_step0"), *Tag),
+				CumulLoss);
+		}
+
+		// Export continental mass overlays
+		if (bExport)
+		{
+			ExportContinentalMassOverlays(*this, Planet, MassDiag, VariantExportRoot, Step);
+		}
+
+		return MassDiag;
+	};
+
+	// --- A/B comparison logging ---
+	const auto LogMassComparison =
+		[this](
+			const int32 Step,
+			const FV9ContinentalMassDiagnostic& Baseline,
+			const FV9ContinentalMassDiagnostic& Candidate)
+	{
+		const FString Msg = FString::Printf(
+			TEXT("[V9MassAudit compare step=%d] ")
+			TEXT("continental_area=%.4f/%.4f samples=%d/%d components=%d/%d largest=%d/%d ")
+			TEXT("active_zone_frac=%.4f/%.4f boundary_band_frac=%.4f/%.4f deep_interior_frac=%.4f/%.4f ")
+			TEXT("coast_dist_mean=%.2f/%.2f p50=%.1f/%.1f p90=%.1f/%.1f max=%.1f/%.1f"),
+			Step,
+			Baseline.ContinentalAreaFraction,
+			Candidate.ContinentalAreaFraction,
+			Baseline.ContinentalSampleCount,
+			Candidate.ContinentalSampleCount,
+			Baseline.ComponentCount,
+			Candidate.ComponentCount,
+			Baseline.LargestComponentSize,
+			Candidate.LargestComponentSize,
+			Baseline.ActiveZoneContinentalFraction,
+			Candidate.ActiveZoneContinentalFraction,
+			Baseline.BoundaryBandContinentalFraction,
+			Candidate.BoundaryBandContinentalFraction,
+			Baseline.DeepInteriorContinentalFraction,
+			Candidate.DeepInteriorContinentalFraction,
+			Baseline.MeanCoastDistHops,
+			Candidate.MeanCoastDistHops,
+			Baseline.P50CoastDist,
+			Candidate.P50CoastDist,
+			Baseline.P90CoastDist,
+			Candidate.P90CoastDist,
+			Baseline.MaxCoastDist,
+			Candidate.MaxCoastDist);
+		AddInfo(Msg);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Msg);
+	};
+
+	// --- Step 0: Initial state ---
+	const TArray<float> BaselineCW0 = SnapshotContinentalWeights(BaselinePlanet.GetPlanet());
+	const TArray<float> CandidateCW0 = SnapshotContinentalWeights(CandidatePlanet.GetPlanet());
+	{
+		const FV9ContinentalMassDiagnostic B0 =
+			CaptureFullCheckpoint(BaselinePlanet, TEXT("baseline"), BaselineExportRoot, 0, {}, false);
+		AddInfo(FString::Printf(
+			TEXT("[V9MassAudit step=0] initial_continental_area=%.4f initial_samples=%d initial_components=%d initial_coast_mean=%.2f"),
+			B0.ContinentalAreaFraction,
+			B0.ContinentalSampleCount,
+			B0.ComponentCount,
+			B0.MeanCoastDistHops));
+	}
+
+	// --- Advance helper ---
+	auto AdvanceBothToStep =
+		[&](const int32 TargetStep)
+	{
+		while (BaselinePlanet.GetPlanet().CurrentStep < TargetStep)
+		{
+			BaselinePlanet.AdvanceStep();
+			CandidatePlanet.AdvanceStep();
+		}
+	};
+
+	// --- Step 25 ---
+	AdvanceBothToStep(25);
+	const FV9ContinentalMassDiagnostic BaselineStep25 =
+		CaptureFullCheckpoint(BaselinePlanet, TEXT("baseline"), BaselineExportRoot, 25, BaselineCW0, false);
+	const FV9ContinentalMassDiagnostic CandidateStep25 =
+		CaptureFullCheckpoint(CandidatePlanet, TEXT("retention"), CandidateExportRoot, 25, CandidateCW0, false);
+	LogMassComparison(25, BaselineStep25, CandidateStep25);
+
+	// --- Step 100 (full exports) ---
+	AdvanceBothToStep(100);
+	const FV9ContinentalMassDiagnostic BaselineStep100 =
+		CaptureFullCheckpoint(BaselinePlanet, TEXT("baseline"), BaselineExportRoot, 100, BaselineCW0, true);
+	const FV9ContinentalMassDiagnostic CandidateStep100 =
+		CaptureFullCheckpoint(CandidatePlanet, TEXT("retention"), CandidateExportRoot, 100, CandidateCW0, true);
+	LogMassComparison(100, BaselineStep100, CandidateStep100);
+
+	// Step 100 gate
+	const FV6CheckpointSnapshot BaselineSnapshot100 = BuildV6CheckpointSnapshot(BaselinePlanet);
+	const FV6CheckpointSnapshot CandidateSnapshot100 = BuildV6CheckpointSnapshot(CandidatePlanet);
+	AddInfo(FString::Printf(
+		TEXT("[V9MassAudit gate step=100] baseline: coherence=%.4f leakage=%.4f churn=%.4f | retention: coherence=%.4f leakage=%.4f churn=%.4f"),
+		BaselineSnapshot100.BoundaryCoherence.BoundaryCoherenceScore,
+		BaselineSnapshot100.BoundaryCoherence.InteriorLeakageFraction,
+		BaselineSnapshot100.OwnershipChurn.ChurnFraction,
+		CandidateSnapshot100.BoundaryCoherence.BoundaryCoherenceScore,
+		CandidateSnapshot100.BoundaryCoherence.InteriorLeakageFraction,
+		CandidateSnapshot100.OwnershipChurn.ChurnFraction));
+
+	const bool bStep100Healthy =
+		CandidateSnapshot100.BoundaryCoherence.BoundaryCoherenceScore > 0.92 &&
+		CandidateSnapshot100.BoundaryCoherence.InteriorLeakageFraction < 0.20 &&
+		CandidateSnapshot100.OwnershipChurn.ChurnFraction < 0.06;
+
+	// --- Step 200 (if healthy) ---
+	if (bStep100Healthy)
+	{
+		AdvanceBothToStep(200);
+		const FV9ContinentalMassDiagnostic BaselineStep200 =
+			CaptureFullCheckpoint(BaselinePlanet, TEXT("baseline"), BaselineExportRoot, 200, BaselineCW0, true);
+		const FV9ContinentalMassDiagnostic CandidateStep200 =
+			CaptureFullCheckpoint(CandidatePlanet, TEXT("retention"), CandidateExportRoot, 200, CandidateCW0, true);
+		LogMassComparison(200, BaselineStep200, CandidateStep200);
+	}
+
+	// --- Summary ---
+	AddInfo(FString::Printf(
+		TEXT("[V9MassAudit summary] export_root=%s baseline_root=%s candidate_root=%s"),
+		*ExportRoot,
+		*BaselineExportRoot,
+		*CandidateExportRoot));
+
+	TestTrue(TEXT("Baseline reached step 100"), BaselinePlanet.GetPlanet().CurrentStep >= 100);
+	TestTrue(TEXT("Candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep >= 100);
 	return true;
 }

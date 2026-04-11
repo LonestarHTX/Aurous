@@ -303,6 +303,9 @@ struct AUROUS_API FTectonicPlanetV6PeriodicSolveStats
 	int32 MaxComponentsBeforeCoherence = 0;
 	int32 MaxComponentsPerPlate = 0;
 	double ContinentalAreaFraction = 0.0;
+	int32 QuietInteriorContinentalRetentionCount = 0;
+	int32 QuietInteriorContinentalRetentionTriangleCount = 0;
+	int32 QuietInteriorContinentalRetentionSingleSourceCount = 0;
 	bool bDestructiveTriangleExclusionApplied = false;
 	FTectonicPlanetV6TransferResolutionCounts TriangleTransferCountsByResolution;
 	FTectonicPlanetV6TransferResolutionCounts SingleSourceTransferCountsByResolution;
@@ -1173,6 +1176,7 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetV9CollisionExecutionRefinedStructuralTransferForTest(bool bEnable);
 	void SetV9ThesisShapedCollisionExecutionForTest(bool bEnable);
 	void SetV9ThesisShapedCollisionRidgeSurgeForTest(bool bEnable);
+	void SetV9QuietInteriorContinentalRetentionForTest(bool bEnable);
 	void SetAutomaticRiftingForTest(bool bEnable);
 	bool ForceLargestEligibleAutomaticRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
 	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
@@ -1334,6 +1338,7 @@ private:
 	bool bEnableV9CollisionExecutionRefinedStructuralTransferForTest = false;
 	bool bEnableV9ThesisShapedCollisionExecutionForTest = false;
 	bool bEnableV9ThesisShapedCollisionRidgeSurgeForTest = false;
+	bool bEnableV9QuietInteriorContinentalRetentionForTest = false;
 	bool bEnableAutomaticRiftingForTest = false;
 	bool bUseLinearConvergentMaintenanceSpeedFactorForTest = true;
 	bool bUseLinearConvergentMaintenanceInfluenceForTest = true;

@@ -56,14 +56,12 @@ The planet is a **fixed canonical sample set** (60k Fibonacci sphere points) wit
 
 ### Tectonic Processes
 
-**Implemented and active in V6 solve path:**
+**All four tectonic processes implemented and active in V6 solve path:**
 - **Subduction:** Paper-aligned uplift ũ = u₀·f(d)·g(v)·h(z̃), BFS distance-to-front, slab pull rotation correction
 - **Oceanic Generation:** Frontier-pair fill with ridge-shaped elevation profile
-- **Continental Collision:** Shadow tracker with persistent pair qualification, bounded multi-event execution (2-3 per remesh), coherent terrane detection via bounded BFS, biweight kernel elevation surge. Connected and firing — collision fidelity is the current work area.
+- **Continental Collision:** Shadow tracker with persistent pair qualification, bounded multi-event execution (2-3 per remesh), coherent terrane detection via bounded BFS, paper-faithful radial biweight kernel elevation surge. Validated at step 200 with accumulating mountain-building. Ridge surge variant behind toggle (paper deviation, not default).
+- **Plate Rifting:** Poisson-triggered fracture into sub-plates via spherical Voronoi + noise. Wired into V6 with deferred follow-up to copied-frontier remesh. Post-rift V6 path proven end-to-end (forced rift validation). Default Poisson rate is low at 60k — will fire more naturally at higher resolution.
 - **Erosion:** Continental erosion (ε_c = 0.03 mm/yr), oceanic damping (ε_o = 0.04 mm/yr), trench accretion — all paper-aligned and active every timestep.
-
-**Implemented in legacy code, not yet wired into V6 path:**
-- **Plate Rifting:** Poisson-triggered fracture into sub-plates via spherical Voronoi + noise. Complete in `TectonicPlanet.cpp`, disabled in V6 at `TectonicPlanetV6.cpp:10668`.
 
 ### Key Parameters (paper-aligned, all verified 2026-04-11)
 - Timestep: 2 My; Planet radius: 6371 km
@@ -139,4 +137,4 @@ The project includes comprehensive diagnostics that should be used as gates for 
 
 ## Current Priority
 
-Collision execution fidelity — the paper's radial biweight kernel and terrane detection are connected, but collision effects are still too weak/small. Investigating whether the bottleneck is terrane size, influence radius inputs, or insufficient repeated events at 60k samples. After collision: wire rifting into V6 path, then long-run validation (step 500+), then calibration.
+Long-run tectonic-cycle validation (step 500+). All four tectonic processes are connected and individually validated. Quiet-interior continental retention guard preserves broad continental mass (step-200 CAF 0.28 vs 0.19 baseline, largest component 9558 vs 2407). Next: verify the full tectonic lifecycle works together — plates split, spread, collide, accrete, and shrink in a believable cycle. Watch items: plate count evolution, natural rift incidence, continental shape quality (width not just area), collision/rift interaction over time. After long-run: optimization and resolution ladder (60k → 100k → 250k).

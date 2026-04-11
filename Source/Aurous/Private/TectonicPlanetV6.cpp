@@ -14140,8 +14140,11 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	TAtomic<int32> ActiveBandTriangleFieldContinuityClampCount(0);
 	TAtomic<int32> ActiveBandSyntheticFieldPreserveCount(0);
 	TAtomic<int32> ActiveBandOceanicFieldPreserveCount(0);
+	TAtomic<int32> QuietInteriorContinentalRetentionCount(0);
+	TAtomic<int32> QuietInteriorContinentalRetentionTriangleCount(0);
+	TAtomic<int32> QuietInteriorContinentalRetentionSingleSourceCount(0);
 
-	ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &PreSolveContinentalWeights, &PreSolveElevations, &PreSolveThicknesses, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &SubductionDistances, &SubductionSpeeds, &DirectHitTriangleTransferCount, &TransferFallbackCount, &ActiveBandTriangleFieldContinuityClampCount, &ActiveBandSyntheticFieldPreserveCount, &ActiveBandOceanicFieldPreserveCount, &ActiveBandSyntheticSingleSourceRecoveryCount](const int32 SampleIndex)
+	ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &PreSolveContinentalWeights, &PreSolveElevations, &PreSolveThicknesses, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &SubductionDistances, &SubductionSpeeds, &DirectHitTriangleTransferCount, &TransferFallbackCount, &ActiveBandTriangleFieldContinuityClampCount, &ActiveBandSyntheticFieldPreserveCount, &ActiveBandOceanicFieldPreserveCount, &ActiveBandSyntheticSingleSourceRecoveryCount, &QuietInteriorContinentalRetentionCount, &QuietInteriorContinentalRetentionTriangleCount, &QuietInteriorContinentalRetentionSingleSourceCount](const int32 SampleIndex)
 	{
 		FSample& Sample = Planet.Samples[SampleIndex];
 		FTectonicPlanetV6ResolvedSample& Resolved = LastResolvedSamples[SampleIndex];
@@ -14399,6 +14402,35 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				}
 				++TransferFallbackCount;
 				bTransferred = true;
+			}
+		}
+
+		// Quiet-interior continental retention: prevent retained-owner outside-active-zone
+		// samples from flipping below CW 0.5 when there is no tectonic cause.
+		// Only protect samples that are genuinely elevated continental crust (pre-solve
+		// elevation above sea level). Clamp to 0.5 floor rather than restoring pre-solve
+		// CW to avoid positive feedback / runaway continental growth.
+		if (bTransferred &&
+			bEnableV9QuietInteriorContinentalRetentionForTest &&
+			Resolved.bAuthorityRetainedOutsideActiveZone &&
+			!Resolved.bActiveZoneSample &&
+			Resolved.PreviousPlateId != INDEX_NONE &&
+			Resolved.PreviousPlateId == Resolved.FinalPlateId &&
+			PreSolveContinentalWeights.IsValidIndex(SampleIndex) &&
+			PreSolveContinentalWeights[SampleIndex] >= 0.5f &&
+			PreSolveElevations.IsValidIndex(SampleIndex) &&
+			PreSolveElevations[SampleIndex] > 0.0f &&
+			Sample.ContinentalWeight < 0.5f)
+		{
+			Sample.ContinentalWeight = 0.5f;
+			++QuietInteriorContinentalRetentionCount;
+			if (Resolved.TransferDebug.SourceKind == ETectonicPlanetV6TransferSourceKind::Triangle)
+			{
+				++QuietInteriorContinentalRetentionTriangleCount;
+			}
+			else
+			{
+				++QuietInteriorContinentalRetentionSingleSourceCount;
 			}
 		}
 
@@ -15501,6 +15533,9 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		TransferStats.ContinentalWeightThresholdMismatchCountsByResolution;
 	LastSolveStats.BoundarySampleCount = CountBoundarySamples(Planet);
 	LastSolveStats.ContinentalAreaFraction = ComputeContinentalAreaFraction(Planet);
+	LastSolveStats.QuietInteriorContinentalRetentionCount = QuietInteriorContinentalRetentionCount.Load();
+	LastSolveStats.QuietInteriorContinentalRetentionTriangleCount = QuietInteriorContinentalRetentionTriangleCount.Load();
+	LastSolveStats.QuietInteriorContinentalRetentionSingleSourceCount = QuietInteriorContinentalRetentionSingleSourceCount.Load();
 	LastSolveStats.MaxComponentsBeforeCoherence = MaxComponentsBeforeRepartition;
 	LastSolveStats.MaxComponentsPerPlate = ComputeMaxComponentsPerPlate(Planet);
 	if (bEnableV9CollisionShadowForTest && bEnableV9Phase1Authority)
@@ -18839,6 +18874,11 @@ void FTectonicPlanetV6::SetV9ThesisShapedCollisionExecutionForTest(const bool bE
 void FTectonicPlanetV6::SetV9ThesisShapedCollisionRidgeSurgeForTest(const bool bEnable)
 {
 	bEnableV9ThesisShapedCollisionRidgeSurgeForTest = bEnable;
+}
+
+void FTectonicPlanetV6::SetV9QuietInteriorContinentalRetentionForTest(const bool bEnable)
+{
+	bEnableV9QuietInteriorContinentalRetentionForTest = bEnable;
 }
 
 void FTectonicPlanetV6::SetAutomaticRiftingForTest(const bool bEnable)
