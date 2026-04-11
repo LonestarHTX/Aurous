@@ -11213,3 +11213,168 @@ bool FTectonicPlanetV6V9ContinentalMassAuditTest::RunTest(const FString& Paramet
 	TestTrue(TEXT("Candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep >= 100);
 	return true;
 }
+
+// ============================================================================
+// Long-Run Tectonic Cycle Validation (step 500)
+// ============================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9LongRunValidationTest,
+	"Aurous.TectonicPlanet.V6V9LongRunValidationTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9LongRunValidationTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	const FString RunId = TEXT("V9LongRunValidation");
+
+	FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+		ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+		FixedIntervalSteps,
+		INDEX_NONE,
+		SampleCount,
+		PlateCount,
+		TestRandomSeed);
+	Planet.SetSyntheticCoverageRetentionForTest(false);
+	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+	Planet.SetExcludeMixedTrianglesForTest(false);
+	Planet.SetV9Phase1AuthorityForTest(true, 1);
+	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+	Planet.SetV9CollisionShadowForTest(true);
+	Planet.SetV9CollisionExecutionForTest(true);
+	Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+	Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
+	Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+	Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
+	Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
+	Planet.SetAutomaticRiftingForTest(true);
+
+	const FString ExportRoot = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*ExportRoot);
+
+	const TArray<float> CW0 = SnapshotContinentalWeights(Planet.GetPlanet());
+
+	const TArray<int32> CheckpointSteps = { 25, 100, 200, 300, 500 };
+	const TSet<int32> ExportSteps = { 100, 200, 500 };
+
+	const auto CaptureCheckpoint = [this, &ExportRoot, &CW0, &ExportSteps](
+		FTectonicPlanetV6& InPlanet,
+		const int32 Step)
+	{
+		const FString Tag = FString::Printf(TEXT("[V9LongRun step=%d]"), Step);
+		const bool bExport = ExportSteps.Contains(Step);
+
+		if (bExport)
+		{
+			ExportV6CheckpointMaps(*this, InPlanet, ExportRoot, Step);
+			ExportV6DebugOverlays(*this, InPlanet, ExportRoot, Step);
+		}
+
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(InPlanet);
+
+		// 1. Stability
+		AddV6BoundaryCoherenceInfo(*this, Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, Tag, Snapshot);
+
+		// 4. Collision activity
+		AddV6CollisionExecutionInfo(*this, Tag, Snapshot);
+
+		// 5. Rifting activity
+		AddV6RiftInfo(*this, Tag, InPlanet.ComputeRiftDiagnosticForTest());
+
+		// 3. Relief + retention guard
+		const FV9ContinentalElevationStats ElevStats = ComputeContinentalElevationStats(InPlanet);
+		const FTectonicPlanetV6PeriodicSolveStats& SolveStats =
+			InPlanet.GetPeriodicSolveCount() > 0
+				? InPlanet.GetLastSolveStats()
+				: InPlanet.BuildCurrentDiagnosticSnapshotForTest();
+		const FV6PlateSizeStats PlateSizeStats = ComputePlateSizeStats(InPlanet);
+		AddInfo(FString::Printf(
+			TEXT("%s elevation: mean=%.4f p95=%.4f max=%.4f above_2km=%d above_5km=%d continental_samples=%d retention_guard=%d(tri=%d,ss=%d) plates=%d plate_size=%d/%.0f/%d"),
+			*Tag,
+			ElevStats.MeanElevationKm,
+			ElevStats.P95ElevationKm,
+			ElevStats.MaxElevationKm,
+			ElevStats.SamplesAbove2Km,
+			ElevStats.SamplesAbove5Km,
+			ElevStats.ContinentalSampleCount,
+			SolveStats.QuietInteriorContinentalRetentionCount,
+			SolveStats.QuietInteriorContinentalRetentionTriangleCount,
+			SolveStats.QuietInteriorContinentalRetentionSingleSourceCount,
+			InPlanet.GetPlanet().Plates.Num(),
+			PlateSizeStats.MinSamples,
+			PlateSizeStats.MeanSamples,
+			PlateSizeStats.MaxSamples));
+
+		// 2. Continental footprint
+		const FV9ContinentalMassDiagnostic MassDiag = ComputeContinentalMassDiagnostic(InPlanet);
+		AddV6ContinentalMassDiagnosticInfo(*this, Tag, MassDiag);
+
+		// 6. Continental loss attribution
+		const FV9ContinentalLossAttribution SolveLoss = ComputeContinentalLossAttribution(InPlanet);
+		AddV6ContinentalLossAttributionInfo(
+			*this,
+			FString::Printf(TEXT("%s last_solve_loss"), *Tag),
+			SolveLoss);
+
+		if (!CW0.IsEmpty())
+		{
+			const FV9ContinentalLossAttribution CumulLoss =
+				ComputeCumulativeContinentalLossAttribution(CW0, InPlanet.GetPlanet());
+			AddV6ContinentalLossAttributionInfo(
+				*this,
+				FString::Printf(TEXT("%s cumulative_loss_from_step0"), *Tag),
+				CumulLoss);
+		}
+
+		if (bExport)
+		{
+			ExportContinentalMassOverlays(*this, InPlanet, MassDiag, ExportRoot, Step);
+		}
+
+		// Summary line for easy grep
+		AddInfo(FString::Printf(
+			TEXT("%s SUMMARY caf=%.4f samples=%d components=%d singletons=%d largest=%d coast_mean=%.2f p50=%.1f coherence=%.4f leakage=%.4f churn=%.4f plates=%d collisions_cum=%d rifts_cum=%d"),
+			*Tag,
+			MassDiag.ContinentalAreaFraction,
+			MassDiag.ContinentalSampleCount,
+			MassDiag.ComponentCount,
+			MassDiag.SingletonCount,
+			MassDiag.LargestComponentSize,
+			MassDiag.MeanCoastDistHops,
+			MassDiag.P50CoastDist,
+			Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+			Snapshot.OwnershipChurn.ChurnFraction,
+			Snapshot.PlateCount,
+			Snapshot.CollisionExecution.CumulativeExecutedCollisionCount,
+			InPlanet.ComputeRiftDiagnosticForTest().CumulativeRiftCount));
+	};
+
+	// Step 0 baseline
+	CaptureCheckpoint(Planet, 0);
+
+	// Run to each checkpoint
+	for (const int32 TargetStep : CheckpointSteps)
+	{
+		while (Planet.GetPlanet().CurrentStep < TargetStep)
+		{
+			Planet.AdvanceStep();
+		}
+		CaptureCheckpoint(Planet, TargetStep);
+	}
+
+	AddInfo(FString::Printf(
+		TEXT("[V9LongRun] export_root=%s final_step=%d"),
+		*ExportRoot,
+		Planet.GetPlanet().CurrentStep));
+
+	TestTrue(TEXT("Reached step 500"), Planet.GetPlanet().CurrentStep >= 500);
+	return true;
+}
