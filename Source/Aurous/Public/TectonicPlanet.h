@@ -189,6 +189,7 @@ struct FPendingRiftEvent
 {
 	bool bValid = false;
 	bool bAutomatic = false;
+	bool bForcedByTest = false;
 	int32 ParentPlateId = INDEX_NONE;
 	int32 ChildCount = 0;
 	int32 ChildPlateA = INDEX_NONE;
@@ -205,6 +206,7 @@ struct FPendingRiftEvent
 	TArray<int32> FormerParentTerraneIds;
 	double ParentContinentalFraction = 0.0;
 	double TriggerProbability = 0.0;
+	double TriggerDraw = 0.0;
 	double RiftMs = 0.0;
 };
 
@@ -765,6 +767,7 @@ struct AUROUS_API FTectonicPlanet
 	bool bEnableContinentalCollision = true;
 	bool bEnableAutomaticRifting = true;
 	bool bEnableWarpedRiftBoundaries = true;
+	bool bDeferRiftFollowupResamplingToV6 = false;
 	bool bUseVertexLevelSoupInclusionForTest = false; // Spike: include triangle in every plate that owns >= 1 vertex.
 	double SubductionBaseUpliftKmPerMyForTest = -1.0; // < 0 uses the compiled default.
 	bool bDisableSubductionElevationTransferForTest = false;
@@ -928,6 +931,15 @@ struct AUROUS_API FTectonicPlanet
 		EResampleTriggerReason TriggerReason = EResampleTriggerReason::None);
 	int32 ComputeResampleInterval() const;
 	bool TryTriggerAutomaticRift();
+	bool TriggerForcedRiftInternal(
+		int32 ParentPlateId,
+		int32 ChildCount,
+		int32 Seed,
+		bool bAutomatic,
+		double TriggerProbability,
+		double TriggerDraw,
+		int32 ParentContinentalSampleCount,
+		double ParentContinentalFraction);
 	bool TriggerForcedRiftInternal(
 		int32 ParentPlateId,
 		int32 ChildCount,

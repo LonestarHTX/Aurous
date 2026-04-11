@@ -51,6 +51,20 @@ namespace
 	constexpr float ActiveBandSyntheticMaxThicknessDeltaKm = 2.5f;
 	constexpr int32 ActiveBandSyntheticLoopBreakMinNeighborSupport = 2;
 
+	FString JoinIntArrayForLog(const TArray<int32>& Values)
+	{
+		FString Joined;
+		for (int32 Index = 0; Index < Values.Num(); ++Index)
+		{
+			if (Index > 0)
+			{
+				Joined += TEXT(",");
+			}
+			Joined += FString::FromInt(Values[Index]);
+		}
+		return Joined;
+	}
+
 	struct FV6PlateQueryGeometry
 	{
 		FV6PlateQueryGeometry()
@@ -10402,6 +10416,189 @@ namespace
 		return BoundarySampleCount;
 	}
 
+	int32 CountPlatePairContactEdges(
+		const FTectonicPlanet& Planet,
+		const int32 PlateA,
+		const int32 PlateB)
+	{
+		if (PlateA == INDEX_NONE || PlateB == INDEX_NONE || PlateA == PlateB)
+		{
+			return 0;
+		}
+
+		int32 ContactEdgeCount = 0;
+		for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+		{
+			if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			const int32 SamplePlateId = Planet.Samples[SampleIndex].PlateId;
+			if (SamplePlateId != PlateA && SamplePlateId != PlateB)
+			{
+				continue;
+			}
+
+			for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+			{
+				if (NeighborIndex <= SampleIndex || !Planet.Samples.IsValidIndex(NeighborIndex))
+				{
+					continue;
+				}
+
+				const int32 NeighborPlateId = Planet.Samples[NeighborIndex].PlateId;
+				if ((SamplePlateId == PlateA && NeighborPlateId == PlateB) ||
+					(SamplePlateId == PlateB && NeighborPlateId == PlateA))
+				{
+					++ContactEdgeCount;
+				}
+			}
+		}
+
+		return ContactEdgeCount;
+	}
+
+	FTectonicPlanetV6PlatePairBoundaryMotionDiagnostic ComputePlatePairBoundaryMotionDiagnostic(
+		const FTectonicPlanet& Planet,
+		const int32 PlateA,
+		const int32 PlateB)
+	{
+		FTectonicPlanetV6PlatePairBoundaryMotionDiagnostic Diagnostic;
+		if (PlateA == INDEX_NONE || PlateB == INDEX_NONE || PlateA == PlateB)
+		{
+			return Diagnostic;
+		}
+
+		TArray<int32> CurrentPlateIds;
+		CurrentPlateIds.Reserve(Planet.Samples.Num());
+		for (const FSample& Sample : Planet.Samples)
+		{
+			CurrentPlateIds.Add(Sample.PlateId);
+		}
+
+		const TArray<int32> RelevantPlateIds{ PlateA, PlateB };
+		double SumRelativeNormalVelocity = 0.0;
+		int32 ClassifiedEdgeCount = 0;
+		for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+		{
+			if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex) ||
+				!Planet.Samples.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			const int32 SamplePlateId = Planet.Samples[SampleIndex].PlateId;
+			if (SamplePlateId != PlateA && SamplePlateId != PlateB)
+			{
+				continue;
+			}
+
+			for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+			{
+				if (NeighborIndex <= SampleIndex || !Planet.Samples.IsValidIndex(NeighborIndex))
+				{
+					continue;
+				}
+
+				const int32 NeighborPlateId = Planet.Samples[NeighborIndex].PlateId;
+				if (!((SamplePlateId == PlateA && NeighborPlateId == PlateB) ||
+					  (SamplePlateId == PlateB && NeighborPlateId == PlateA)))
+				{
+					continue;
+				}
+
+				++Diagnostic.ContactEdgeCount;
+
+				TArray<FTectonicPlanetV6BoundaryMotionSample> MotionSamples;
+				BuildBoundaryMotionSamplesForPlateIds(
+					Planet,
+					CurrentPlateIds,
+					SampleIndex,
+					RelevantPlateIds,
+					MotionSamples);
+
+				double RelativeNormalVelocity = 0.0;
+				const EV6BoundaryMotionClass MotionClass = ClassifyBoundaryMotion(
+					Planet.Samples[SampleIndex].Position,
+					PlateA,
+					PlateB,
+					MotionSamples,
+					RelativeNormalVelocity);
+
+				if (MotionClass != EV6BoundaryMotionClass::Divergent &&
+					MotionClass != EV6BoundaryMotionClass::Convergent)
+				{
+					continue;
+				}
+
+				SumRelativeNormalVelocity += RelativeNormalVelocity;
+				++ClassifiedEdgeCount;
+				Diagnostic.MaxAbsRelativeNormalVelocityKmPerMy = FMath::Max(
+					Diagnostic.MaxAbsRelativeNormalVelocityKmPerMy,
+					FMath::Abs(RelativeNormalVelocity));
+
+				if (MotionClass == EV6BoundaryMotionClass::Divergent)
+				{
+					++Diagnostic.DivergentEdgeCount;
+				}
+				else
+				{
+					++Diagnostic.ConvergentEdgeCount;
+				}
+			}
+		}
+
+		Diagnostic.MeanRelativeNormalVelocityKmPerMy =
+			ClassifiedEdgeCount > 0 ? SumRelativeNormalVelocity / static_cast<double>(ClassifiedEdgeCount) : 0.0;
+		Diagnostic.bPairIsDivergent =
+			Diagnostic.DivergentEdgeCount > 0 &&
+			Diagnostic.DivergentEdgeCount >= Diagnostic.ConvergentEdgeCount &&
+			Diagnostic.MeanRelativeNormalVelocityKmPerMy > 0.0;
+		return Diagnostic;
+	}
+
+	void CountActivePairCauseSamples(
+		const TArray<FTectonicPlanetV6ResolvedSample>& ResolvedSamples,
+		const int32 PlateA,
+		const int32 PlateB,
+		int32& OutRiftSampleCount,
+		int32& OutDivergenceSampleCount)
+	{
+		OutRiftSampleCount = 0;
+		OutDivergenceSampleCount = 0;
+		if (PlateA == INDEX_NONE || PlateB == INDEX_NONE || PlateA == PlateB)
+		{
+			return;
+		}
+
+		const uint64 PairKey = MakeOrderedPlatePairKey(PlateA, PlateB);
+		for (const FTectonicPlanetV6ResolvedSample& Resolved : ResolvedSamples)
+		{
+			if (!Resolved.bActiveZoneSample ||
+				Resolved.ActiveZonePrimaryPlateId == INDEX_NONE ||
+				Resolved.ActiveZoneSecondaryPlateId == INDEX_NONE ||
+				MakeOrderedPlatePairKey(
+					Resolved.ActiveZonePrimaryPlateId,
+					Resolved.ActiveZoneSecondaryPlateId) != PairKey)
+			{
+				continue;
+			}
+
+			switch (Resolved.ActiveZoneCause)
+			{
+			case ETectonicPlanetV6ActiveZoneCause::Rift:
+				++OutRiftSampleCount;
+				break;
+			case ETectonicPlanetV6ActiveZoneCause::DivergenceFill:
+				++OutDivergenceSampleCount;
+				break;
+			default:
+				break;
+			}
+		}
+	}
+
 	double ComputeContinentalAreaFraction(const FTectonicPlanet& Planet)
 	{
 		if (Planet.Samples.IsEmpty())
@@ -12151,8 +12348,9 @@ void FTectonicPlanetV6::Initialize(
 
 	FTectonicPlanetRuntimeConfig RuntimeConfig = GetM6BaselineRuntimeConfig();
 	RuntimeConfig.ResamplingPolicy = EResamplingPolicy::EventDrivenOnly;
-	RuntimeConfig.bEnableAutomaticRifting = false;
+	RuntimeConfig.bEnableAutomaticRifting = bEnableAutomaticRiftingForTest;
 	ApplyTectonicPlanetRuntimeConfig(Planet, RuntimeConfig);
+	Planet.bDeferRiftFollowupResamplingToV6 = bEnableAutomaticRiftingForTest;
 
 	Planet.ResamplingSteps.Reset();
 	Planet.ResamplingHistory.Reset();
@@ -12214,6 +12412,7 @@ void FTectonicPlanetV6::Initialize(
 	CumulativeCollisionElevationDeltaMaskKm.Reset();
 	CumulativeCollisionContinentalGainMask.Reset();
 	CurrentSolveCollisionExecutionDiagnostic = FTectonicPlanetV6CollisionExecutionDiagnostic{};
+	CurrentSolveRiftDiagnostic = FTectonicPlanetV6RiftDiagnostic{};
 	V9CollisionShadowPairRecurrenceByKey.Reset();
 	V9CollisionExecutionLastSolveIndexByKey.Reset();
 	V9CollisionExecutionCumulativeCount = 0;
@@ -12224,6 +12423,7 @@ void FTectonicPlanetV6::Initialize(
 	V9CollisionExecutionCumulativeTransferredContinentalSampleCount = 0;
 	V9CollisionExecutionCumulativeElevationDeltaKm = 0.0;
 	V9CollisionExecutionCumulativeMaxElevationDeltaKm = 0.0;
+	V9RiftCumulativeCount = 0;
 	bEnableSyntheticCoverageRetentionForTest = false;
 	bEnableV9CollisionShadowForTest = false;
 	bEnableV9CollisionExecutionForTest = false;
@@ -12244,6 +12444,11 @@ void FTectonicPlanetV6::AdvanceStep()
 	if (bForcePerTimestepContainmentSoupRebuildForTest)
 	{
 		Planet.BuildContainmentSoups();
+	}
+
+	if (HandlePendingAutomaticRiftAfterAdvance())
+	{
+		return;
 	}
 
 	if (UsesIntervalDestructivePropagationForSolveMode(PeriodicSolveMode) &&
@@ -12291,6 +12496,140 @@ void FTectonicPlanetV6::AdvanceSteps(const int32 StepCount)
 	{
 		AdvanceStep();
 	}
+}
+
+bool FTectonicPlanetV6::HandlePendingAutomaticRiftAfterAdvance()
+{
+	if (!bEnableAutomaticRiftingForTest || !Planet.PendingRiftEvent.bValid)
+	{
+		return false;
+	}
+
+	const FPendingRiftEvent PendingRift = Planet.PendingRiftEvent;
+	++V9RiftCumulativeCount;
+
+	CurrentSolveRiftDiagnostic = FTectonicPlanetV6RiftDiagnostic{};
+	CurrentSolveRiftDiagnostic.bTriggeredThisSolve = true;
+	CurrentSolveRiftDiagnostic.bAutomatic = PendingRift.bAutomatic;
+	CurrentSolveRiftDiagnostic.bForcedByTest = PendingRift.bForcedByTest;
+	CurrentSolveRiftDiagnostic.bOwnershipAppliedDirectlyByEvent = true;
+	CurrentSolveRiftDiagnostic.bCopiedFrontierRebuiltBeforeSolve = true;
+	CurrentSolveRiftDiagnostic.bPlateSubmeshRebuiltBeforeSolve = true;
+	CurrentSolveRiftDiagnostic.Step = Planet.CurrentStep;
+	CurrentSolveRiftDiagnostic.CumulativeRiftCount = V9RiftCumulativeCount;
+	CurrentSolveRiftDiagnostic.ParentPlateId = PendingRift.ParentPlateId;
+	CurrentSolveRiftDiagnostic.ChildPlateA = PendingRift.ChildPlateA;
+	CurrentSolveRiftDiagnostic.ChildPlateB = PendingRift.ChildPlateB;
+	CurrentSolveRiftDiagnostic.ParentSampleCount = PendingRift.ParentSampleCount;
+	CurrentSolveRiftDiagnostic.ParentContinentalSampleCount = PendingRift.ParentContinentalSampleCount;
+	CurrentSolveRiftDiagnostic.ChildSampleCountA = PendingRift.ChildSampleCountA;
+	CurrentSolveRiftDiagnostic.ChildSampleCountB = PendingRift.ChildSampleCountB;
+	CurrentSolveRiftDiagnostic.PostRiftPlateCount = Planet.Plates.Num();
+	CurrentSolveRiftDiagnostic.ParentContinentalFraction = PendingRift.ParentContinentalFraction;
+	CurrentSolveRiftDiagnostic.TriggerProbability = PendingRift.TriggerProbability;
+	CurrentSolveRiftDiagnostic.TriggerDraw = PendingRift.TriggerDraw;
+	CurrentSolveRiftDiagnostic.RiftMilliseconds = PendingRift.RiftMs;
+	CurrentSolveRiftDiagnostic.ChildPlateIds = PendingRift.ChildPlateIds;
+	CurrentSolveRiftDiagnostic.ChildSampleCounts = PendingRift.ChildSampleCounts;
+
+	RebuildThesisCopiedFrontierMeshes();
+	RebuildThesisPlateSubmeshMeshes();
+
+	if (IsCopiedFrontierLikeSolveMode(PeriodicSolveMode))
+	{
+		if (UsesIntervalDestructivePropagationForSolveMode(PeriodicSolveMode))
+		{
+			RefreshCopiedFrontierDestructiveTrackingForTest();
+		}
+		else
+		{
+			CopiedFrontierTrackedDestructiveKinds.Reset();
+			CopiedFrontierTrackedPreferredContinuationPlateIds.Reset();
+			CopiedFrontierTrackedDestructiveSourcePlateIds.Reset();
+			CopiedFrontierTrackedDestructiveDistancesKm.Reset();
+			CopiedFrontierTrackedDestructiveSeedOriginFlags.Reset();
+			CopiedFrontierTrackedDestructiveSeedSurvivalLoggedFlags.Reset();
+			CopiedFrontierTrackedDestructiveTopologyNeighborOriginFlags.Reset();
+			CopiedFrontierTrackedDestructiveCurrentIntervalLifecycleStats =
+				FTectonicPlanetV6DestructiveTrackingLifecycleStats{};
+			CopiedFrontierTrackedDestructiveCurrentIntervalSeedCount = 0;
+			CopiedFrontierTrackedDestructiveCurrentIntervalPropagationCount = 0;
+			CopiedFrontierTrackedDestructiveCurrentIntervalExpiredCount = 0;
+			CopiedFrontierTrackedDestructiveCurrentIntervalPropagationWaveCount = 0;
+		}
+	}
+
+	PerformAuthoritativePeriodicSolve(ETectonicPlanetV6SolveTrigger::Rift);
+
+	CurrentSolveRiftDiagnostic.bPostRiftSolveRan =
+		LastSolveStats.Trigger == ETectonicPlanetV6SolveTrigger::Rift &&
+		LastSolveStats.Step == Planet.CurrentStep;
+	CurrentSolveRiftDiagnostic.PostRiftPlateCount = Planet.Plates.Num();
+	CurrentSolveRiftDiagnostic.ChildBoundaryContactEdgeCount =
+		CountPlatePairContactEdges(
+			Planet,
+			CurrentSolveRiftDiagnostic.ChildPlateA,
+			CurrentSolveRiftDiagnostic.ChildPlateB);
+	CountActivePairCauseSamples(
+		LastResolvedSamples,
+		CurrentSolveRiftDiagnostic.ChildPlateA,
+		CurrentSolveRiftDiagnostic.ChildPlateB,
+		CurrentSolveRiftDiagnostic.ChildBoundaryRiftActiveSampleCount,
+		CurrentSolveRiftDiagnostic.ChildBoundaryDivergenceActiveSampleCount);
+	CurrentSolveRiftDiagnostic.bChildBoundaryClassifiedDivergent =
+		CurrentSolveRiftDiagnostic.ChildBoundaryRiftActiveSampleCount > 0 ||
+		CurrentSolveRiftDiagnostic.ChildBoundaryDivergenceActiveSampleCount > 0;
+	CurrentSolveRiftDiagnostic.ChildBoundaryDivergentEdgeCount =
+		CurrentSolveRiftDiagnostic.bChildBoundaryClassifiedDivergent
+			? CurrentSolveRiftDiagnostic.ChildBoundaryContactEdgeCount
+			: 0;
+	const FTectonicPlanetV6PlatePairBoundaryMotionDiagnostic BoundaryMotion =
+		ComputePlatePairBoundaryMotionDiagnostic(
+			Planet,
+			CurrentSolveRiftDiagnostic.ChildPlateA,
+			CurrentSolveRiftDiagnostic.ChildPlateB);
+	CurrentSolveRiftDiagnostic.ChildBoundaryConvergentEdgeCount = BoundaryMotion.ConvergentEdgeCount;
+	CurrentSolveRiftDiagnostic.ChildBoundaryMeanRelativeNormalVelocityKmPerMy =
+		BoundaryMotion.MeanRelativeNormalVelocityKmPerMy;
+	CurrentSolveRiftDiagnostic.ChildBoundaryMaxAbsRelativeNormalVelocityKmPerMy =
+		BoundaryMotion.MaxAbsRelativeNormalVelocityKmPerMy;
+	CurrentSolveRiftDiagnostic.bChildBoundaryClassifiedDivergent =
+		CurrentSolveRiftDiagnostic.bChildBoundaryClassifiedDivergent ||
+		BoundaryMotion.bPairIsDivergent;
+	if (BoundaryMotion.DivergentEdgeCount > 0)
+	{
+		CurrentSolveRiftDiagnostic.ChildBoundaryDivergentEdgeCount = BoundaryMotion.DivergentEdgeCount;
+	}
+
+	const FString ChildPlateIdsString = JoinIntArrayForLog(CurrentSolveRiftDiagnostic.ChildPlateIds);
+	const FString ChildSampleCountsString = JoinIntArrayForLog(CurrentSolveRiftDiagnostic.ChildSampleCounts);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[TectonicPlanetV6 Rift Step=%d] automatic=%d forced=%d parent=%d child_ids=(%s) parent_samples=%d child_samples=(%s) parent_continental_fraction=%.4f trigger_probability=%.6f trigger_draw=%.6f post_rift_plate_count=%d remesh_ran=%d ownership_applied_directly=%d child_boundary_contact_edges=%d child_boundary_divergent_edges=%d child_boundary_convergent_edges=%d child_boundary_mean_rel_normal_velocity=%.4f child_boundary_max_abs_rel_normal_velocity=%.4f child_boundary_rift_active_samples=%d child_boundary_divergence_samples=%d"),
+		CurrentSolveRiftDiagnostic.Step,
+		CurrentSolveRiftDiagnostic.bAutomatic ? 1 : 0,
+		CurrentSolveRiftDiagnostic.bForcedByTest ? 1 : 0,
+		CurrentSolveRiftDiagnostic.ParentPlateId,
+		*ChildPlateIdsString,
+		CurrentSolveRiftDiagnostic.ParentSampleCount,
+		*ChildSampleCountsString,
+		CurrentSolveRiftDiagnostic.ParentContinentalFraction,
+		CurrentSolveRiftDiagnostic.TriggerProbability,
+		CurrentSolveRiftDiagnostic.TriggerDraw,
+		CurrentSolveRiftDiagnostic.PostRiftPlateCount,
+		CurrentSolveRiftDiagnostic.bPostRiftSolveRan ? 1 : 0,
+		CurrentSolveRiftDiagnostic.bOwnershipAppliedDirectlyByEvent ? 1 : 0,
+		CurrentSolveRiftDiagnostic.ChildBoundaryContactEdgeCount,
+		CurrentSolveRiftDiagnostic.ChildBoundaryDivergentEdgeCount,
+		CurrentSolveRiftDiagnostic.ChildBoundaryConvergentEdgeCount,
+		CurrentSolveRiftDiagnostic.ChildBoundaryMeanRelativeNormalVelocityKmPerMy,
+		CurrentSolveRiftDiagnostic.ChildBoundaryMaxAbsRelativeNormalVelocityKmPerMy,
+		CurrentSolveRiftDiagnostic.ChildBoundaryRiftActiveSampleCount,
+		CurrentSolveRiftDiagnostic.ChildBoundaryDivergenceActiveSampleCount);
+
+	Planet.PendingRiftEvent = FPendingRiftEvent{};
+	return true;
 }
 
 FTectonicPlanetV6ResolvedSample FTectonicPlanetV6::ResolvePhase1OwnershipForTest(
@@ -18188,6 +18527,66 @@ FTectonicPlanetV6CollisionExecutionDiagnostic FTectonicPlanetV6::ComputeCollisio
 	return CurrentSolveCollisionExecutionDiagnostic;
 }
 
+FTectonicPlanetV6RiftDiagnostic FTectonicPlanetV6::ComputeRiftDiagnosticForTest() const
+{
+	FTectonicPlanetV6RiftDiagnostic Diag = CurrentSolveRiftDiagnostic;
+	Diag.CumulativeRiftCount = V9RiftCumulativeCount;
+	Diag.bTriggeredThisSolve =
+		LastSolveStats.Trigger == ETectonicPlanetV6SolveTrigger::Rift &&
+		LastSolveStats.Step == Diag.Step;
+	Diag.PostRiftPlateCount = Planet.Plates.Num();
+	Diag.bParentPlateStillPresent =
+		Diag.ParentPlateId != INDEX_NONE &&
+		Planet.FindPlateArrayIndexById(Diag.ParentPlateId) != INDEX_NONE;
+
+	const int32 ChildPlateAIndex =
+		Diag.ChildPlateA != INDEX_NONE ? Planet.FindPlateArrayIndexById(Diag.ChildPlateA) : INDEX_NONE;
+	const int32 ChildPlateBIndex =
+		Diag.ChildPlateB != INDEX_NONE ? Planet.FindPlateArrayIndexById(Diag.ChildPlateB) : INDEX_NONE;
+	if (Planet.Plates.IsValidIndex(ChildPlateAIndex))
+	{
+		Diag.bChildPlateAAlive = true;
+		Diag.CurrentChildSampleCountA = Planet.Plates[ChildPlateAIndex].MemberSamples.Num();
+	}
+	if (Planet.Plates.IsValidIndex(ChildPlateBIndex))
+	{
+		Diag.bChildPlateBAlive = true;
+		Diag.CurrentChildSampleCountB = Planet.Plates[ChildPlateBIndex].MemberSamples.Num();
+	}
+
+	if (Diag.bChildPlateAAlive && Diag.bChildPlateBAlive)
+	{
+		Diag.ChildBoundaryContactEdgeCount =
+			CountPlatePairContactEdges(Planet, Diag.ChildPlateA, Diag.ChildPlateB);
+		CountActivePairCauseSamples(
+			LastResolvedSamples,
+			Diag.ChildPlateA,
+			Diag.ChildPlateB,
+			Diag.ChildBoundaryRiftActiveSampleCount,
+			Diag.ChildBoundaryDivergenceActiveSampleCount);
+
+		const FTectonicPlanetV6PlatePairBoundaryMotionDiagnostic MotionDiag =
+			ComputePlatePairBoundaryMotionDiagnostic(Planet, Diag.ChildPlateA, Diag.ChildPlateB);
+		Diag.ChildBoundaryDivergentEdgeCount = MotionDiag.DivergentEdgeCount;
+		Diag.ChildBoundaryConvergentEdgeCount = MotionDiag.ConvergentEdgeCount;
+		Diag.ChildBoundaryMeanRelativeNormalVelocityKmPerMy = MotionDiag.MeanRelativeNormalVelocityKmPerMy;
+		Diag.ChildBoundaryMaxAbsRelativeNormalVelocityKmPerMy = MotionDiag.MaxAbsRelativeNormalVelocityKmPerMy;
+		Diag.bChildBoundaryClassifiedDivergent =
+			Diag.ChildBoundaryRiftActiveSampleCount > 0 ||
+			Diag.ChildBoundaryDivergenceActiveSampleCount > 0 ||
+			MotionDiag.bPairIsDivergent;
+	}
+	return Diag;
+}
+
+FTectonicPlanetV6PlatePairBoundaryMotionDiagnostic
+FTectonicPlanetV6::ComputePlatePairBoundaryMotionDiagnosticForTest(
+	const int32 PlateA,
+	const int32 PlateB) const
+{
+	return ComputePlatePairBoundaryMotionDiagnostic(Planet, PlateA, PlateB);
+}
+
 const FTectonicPlanet& FTectonicPlanetV6::GetPlanet() const
 {
 	return Planet;
@@ -18440,6 +18839,71 @@ void FTectonicPlanetV6::SetV9ThesisShapedCollisionExecutionForTest(const bool bE
 void FTectonicPlanetV6::SetV9ThesisShapedCollisionRidgeSurgeForTest(const bool bEnable)
 {
 	bEnableV9ThesisShapedCollisionRidgeSurgeForTest = bEnable;
+}
+
+void FTectonicPlanetV6::SetAutomaticRiftingForTest(const bool bEnable)
+{
+	bEnableAutomaticRiftingForTest = bEnable;
+	Planet.bEnableAutomaticRifting = bEnable;
+	Planet.bDeferRiftFollowupResamplingToV6 = bEnable;
+}
+
+bool FTectonicPlanetV6::ForceLargestEligibleAutomaticRiftForTest(const int32 ChildCount, const int32 Seed)
+{
+	if (Planet.PendingRiftEvent.bValid)
+	{
+		return HandlePendingAutomaticRiftAfterAdvance();
+	}
+
+	int32 ParentContinentalSampleCount = 0;
+	double ParentContinentalFraction = 0.0;
+	const int32 ParentPlateId = Planet.FindLargestEligibleAutomaticRiftParentId(
+		&ParentContinentalSampleCount,
+		&ParentContinentalFraction);
+	if (ParentPlateId == INDEX_NONE)
+	{
+		return false;
+	}
+
+	const int32 ParentPlateIndex = Planet.FindPlateArrayIndexById(ParentPlateId);
+	if (!Planet.Plates.IsValidIndex(ParentPlateIndex))
+	{
+		return false;
+	}
+
+	const int32 ParentSampleCount = Planet.Plates[ParentPlateIndex].MemberSamples.Num();
+	const double TriggerProbability = Planet.ComputeAutomaticRiftProbabilityForSampleCount(
+		ParentSampleCount,
+		ParentContinentalFraction);
+
+	const bool bPreviousAutomaticRiftingForTest = bEnableAutomaticRiftingForTest;
+	const bool bPreviousAutomaticRifting = Planet.bEnableAutomaticRifting;
+	const bool bPreviousDeferRiftFollowup = Planet.bDeferRiftFollowupResamplingToV6;
+
+	bEnableAutomaticRiftingForTest = true;
+	Planet.bEnableAutomaticRifting = true;
+	Planet.bDeferRiftFollowupResamplingToV6 = true;
+
+	const bool bTriggered = Planet.TriggerForcedRift(ParentPlateId, ChildCount, Seed);
+	if (!bTriggered || !Planet.PendingRiftEvent.bValid)
+	{
+		bEnableAutomaticRiftingForTest = bPreviousAutomaticRiftingForTest;
+		Planet.bEnableAutomaticRifting = bPreviousAutomaticRifting;
+		Planet.bDeferRiftFollowupResamplingToV6 = bPreviousDeferRiftFollowup;
+		return false;
+	}
+
+	Planet.PendingRiftEvent.bAutomatic = false;
+	Planet.PendingRiftEvent.bForcedByTest = true;
+	Planet.PendingRiftEvent.TriggerProbability = TriggerProbability;
+	Planet.PendingRiftEvent.TriggerDraw = -1.0;
+
+	const bool bHandled = HandlePendingAutomaticRiftAfterAdvance();
+
+	bEnableAutomaticRiftingForTest = bPreviousAutomaticRiftingForTest;
+	Planet.bEnableAutomaticRifting = bPreviousAutomaticRifting;
+	Planet.bDeferRiftFollowupResamplingToV6 = bPreviousDeferRiftFollowup;
+	return bHandled;
 }
 
 void FTectonicPlanetV6::SetUseLinearConvergentMaintenanceSpeedFactorForTest(

@@ -8,6 +8,7 @@ enum class ETectonicPlanetV6SolveTrigger : uint8
 	None,
 	Periodic,
 	Manual,
+	Rift,
 };
 
 enum class ETectonicPlanetV6PeriodicSolveMode : uint8
@@ -980,6 +981,56 @@ struct AUROUS_API FTectonicPlanetV6CollisionExecutionDiagnostic
 	int32 ExecutedRidgeFlankAffectedSampleCount = 0;
 };
 
+struct AUROUS_API FTectonicPlanetV6RiftDiagnostic
+{
+	bool bTriggeredThisSolve = false;
+	bool bAutomatic = false;
+	bool bForcedByTest = false;
+	bool bOwnershipAppliedDirectlyByEvent = false;
+	bool bCopiedFrontierRebuiltBeforeSolve = false;
+	bool bPlateSubmeshRebuiltBeforeSolve = false;
+	bool bPostRiftSolveRan = false;
+	bool bChildBoundaryClassifiedDivergent = false;
+	bool bParentPlateStillPresent = false;
+	bool bChildPlateAAlive = false;
+	bool bChildPlateBAlive = false;
+	int32 Step = 0;
+	int32 CumulativeRiftCount = 0;
+	int32 ParentPlateId = INDEX_NONE;
+	int32 ChildPlateA = INDEX_NONE;
+	int32 ChildPlateB = INDEX_NONE;
+	int32 ParentSampleCount = 0;
+	int32 ParentContinentalSampleCount = 0;
+	int32 ChildSampleCountA = 0;
+	int32 ChildSampleCountB = 0;
+	int32 PostRiftPlateCount = 0;
+	int32 ChildBoundaryContactEdgeCount = 0;
+	int32 ChildBoundaryDivergentEdgeCount = 0;
+	int32 ChildBoundaryConvergentEdgeCount = 0;
+	int32 ChildBoundaryRiftActiveSampleCount = 0;
+	int32 ChildBoundaryDivergenceActiveSampleCount = 0;
+	int32 CurrentChildSampleCountA = 0;
+	int32 CurrentChildSampleCountB = 0;
+	double ParentContinentalFraction = 0.0;
+	double TriggerProbability = 0.0;
+	double TriggerDraw = 0.0;
+	double RiftMilliseconds = 0.0;
+	double ChildBoundaryMeanRelativeNormalVelocityKmPerMy = 0.0;
+	double ChildBoundaryMaxAbsRelativeNormalVelocityKmPerMy = 0.0;
+	TArray<int32> ChildPlateIds;
+	TArray<int32> ChildSampleCounts;
+};
+
+struct AUROUS_API FTectonicPlanetV6PlatePairBoundaryMotionDiagnostic
+{
+	bool bPairIsDivergent = false;
+	int32 ContactEdgeCount = 0;
+	int32 DivergentEdgeCount = 0;
+	int32 ConvergentEdgeCount = 0;
+	double MeanRelativeNormalVelocityKmPerMy = 0.0;
+	double MaxAbsRelativeNormalVelocityKmPerMy = 0.0;
+};
+
 struct AUROUS_API FTectonicPlanetV6
 {
 	void Initialize(
@@ -1017,6 +1068,10 @@ struct AUROUS_API FTectonicPlanetV6
 	FTectonicPlanetV6ActiveZoneDiagnostic ComputeActiveZoneDiagnosticForTest() const;
 	FTectonicPlanetV6CollisionShadowDiagnostic ComputeCollisionShadowDiagnosticForTest() const;
 	FTectonicPlanetV6CollisionExecutionDiagnostic ComputeCollisionExecutionDiagnosticForTest() const;
+	FTectonicPlanetV6RiftDiagnostic ComputeRiftDiagnosticForTest() const;
+	FTectonicPlanetV6PlatePairBoundaryMotionDiagnostic ComputePlatePairBoundaryMotionDiagnosticForTest(
+		int32 PlateA,
+		int32 PlateB) const;
 	const TArray<FTectonicPlanetV6ResolvedSample>& GetLastResolvedSamplesForTest() const { return LastResolvedSamples; }
 	const TArray<uint8>& GetMissLineageCountsForTest() const { return MissLineageCounts; }
 	const TArray<uint8>& GetCollisionShadowPersistenceMaskForTest() const
@@ -1118,6 +1173,8 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetV9CollisionExecutionRefinedStructuralTransferForTest(bool bEnable);
 	void SetV9ThesisShapedCollisionExecutionForTest(bool bEnable);
 	void SetV9ThesisShapedCollisionRidgeSurgeForTest(bool bEnable);
+	void SetAutomaticRiftingForTest(bool bEnable);
+	bool ForceLargestEligibleAutomaticRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
 	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
 	void SetUseLinearConvergentMaintenanceInfluenceForTest(bool bEnableLinear);
 
@@ -1163,6 +1220,7 @@ struct AUROUS_API FTectonicPlanetV6
 		FTectonicPlanetV6TransferDebugInfo& OutTransferDebug);
 
 private:
+	bool HandlePendingAutomaticRiftAfterAdvance();
 	void PerformThesisRemeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisCopiedFrontierSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisPlateSubmeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
@@ -1253,6 +1311,7 @@ private:
 	TArray<float> CumulativeCollisionElevationDeltaMaskKm;
 	TArray<float> CumulativeCollisionContinentalGainMask;
 	FTectonicPlanetV6CollisionExecutionDiagnostic CurrentSolveCollisionExecutionDiagnostic;
+	FTectonicPlanetV6RiftDiagnostic CurrentSolveRiftDiagnostic;
 	TMap<uint64, FGeometricCollisionPairRecurrenceState> V9CollisionShadowPairRecurrenceByKey;
 	TMap<uint64, int32> V9CollisionExecutionLastSolveIndexByKey;
 	int32 V9CollisionExecutionCumulativeCount = 0;
@@ -1275,6 +1334,7 @@ private:
 	bool bEnableV9CollisionExecutionRefinedStructuralTransferForTest = false;
 	bool bEnableV9ThesisShapedCollisionExecutionForTest = false;
 	bool bEnableV9ThesisShapedCollisionRidgeSurgeForTest = false;
+	bool bEnableAutomaticRiftingForTest = false;
 	bool bUseLinearConvergentMaintenanceSpeedFactorForTest = true;
 	bool bUseLinearConvergentMaintenanceInfluenceForTest = true;
 	TArray<uint8> CurrentSolveThesisCollisionTerraneComponentMask;
@@ -1285,4 +1345,5 @@ private:
 	double PreviousIntervalMeanSubductionDistanceKm = -1.0;
 	int32 PreviousIntervalSubductionSampleCount = 0;
 	int32 PreviousIntervalTrackedTriangleCount = 0;
+	int32 V9RiftCumulativeCount = 0;
 };

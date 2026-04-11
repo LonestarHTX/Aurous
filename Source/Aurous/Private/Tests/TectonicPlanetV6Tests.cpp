@@ -16,6 +16,8 @@ namespace
 	constexpr float TestBoundaryWarpAmplitude = 0.2f;
 	constexpr float TestContinentalFraction = 0.30f;
 
+	FString JoinIntArrayForDiagnostics(const TArray<int32>& Values);
+
 	struct FV6CheckpointSnapshot
 	{
 		int32 Step = 0;
@@ -1182,6 +1184,51 @@ namespace
 		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
 	}
 
+	void AddV6RiftInfo(
+		FAutomationTestBase& Test,
+		const FString& SummaryTag,
+		const FTectonicPlanetV6RiftDiagnostic& Rift)
+	{
+		const FString ChildPlateIds = JoinIntArrayForDiagnostics(Rift.ChildPlateIds);
+		const FString ChildSampleCounts = JoinIntArrayForDiagnostics(Rift.ChildSampleCounts);
+		const FString Message = FString::Printf(
+			TEXT("%s rift_step=%d rift_cumulative=%d triggered_this_solve=%d automatic=%d forced=%d parent=%d parent_still_present=%d child_ids=(%s) parent_samples=%d parent_continental_samples=%d parent_continental_fraction=%.4f child_samples=(%s) current_child_samples=(%d,%d) child_alive=(%d,%d) trigger_probability=%.6f trigger_draw=%.6f post_rift_plate_count=%d ownership_applied_directly=%d copied_frontier_rebuilt=%d plate_submesh_rebuilt=%d post_rift_solve_ran=%d child_boundary_contact_edges=%d child_boundary_divergent_edges=%d child_boundary_convergent_edges=%d child_boundary_mean_rel_normal_velocity=%.4f child_boundary_max_abs_rel_normal_velocity=%.4f child_boundary_rift_active_samples=%d child_boundary_divergence_samples=%d child_boundary_classified_divergent=%d"),
+			*SummaryTag,
+			Rift.Step,
+			Rift.CumulativeRiftCount,
+			Rift.bTriggeredThisSolve ? 1 : 0,
+			Rift.bAutomatic ? 1 : 0,
+			Rift.bForcedByTest ? 1 : 0,
+			Rift.ParentPlateId,
+			Rift.bParentPlateStillPresent ? 1 : 0,
+			*ChildPlateIds,
+			Rift.ParentSampleCount,
+			Rift.ParentContinentalSampleCount,
+			Rift.ParentContinentalFraction,
+			*ChildSampleCounts,
+			Rift.CurrentChildSampleCountA,
+			Rift.CurrentChildSampleCountB,
+			Rift.bChildPlateAAlive ? 1 : 0,
+			Rift.bChildPlateBAlive ? 1 : 0,
+			Rift.TriggerProbability,
+			Rift.TriggerDraw,
+			Rift.PostRiftPlateCount,
+			Rift.bOwnershipAppliedDirectlyByEvent ? 1 : 0,
+			Rift.bCopiedFrontierRebuiltBeforeSolve ? 1 : 0,
+			Rift.bPlateSubmeshRebuiltBeforeSolve ? 1 : 0,
+			Rift.bPostRiftSolveRan ? 1 : 0,
+			Rift.ChildBoundaryContactEdgeCount,
+			Rift.ChildBoundaryDivergentEdgeCount,
+			Rift.ChildBoundaryConvergentEdgeCount,
+			Rift.ChildBoundaryMeanRelativeNormalVelocityKmPerMy,
+			Rift.ChildBoundaryMaxAbsRelativeNormalVelocityKmPerMy,
+			Rift.ChildBoundaryRiftActiveSampleCount,
+			Rift.ChildBoundaryDivergenceActiveSampleCount,
+			Rift.bChildBoundaryClassifiedDivergent ? 1 : 0);
+		Test.AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	}
+
 	void AddV6TectonicInteractionInfo(
 		FAutomationTestBase& Test,
 		const FString& SummaryTag,
@@ -2155,6 +2202,38 @@ namespace
 				ContinentalElevations.Num() - 1);
 			Result.P95ElevationKm = ContinentalElevations[P95Index];
 		}
+		return Result;
+	}
+
+	struct FV6PlateSizeStats
+	{
+		int32 MinSamples = 0;
+		double MeanSamples = 0.0;
+		int32 MaxSamples = 0;
+	};
+
+	FV6PlateSizeStats ComputePlateSizeStats(const FTectonicPlanetV6& Planet)
+	{
+		FV6PlateSizeStats Result;
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		if (PlanetData.Plates.IsEmpty())
+		{
+			return Result;
+		}
+
+		int64 TotalSamples = 0;
+		Result.MinSamples = PlanetData.Plates[0].MemberSamples.Num();
+		Result.MaxSamples = Result.MinSamples;
+		for (const FPlate& Plate : PlanetData.Plates)
+		{
+			const int32 MemberCount = Plate.MemberSamples.Num();
+			Result.MinSamples = FMath::Min(Result.MinSamples, MemberCount);
+			Result.MaxSamples = FMath::Max(Result.MaxSamples, MemberCount);
+			TotalSamples += MemberCount;
+		}
+
+		Result.MeanSamples =
+			static_cast<double>(TotalSamples) / static_cast<double>(PlanetData.Plates.Num());
 		return Result;
 	}
 
@@ -9468,7 +9547,699 @@ bool FTectonicPlanetV6V9Step200ThesisSurgeValidationTest::RunTest(const FString&
 			Step200Snapshot.BoundaryCoherence.InteriorLeakageFraction));
 	}
 
-	TestTrue(TEXT("Planet reached step 200"),
-		Planet.GetPlanet().CurrentStep >= TargetStep);
+TestTrue(TEXT("Planet reached step 200"),
+	Planet.GetPlanet().CurrentStep >= TargetStep);
+return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9RiftingIntegrationHarnessTest,
+	"Aurous.TectonicPlanet.V6V9RiftingIntegrationHarnessTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9RiftingIntegrationHarnessTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	const FString RunId = TEXT("V9RiftingIntegrationHarness");
+
+	const auto InitializePlanet = [&](const bool bEnableAutomaticRifting) -> FTectonicPlanetV6
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+			FixedIntervalSteps,
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			TestRandomSeed);
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+		Planet.SetV9CollisionShadowForTest(true);
+		Planet.SetV9CollisionExecutionForTest(true);
+		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
+		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
+		Planet.SetAutomaticRiftingForTest(bEnableAutomaticRifting);
+		return Planet;
+	};
+
+	struct FRiftEventRecord
+	{
+		int32 Step = 0;
+		int32 ParentPlateId = INDEX_NONE;
+		int32 ChildPlateA = INDEX_NONE;
+		int32 ChildPlateB = INDEX_NONE;
+		int32 ParentSampleCount = 0;
+		int32 ChildSampleCountA = 0;
+		int32 ChildSampleCountB = 0;
+		int32 PostRiftPlateCount = 0;
+		int32 ChildBoundaryContactEdgeCount = 0;
+		int32 ChildBoundaryDivergentEdgeCount = 0;
+		int32 ChildBoundaryRiftActiveSampleCount = 0;
+		int32 ChildBoundaryDivergenceActiveSampleCount = 0;
+		double ParentContinentalFraction = 0.0;
+		double TriggerProbability = 0.0;
+		double TriggerDraw = 0.0;
+	};
+
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet(false);
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet(true);
+
+	const FString ExportRoot = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	const FString BaselineExportRoot = FPaths::Combine(ExportRoot, TEXT("baseline_rift_off"));
+	const FString CandidateExportRoot = FPaths::Combine(ExportRoot, TEXT("candidate_rift_on"));
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*BaselineExportRoot);
+	PlatformFile.CreateDirectoryTree(*CandidateExportRoot);
+
+	TArray<FRiftEventRecord> CandidateRiftEvents;
+	int32 PreviousCandidateRiftCount = 0;
+
+	const auto CaptureCheckpoint =
+		[this](FTectonicPlanetV6& Planet,
+			const FString& VariantTag,
+			const FString& VariantExportRoot,
+			const int32 Step,
+			const bool bFullExports) -> FV6CheckpointSnapshot
+	{
+		if (bFullExports)
+		{
+			ExportV6CheckpointMaps(*this, Planet, VariantExportRoot, Step);
+			ExportV6DebugOverlays(*this, Planet, VariantExportRoot, Step);
+		}
+
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+		const FString Tag = FString::Printf(TEXT("[V9RiftingHarness %s step=%d]"), *VariantTag, Step);
+		AddV6BoundaryCoherenceInfo(*this, Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, Tag, Snapshot);
+		AddV6CollisionShadowInfo(*this, Tag, Snapshot);
+		AddV6CollisionExecutionInfo(*this, Tag, Snapshot);
+		AddV6RiftInfo(*this, Tag, Planet.ComputeRiftDiagnosticForTest());
+
+		const FV9ContinentalElevationStats ElevationStats = ComputeContinentalElevationStats(Planet);
+		const FV6PlateSizeStats PlateSizeStats = ComputePlateSizeStats(Planet);
+		const FString ElevationMessage = FString::Printf(
+			TEXT("%s continental_mean_km=%.4f continental_p95_km=%.4f continental_max_km=%.4f above_2km=%d above_5km=%d plate_size_min_mean_max=%d/%.1f/%d"),
+			*Tag,
+			ElevationStats.MeanElevationKm,
+			ElevationStats.P95ElevationKm,
+			ElevationStats.MaxElevationKm,
+			ElevationStats.SamplesAbove2Km,
+			ElevationStats.SamplesAbove5Km,
+			PlateSizeStats.MinSamples,
+			PlateSizeStats.MeanSamples,
+			PlateSizeStats.MaxSamples);
+		AddInfo(ElevationMessage);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *ElevationMessage);
+		return Snapshot;
+	};
+
+	const auto LogComparison =
+		[this](
+			const int32 Step,
+			const FV6CheckpointSnapshot& Baseline,
+			const FV6CheckpointSnapshot& Candidate,
+			const FTectonicPlanetV6RiftDiagnostic& BaselineRift,
+			const FTectonicPlanetV6RiftDiagnostic& CandidateRift,
+			const FV9ContinentalElevationStats& BaselineElevation,
+			const FV9ContinentalElevationStats& CandidateElevation,
+			const FV6PlateSizeStats& BaselinePlateSizes,
+			const FV6PlateSizeStats& CandidatePlateSizes)
+	{
+		const FString Message = FString::Printf(
+			TEXT("[V9RiftingHarness compare step=%d] ")
+			TEXT("plate_count=%d/%d rift_cumulative=%d/%d ")
+			TEXT("coherence=%.4f/%.4f leakage=%.4f/%.4f churn=%.4f/%.4f ")
+			TEXT("miss=%d/%d multi_hit=%d/%d active_fraction=%.4f/%.4f ")
+			TEXT("continental_mean=%.4f/%.4f continental_p95=%.4f/%.4f above_2km=%d/%d ")
+			TEXT("plate_size_min_mean_max=%d,%.1f,%d/%d,%.1f,%d"),
+			Step,
+			Baseline.PlateCount,
+			Candidate.PlateCount,
+			BaselineRift.CumulativeRiftCount,
+			CandidateRift.CumulativeRiftCount,
+			Baseline.BoundaryCoherence.BoundaryCoherenceScore,
+			Candidate.BoundaryCoherence.BoundaryCoherenceScore,
+			Baseline.BoundaryCoherence.InteriorLeakageFraction,
+			Candidate.BoundaryCoherence.InteriorLeakageFraction,
+			Baseline.OwnershipChurn.ChurnFraction,
+			Candidate.OwnershipChurn.ChurnFraction,
+			Baseline.MissCount,
+			Candidate.MissCount,
+			Baseline.MultiHitCount,
+			Candidate.MultiHitCount,
+			Baseline.ActiveZone.ActiveFraction,
+			Candidate.ActiveZone.ActiveFraction,
+			BaselineElevation.MeanElevationKm,
+			CandidateElevation.MeanElevationKm,
+			BaselineElevation.P95ElevationKm,
+			CandidateElevation.P95ElevationKm,
+			BaselineElevation.SamplesAbove2Km,
+			CandidateElevation.SamplesAbove2Km,
+			BaselinePlateSizes.MinSamples,
+			BaselinePlateSizes.MeanSamples,
+			BaselinePlateSizes.MaxSamples,
+			CandidatePlateSizes.MinSamples,
+			CandidatePlateSizes.MeanSamples,
+			CandidatePlateSizes.MaxSamples);
+		AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	};
+
+	const auto TrackCandidateRiftEvent =
+		[this, &CandidatePlanet, &CandidateRiftEvents, &PreviousCandidateRiftCount]()
+	{
+		const FTectonicPlanetV6RiftDiagnostic Rift = CandidatePlanet.ComputeRiftDiagnosticForTest();
+		if (Rift.CumulativeRiftCount <= PreviousCandidateRiftCount)
+		{
+			return;
+		}
+
+		PreviousCandidateRiftCount = Rift.CumulativeRiftCount;
+		FRiftEventRecord& Event = CandidateRiftEvents.AddDefaulted_GetRef();
+		Event.Step = Rift.Step;
+		Event.ParentPlateId = Rift.ParentPlateId;
+		Event.ChildPlateA = Rift.ChildPlateA;
+		Event.ChildPlateB = Rift.ChildPlateB;
+		Event.ParentSampleCount = Rift.ParentSampleCount;
+		Event.ChildSampleCountA = Rift.ChildSampleCountA;
+		Event.ChildSampleCountB = Rift.ChildSampleCountB;
+		Event.PostRiftPlateCount = Rift.PostRiftPlateCount;
+		Event.ChildBoundaryContactEdgeCount = Rift.ChildBoundaryContactEdgeCount;
+		Event.ChildBoundaryDivergentEdgeCount = Rift.ChildBoundaryDivergentEdgeCount;
+		Event.ChildBoundaryRiftActiveSampleCount = Rift.ChildBoundaryRiftActiveSampleCount;
+		Event.ChildBoundaryDivergenceActiveSampleCount = Rift.ChildBoundaryDivergenceActiveSampleCount;
+		Event.ParentContinentalFraction = Rift.ParentContinentalFraction;
+		Event.TriggerProbability = Rift.TriggerProbability;
+		Event.TriggerDraw = Rift.TriggerDraw;
+
+		const FString EventMessage = FString::Printf(
+			TEXT("[V9RiftingHarness EVENT step=%d] parent=%d children=(%d,%d) parent_samples=%d child_samples=(%d,%d) parent_continental_fraction=%.4f trigger_probability=%.6f trigger_draw=%.6f post_rift_plate_count=%d remesh_ran=%d ownership_applied_directly=%d child_boundary_divergent=%d child_boundary_contact_edges=%d child_boundary_divergent_edges=%d child_boundary_rift_active_samples=%d child_boundary_divergence_samples=%d"),
+			Rift.Step,
+			Rift.ParentPlateId,
+			Rift.ChildPlateA,
+			Rift.ChildPlateB,
+			Rift.ParentSampleCount,
+			Rift.ChildSampleCountA,
+			Rift.ChildSampleCountB,
+			Rift.ParentContinentalFraction,
+			Rift.TriggerProbability,
+			Rift.TriggerDraw,
+			Rift.PostRiftPlateCount,
+			Rift.bPostRiftSolveRan ? 1 : 0,
+			Rift.bOwnershipAppliedDirectlyByEvent ? 1 : 0,
+			Rift.bChildBoundaryClassifiedDivergent ? 1 : 0,
+			Rift.ChildBoundaryContactEdgeCount,
+			Rift.ChildBoundaryDivergentEdgeCount,
+			Rift.ChildBoundaryRiftActiveSampleCount,
+			Rift.ChildBoundaryDivergenceActiveSampleCount);
+		AddInfo(EventMessage);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *EventMessage);
+	};
+
+	auto AdvanceBothToStep =
+		[&](const int32 TargetStep)
+	{
+		while (CandidatePlanet.GetPlanet().CurrentStep < TargetStep)
+		{
+			BaselinePlanet.AdvanceStep();
+			CandidatePlanet.AdvanceStep();
+			TrackCandidateRiftEvent();
+		}
+	};
+
+	FV6CheckpointSnapshot BaselineStep25;
+	FV6CheckpointSnapshot CandidateStep25;
+	FV6CheckpointSnapshot BaselineStep100;
+	FV6CheckpointSnapshot CandidateStep100;
+	FV6CheckpointSnapshot BaselineStep200;
+	FV6CheckpointSnapshot CandidateStep200;
+
+	AdvanceBothToStep(25);
+	BaselineStep25 = CaptureCheckpoint(BaselinePlanet, TEXT("baseline_rift_off"), BaselineExportRoot, 25, false);
+	CandidateStep25 = CaptureCheckpoint(CandidatePlanet, TEXT("candidate_rift_on"), CandidateExportRoot, 25, false);
+	LogComparison(
+		25,
+		BaselineStep25,
+		CandidateStep25,
+		BaselinePlanet.ComputeRiftDiagnosticForTest(),
+		CandidatePlanet.ComputeRiftDiagnosticForTest(),
+		ComputeContinentalElevationStats(BaselinePlanet),
+		ComputeContinentalElevationStats(CandidatePlanet),
+		ComputePlateSizeStats(BaselinePlanet),
+		ComputePlateSizeStats(CandidatePlanet));
+
+	AdvanceBothToStep(100);
+	BaselineStep100 = CaptureCheckpoint(BaselinePlanet, TEXT("baseline_rift_off"), BaselineExportRoot, 100, true);
+	CandidateStep100 = CaptureCheckpoint(CandidatePlanet, TEXT("candidate_rift_on"), CandidateExportRoot, 100, true);
+	const FTectonicPlanetV6RiftDiagnostic BaselineRift100 = BaselinePlanet.ComputeRiftDiagnosticForTest();
+	const FTectonicPlanetV6RiftDiagnostic CandidateRift100 = CandidatePlanet.ComputeRiftDiagnosticForTest();
+	const FV9ContinentalElevationStats BaselineElevation100 = ComputeContinentalElevationStats(BaselinePlanet);
+	const FV9ContinentalElevationStats CandidateElevation100 = ComputeContinentalElevationStats(CandidatePlanet);
+	const FV6PlateSizeStats BaselinePlateSizes100 = ComputePlateSizeStats(BaselinePlanet);
+	const FV6PlateSizeStats CandidatePlateSizes100 = ComputePlateSizeStats(CandidatePlanet);
+	LogComparison(
+		100,
+		BaselineStep100,
+		CandidateStep100,
+		BaselineRift100,
+		CandidateRift100,
+		BaselineElevation100,
+		CandidateElevation100,
+		BaselinePlateSizes100,
+		CandidatePlateSizes100);
+
+	const bool bRiftCountPass = CandidateRift100.CumulativeRiftCount > 0;
+	const bool bPlateCountPass = CandidateStep100.PlateCount >= PlateCount;
+	const bool bChildBoundaryDivergentPass =
+		CandidateRift100.CumulativeRiftCount > 0 &&
+		CandidateRift100.bChildBoundaryClassifiedDivergent;
+	const bool bCoherencePass = CandidateStep100.BoundaryCoherence.BoundaryCoherenceScore > 0.93;
+	const bool bLeakagePass = CandidateStep100.BoundaryCoherence.InteriorLeakageFraction < 0.18;
+	const bool bChurnPass = CandidateStep100.OwnershipChurn.ChurnFraction < 0.05;
+	const bool bMeanElevationPass = CandidateElevation100.MeanElevationKm > 0.3;
+	const bool bP95ElevationPass = CandidateElevation100.P95ElevationKm > 2.0;
+	const bool bAllowStep200 =
+		bRiftCountPass &&
+		bPlateCountPass &&
+		bChildBoundaryDivergentPass &&
+		bCoherencePass &&
+		bLeakagePass &&
+		bChurnPass &&
+		bMeanElevationPass &&
+		bP95ElevationPass;
+
+	if (!bRiftCountPass)
+	{
+		int32 EligibleContinentalSamples = 0;
+		double EligibleContinentalFraction = 0.0;
+		const int32 EligibleParentPlateId =
+			CandidatePlanet.GetPlanet().FindLargestEligibleAutomaticRiftParentId(
+				&EligibleContinentalSamples,
+				&EligibleContinentalFraction);
+		double EligibleProbability = 0.0;
+		int32 EligibleParentSamples = 0;
+		if (EligibleParentPlateId != INDEX_NONE)
+		{
+			const int32 ParentPlateIndex =
+				CandidatePlanet.GetPlanet().FindPlateArrayIndexById(EligibleParentPlateId);
+			if (CandidatePlanet.GetPlanet().Plates.IsValidIndex(ParentPlateIndex))
+			{
+				EligibleParentSamples =
+					CandidatePlanet.GetPlanet().Plates[ParentPlateIndex].MemberSamples.Num();
+				EligibleProbability =
+					CandidatePlanet.GetPlanet().ComputeAutomaticRiftProbabilityForSampleCount(
+						EligibleParentSamples,
+						EligibleContinentalFraction);
+			}
+		}
+
+		const FString NoRiftMessage = FString::Printf(
+			TEXT("[V9RiftingHarness no_rift_by_step100] eligible_parent=%d eligible_parent_samples=%d eligible_parent_continental_samples=%d eligible_parent_continental_fraction=%.4f eligible_probability=%.6f"),
+			EligibleParentPlateId,
+			EligibleParentSamples,
+			EligibleContinentalSamples,
+			EligibleContinentalFraction,
+			EligibleProbability);
+		AddInfo(NoRiftMessage);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *NoRiftMessage);
+	}
+
+	const FString GateMessage = FString::Printf(
+		TEXT("[V9RiftingHarness gate step=100] run_step200=%d rift_count=%d plate_count=%d child_boundary_divergent=%d coherence=%d leakage=%d churn=%d continental_mean=%d continental_p95=%d candidate_rifts=%d candidate_plate_count=%d candidate_coherence=%.4f candidate_leakage=%.4f candidate_churn=%.4f candidate_mean=%.4f candidate_p95=%.4f"),
+		bAllowStep200 ? 1 : 0,
+		bRiftCountPass ? 1 : 0,
+		bPlateCountPass ? 1 : 0,
+		bChildBoundaryDivergentPass ? 1 : 0,
+		bCoherencePass ? 1 : 0,
+		bLeakagePass ? 1 : 0,
+		bChurnPass ? 1 : 0,
+		bMeanElevationPass ? 1 : 0,
+		bP95ElevationPass ? 1 : 0,
+		CandidateRift100.CumulativeRiftCount,
+		CandidateStep100.PlateCount,
+		CandidateStep100.BoundaryCoherence.BoundaryCoherenceScore,
+		CandidateStep100.BoundaryCoherence.InteriorLeakageFraction,
+		CandidateStep100.OwnershipChurn.ChurnFraction,
+		CandidateElevation100.MeanElevationKm,
+		CandidateElevation100.P95ElevationKm);
+	AddInfo(GateMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *GateMessage);
+
+	if (bAllowStep200)
+	{
+		AdvanceBothToStep(200);
+		BaselineStep200 = CaptureCheckpoint(BaselinePlanet, TEXT("baseline_rift_off"), BaselineExportRoot, 200, true);
+		CandidateStep200 = CaptureCheckpoint(CandidatePlanet, TEXT("candidate_rift_on"), CandidateExportRoot, 200, true);
+		LogComparison(
+			200,
+			BaselineStep200,
+			CandidateStep200,
+			BaselinePlanet.ComputeRiftDiagnosticForTest(),
+			CandidatePlanet.ComputeRiftDiagnosticForTest(),
+			ComputeContinentalElevationStats(BaselinePlanet),
+			ComputeContinentalElevationStats(CandidatePlanet),
+			ComputePlateSizeStats(BaselinePlanet),
+			ComputePlateSizeStats(CandidatePlanet));
+	}
+
+	const FString PlateProgressionMessage = FString::Printf(
+		TEXT("[V9RiftingHarness plate_progression] baseline=0:%d,25:%d,100:%d%s candidate=0:%d,25:%d,100:%d%s"),
+		PlateCount,
+		BaselineStep25.PlateCount,
+		BaselineStep100.PlateCount,
+		bAllowStep200 ? *FString::Printf(TEXT(",200:%d"), BaselineStep200.PlateCount) : TEXT(""),
+		PlateCount,
+		CandidateStep25.PlateCount,
+		CandidateStep100.PlateCount,
+		bAllowStep200 ? *FString::Printf(TEXT(",200:%d"), CandidateStep200.PlateCount) : TEXT(""));
+	AddInfo(PlateProgressionMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *PlateProgressionMessage);
+
+	for (int32 EventIndex = 0; EventIndex < CandidateRiftEvents.Num(); ++EventIndex)
+	{
+		const FRiftEventRecord& Event = CandidateRiftEvents[EventIndex];
+		AddInfo(FString::Printf(
+			TEXT("[V9RiftingHarness event_summary index=%d] step=%d parent=%d children=(%d,%d) parent_samples=%d child_samples=(%d,%d) parent_continental_fraction=%.4f trigger_probability=%.6f trigger_draw=%.6f post_rift_plate_count=%d child_boundary_contact_edges=%d child_boundary_divergent_edges=%d child_boundary_rift_active_samples=%d child_boundary_divergence_samples=%d"),
+			EventIndex,
+			Event.Step,
+			Event.ParentPlateId,
+			Event.ChildPlateA,
+			Event.ChildPlateB,
+			Event.ParentSampleCount,
+			Event.ChildSampleCountA,
+			Event.ChildSampleCountB,
+			Event.ParentContinentalFraction,
+			Event.TriggerProbability,
+			Event.TriggerDraw,
+			Event.PostRiftPlateCount,
+			Event.ChildBoundaryContactEdgeCount,
+			Event.ChildBoundaryDivergentEdgeCount,
+			Event.ChildBoundaryRiftActiveSampleCount,
+			Event.ChildBoundaryDivergenceActiveSampleCount));
+	}
+
+	TestTrue(TEXT("Baseline reached step 100"), BaselinePlanet.GetPlanet().CurrentStep >= 100);
+	TestTrue(TEXT("Candidate reached step 100"), CandidatePlanet.GetPlanet().CurrentStep >= 100);
+	if (bAllowStep200)
+	{
+		TestTrue(TEXT("Candidate promoted to step 200"), CandidatePlanet.GetPlanet().CurrentStep == 200);
+	}
+	else
+	{
+		TestTrue(TEXT("Candidate stopped at step 100 when gate failed"), CandidatePlanet.GetPlanet().CurrentStep == 100);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9ForcedRiftValidationHarnessTest,
+	"Aurous.TectonicPlanet.V6V9ForcedRiftValidationHarnessTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9ForcedRiftValidationHarnessTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 60000;
+	constexpr int32 PlateCount = 40;
+	constexpr int32 ForcedRiftTriggerStep = 31;
+	constexpr int32 ForcedRiftChildCount = 2;
+	constexpr int32 ForcedRiftSeed = 17017;
+	constexpr int32 MinExpectedChildSamples = 256;
+	const FString RunId = TEXT("V9ForcedRiftValidationHarness");
+
+	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+			FixedIntervalSteps,
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			TestRandomSeed);
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+		Planet.SetV9CollisionShadowForTest(true);
+		Planet.SetV9CollisionExecutionForTest(true);
+		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
+		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
+		Planet.SetAutomaticRiftingForTest(false);
+		return Planet;
+	};
+
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
+
+	const FString ExportRoot = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	const FString BaselineExportRoot = FPaths::Combine(ExportRoot, TEXT("baseline_no_rift"));
+	const FString CandidateExportRoot = FPaths::Combine(ExportRoot, TEXT("candidate_forced_rift"));
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*BaselineExportRoot);
+	PlatformFile.CreateDirectoryTree(*CandidateExportRoot);
+
+	const auto CaptureCheckpoint =
+		[this](FTectonicPlanetV6& Planet,
+			const FString& VariantTag,
+			const FString& VariantExportRoot,
+			const int32 Step,
+			const bool bFullExports) -> FV6CheckpointSnapshot
+	{
+		if (bFullExports)
+		{
+			ExportV6CheckpointMaps(*this, Planet, VariantExportRoot, Step);
+			ExportV6DebugOverlays(*this, Planet, VariantExportRoot, Step);
+		}
+
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Planet);
+		const FString Tag = FString::Printf(TEXT("[V9ForcedRiftHarness %s step=%d]"), *VariantTag, Step);
+		AddV6BoundaryCoherenceInfo(*this, Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, Tag, Snapshot);
+		AddV6CollisionShadowInfo(*this, Tag, Snapshot);
+		AddV6CollisionExecutionInfo(*this, Tag, Snapshot);
+		AddV6RiftInfo(*this, Tag, Planet.ComputeRiftDiagnosticForTest());
+
+		const FV9ContinentalElevationStats ElevationStats = ComputeContinentalElevationStats(Planet);
+		const FV6PlateSizeStats PlateSizeStats = ComputePlateSizeStats(Planet);
+		const FString ElevationMessage = FString::Printf(
+			TEXT("%s continental_mean_km=%.4f continental_p95_km=%.4f continental_max_km=%.4f above_2km=%d above_5km=%d plate_size_min_mean_max=%d/%.1f/%d"),
+			*Tag,
+			ElevationStats.MeanElevationKm,
+			ElevationStats.P95ElevationKm,
+			ElevationStats.MaxElevationKm,
+			ElevationStats.SamplesAbove2Km,
+			ElevationStats.SamplesAbove5Km,
+			PlateSizeStats.MinSamples,
+			PlateSizeStats.MeanSamples,
+			PlateSizeStats.MaxSamples);
+		AddInfo(ElevationMessage);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *ElevationMessage);
+		return Snapshot;
+	};
+
+	const auto LogComparison =
+		[this](
+			const int32 Step,
+			const FV6CheckpointSnapshot& Baseline,
+			const FV6CheckpointSnapshot& Candidate,
+			const FTectonicPlanetV6RiftDiagnostic& CandidateRift,
+			const FV9ContinentalElevationStats& BaselineElevation,
+			const FV9ContinentalElevationStats& CandidateElevation)
+	{
+		const FString Message = FString::Printf(
+			TEXT("[V9ForcedRiftHarness compare step=%d] ")
+			TEXT("plate_count=%d/%d rift_cumulative=0/%d coherence=%.4f/%.4f leakage=%.4f/%.4f churn=%.4f/%.4f ")
+			TEXT("miss=%d/%d multi_hit=%d/%d active_fraction=%.4f/%.4f continental_mean=%.4f/%.4f continental_p95=%.4f/%.4f above_2km=%d/%d"),
+			Step,
+			Baseline.PlateCount,
+			Candidate.PlateCount,
+			CandidateRift.CumulativeRiftCount,
+			Baseline.BoundaryCoherence.BoundaryCoherenceScore,
+			Candidate.BoundaryCoherence.BoundaryCoherenceScore,
+			Baseline.BoundaryCoherence.InteriorLeakageFraction,
+			Candidate.BoundaryCoherence.InteriorLeakageFraction,
+			Baseline.OwnershipChurn.ChurnFraction,
+			Candidate.OwnershipChurn.ChurnFraction,
+			Baseline.MissCount,
+			Candidate.MissCount,
+			Baseline.MultiHitCount,
+			Candidate.MultiHitCount,
+			Baseline.ActiveZone.ActiveFraction,
+			Candidate.ActiveZone.ActiveFraction,
+			BaselineElevation.MeanElevationKm,
+			CandidateElevation.MeanElevationKm,
+			BaselineElevation.P95ElevationKm,
+			CandidateElevation.P95ElevationKm,
+			BaselineElevation.SamplesAbove2Km,
+			CandidateElevation.SamplesAbove2Km);
+		AddInfo(Message);
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Message);
+	};
+
+	auto AdvanceBothToStep =
+		[&](const int32 TargetStep)
+	{
+		while (CandidatePlanet.GetPlanet().CurrentStep < TargetStep)
+		{
+			BaselinePlanet.AdvanceStep();
+			CandidatePlanet.AdvanceStep();
+		}
+	};
+
+	AdvanceBothToStep(ForcedRiftTriggerStep);
+	const bool bForcedRiftTriggered =
+		CandidatePlanet.ForceLargestEligibleAutomaticRiftForTest(ForcedRiftChildCount, ForcedRiftSeed);
+	const FTectonicPlanetV6RiftDiagnostic ForcedRiftDiagnostic = CandidatePlanet.ComputeRiftDiagnosticForTest();
+	const FString ForcedEventMessage = FString::Printf(
+		TEXT("[V9ForcedRiftHarness EVENT step=%d] forced_triggered=%d parent=%d children=(%d,%d) parent_present=%d parent_samples=%d child_samples_at_event=(%d,%d) child_samples_current=(%d,%d) parent_continental_fraction=%.4f trigger_probability=%.6f trigger_draw=%.6f post_rift_plate_count=%d ownership_applied_directly=%d remesh_ran=%d copied_frontier_rebuilt=%d plate_submesh_rebuilt=%d child_boundary_divergent=%d child_boundary_contact_edges=%d child_boundary_divergent_edges=%d child_boundary_convergent_edges=%d child_boundary_mean_rel_normal_velocity=%.4f child_boundary_max_abs_rel_normal_velocity=%.4f"),
+		ForcedRiftDiagnostic.Step,
+		bForcedRiftTriggered ? 1 : 0,
+		ForcedRiftDiagnostic.ParentPlateId,
+		ForcedRiftDiagnostic.ChildPlateA,
+		ForcedRiftDiagnostic.ChildPlateB,
+		ForcedRiftDiagnostic.bParentPlateStillPresent ? 1 : 0,
+		ForcedRiftDiagnostic.ParentSampleCount,
+		ForcedRiftDiagnostic.ChildSampleCountA,
+		ForcedRiftDiagnostic.ChildSampleCountB,
+		ForcedRiftDiagnostic.CurrentChildSampleCountA,
+		ForcedRiftDiagnostic.CurrentChildSampleCountB,
+		ForcedRiftDiagnostic.ParentContinentalFraction,
+		ForcedRiftDiagnostic.TriggerProbability,
+		ForcedRiftDiagnostic.TriggerDraw,
+		ForcedRiftDiagnostic.PostRiftPlateCount,
+		ForcedRiftDiagnostic.bOwnershipAppliedDirectlyByEvent ? 1 : 0,
+		ForcedRiftDiagnostic.bPostRiftSolveRan ? 1 : 0,
+		ForcedRiftDiagnostic.bCopiedFrontierRebuiltBeforeSolve ? 1 : 0,
+		ForcedRiftDiagnostic.bPlateSubmeshRebuiltBeforeSolve ? 1 : 0,
+		ForcedRiftDiagnostic.bChildBoundaryClassifiedDivergent ? 1 : 0,
+		ForcedRiftDiagnostic.ChildBoundaryContactEdgeCount,
+		ForcedRiftDiagnostic.ChildBoundaryDivergentEdgeCount,
+		ForcedRiftDiagnostic.ChildBoundaryConvergentEdgeCount,
+		ForcedRiftDiagnostic.ChildBoundaryMeanRelativeNormalVelocityKmPerMy,
+		ForcedRiftDiagnostic.ChildBoundaryMaxAbsRelativeNormalVelocityKmPerMy);
+	AddInfo(ForcedEventMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *ForcedEventMessage);
+
+	AdvanceBothToStep(25);
+	const FV6CheckpointSnapshot BaselineStep25 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_no_rift"), BaselineExportRoot, 25, false);
+	const FV6CheckpointSnapshot CandidateStep25 =
+		CaptureCheckpoint(CandidatePlanet, TEXT("candidate_forced_rift"), CandidateExportRoot, 25, false);
+	LogComparison(
+		25,
+		BaselineStep25,
+		CandidateStep25,
+		CandidatePlanet.ComputeRiftDiagnosticForTest(),
+		ComputeContinentalElevationStats(BaselinePlanet),
+		ComputeContinentalElevationStats(CandidatePlanet));
+
+	AdvanceBothToStep(100);
+	const FV6CheckpointSnapshot BaselineStep100 =
+		CaptureCheckpoint(BaselinePlanet, TEXT("baseline_no_rift"), BaselineExportRoot, 100, true);
+	const FV6CheckpointSnapshot CandidateStep100 =
+		CaptureCheckpoint(CandidatePlanet, TEXT("candidate_forced_rift"), CandidateExportRoot, 100, true);
+	const FTectonicPlanetV6RiftDiagnostic CandidateRift100 = CandidatePlanet.ComputeRiftDiagnosticForTest();
+	const FV9ContinentalElevationStats BaselineElevation100 = ComputeContinentalElevationStats(BaselinePlanet);
+	const FV9ContinentalElevationStats CandidateElevation100 = ComputeContinentalElevationStats(CandidatePlanet);
+	LogComparison(
+		100,
+		BaselineStep100,
+		CandidateStep100,
+		CandidateRift100,
+		BaselineElevation100,
+		CandidateElevation100);
+
+	const bool bPlateCountPass = CandidateStep100.PlateCount >= (PlateCount + 1);
+	const bool bParentRemovedPass = !CandidateRift100.bParentPlateStillPresent;
+	const bool bChildAAlivePass = CandidateRift100.bChildPlateAAlive && CandidateRift100.CurrentChildSampleCountA >= MinExpectedChildSamples;
+	const bool bChildBAlivePass = CandidateRift100.bChildPlateBAlive && CandidateRift100.CurrentChildSampleCountB >= MinExpectedChildSamples;
+	const bool bPostRiftSolvePass =
+		bForcedRiftTriggered &&
+		CandidateRift100.bForcedByTest &&
+		CandidateRift100.bOwnershipAppliedDirectlyByEvent &&
+		CandidateRift100.bCopiedFrontierRebuiltBeforeSolve &&
+		CandidateRift100.bPlateSubmeshRebuiltBeforeSolve &&
+		CandidateRift100.bPostRiftSolveRan;
+	const bool bChildBoundaryPass =
+		CandidateRift100.bChildBoundaryClassifiedDivergent &&
+		CandidateRift100.ChildBoundaryDivergentEdgeCount > 0 &&
+		CandidateRift100.ChildBoundaryMeanRelativeNormalVelocityKmPerMy > 0.0;
+	const bool bCoherencePass = CandidateStep100.BoundaryCoherence.BoundaryCoherenceScore > 0.92;
+	const bool bLeakagePass = CandidateStep100.BoundaryCoherence.InteriorLeakageFraction < 0.20;
+	const bool bChurnPass = CandidateStep100.OwnershipChurn.ChurnFraction < 0.06;
+	const bool bMeanElevationPass = CandidateElevation100.MeanElevationKm > 0.3;
+	const bool bP95ElevationPass = CandidateElevation100.P95ElevationKm > 2.0;
+	const bool bAbove2KmPass = CandidateElevation100.SamplesAbove2Km > 3000;
+
+	const FString GateMessage = FString::Printf(
+		TEXT("[V9ForcedRiftHarness gate step=100] post_rift_solve=%d plate_count=%d parent_removed=%d child_a_alive=%d child_b_alive=%d child_boundary_divergent=%d coherence=%d leakage=%d churn=%d continental_mean=%d continental_p95=%d above_2km=%d candidate_plate_count=%d candidate_parent_present=%d candidate_child_samples=(%d,%d) candidate_child_boundary_mean_rel_normal_velocity=%.4f candidate_coherence=%.4f candidate_leakage=%.4f candidate_churn=%.4f candidate_mean=%.4f candidate_p95=%.4f candidate_above_2km=%d"),
+		bPostRiftSolvePass ? 1 : 0,
+		bPlateCountPass ? 1 : 0,
+		bParentRemovedPass ? 1 : 0,
+		bChildAAlivePass ? 1 : 0,
+		bChildBAlivePass ? 1 : 0,
+		bChildBoundaryPass ? 1 : 0,
+		bCoherencePass ? 1 : 0,
+		bLeakagePass ? 1 : 0,
+		bChurnPass ? 1 : 0,
+		bMeanElevationPass ? 1 : 0,
+		bP95ElevationPass ? 1 : 0,
+		bAbove2KmPass ? 1 : 0,
+		CandidateStep100.PlateCount,
+		CandidateRift100.bParentPlateStillPresent ? 1 : 0,
+		CandidateRift100.CurrentChildSampleCountA,
+		CandidateRift100.CurrentChildSampleCountB,
+		CandidateRift100.ChildBoundaryMeanRelativeNormalVelocityKmPerMy,
+		CandidateStep100.BoundaryCoherence.BoundaryCoherenceScore,
+		CandidateStep100.BoundaryCoherence.InteriorLeakageFraction,
+		CandidateStep100.OwnershipChurn.ChurnFraction,
+		CandidateElevation100.MeanElevationKm,
+		CandidateElevation100.P95ElevationKm,
+		CandidateElevation100.SamplesAbove2Km);
+	AddInfo(GateMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *GateMessage);
+
+	const FString PlateProgressionMessage = FString::Printf(
+		TEXT("[V9ForcedRiftHarness plate_progression] baseline=0:%d,%d:%d,25:%d,100:%d candidate=0:%d,%d:%d,25:%d,100:%d"),
+		PlateCount,
+		ForcedRiftTriggerStep,
+		PlateCount,
+		BaselineStep25.PlateCount,
+		BaselineStep100.PlateCount,
+		PlateCount,
+		ForcedRiftTriggerStep,
+		ForcedRiftDiagnostic.PostRiftPlateCount,
+		CandidateStep25.PlateCount,
+		CandidateStep100.PlateCount);
+	AddInfo(PlateProgressionMessage);
+	UE_LOG(LogTemp, Log, TEXT("%s"), *PlateProgressionMessage);
+
+	TestTrue(TEXT("Forced rift triggered"), bForcedRiftTriggered);
+	TestTrue(TEXT("Forced rift performed V6 post-rift solve"), bPostRiftSolvePass);
+	TestTrue(TEXT("Parent removed after rift"), bParentRemovedPass);
+	TestTrue(TEXT("Child plate A alive at step 100"), bChildAAlivePass);
+	TestTrue(TEXT("Child plate B alive at step 100"), bChildBAlivePass);
+	TestTrue(TEXT("Plate count increased after rift"), bPlateCountPass);
+	TestTrue(TEXT("Child boundary classified divergent"), bChildBoundaryPass);
+	TestTrue(TEXT("Forced-rift coherence stays above relaxed gate"), bCoherencePass);
+	TestTrue(TEXT("Forced-rift leakage stays under relaxed gate"), bLeakagePass);
+	TestTrue(TEXT("Forced-rift churn stays under relaxed gate"), bChurnPass);
+	TestTrue(TEXT("Forced-rift continental mean elevation stays healthy"), bMeanElevationPass);
+	TestTrue(TEXT("Forced-rift continental p95 elevation stays healthy"), bP95ElevationPass);
 	return true;
 }

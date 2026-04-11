@@ -5670,6 +5670,7 @@ void FTectonicPlanet::Initialize(const int32 InSampleCount, const double InPlane
 	bEnableOverlapHysteresis = false;
 	bEnableContinentalCollision = true;
 	ResamplingPolicy = EResamplingPolicy::PeriodicFull;
+	bDeferRiftFollowupResamplingToV6 = false;
 	LastResampleTriggerReason = EResampleTriggerReason::None;
 	LastResampleOwnershipMode = EResampleOwnershipMode::FullResolution;
 	bPendingFullResolutionResample = false;
@@ -6327,6 +6328,7 @@ bool FTectonicPlanet::TryTriggerAutomaticRift()
 		EventSeed,
 		true,
 		Probability,
+		Draw,
 		ContinentalSampleCount,
 		ContinentalFraction);
 }
@@ -6346,7 +6348,27 @@ int32 FTectonicPlanet::FindPlateArrayIndexById(const int32 PlateId) const
 
 bool FTectonicPlanet::TriggerForcedRift(const int32 ParentPlateId, const int32 ChildCount, const int32 Seed)
 {
-	return TriggerForcedRiftInternal(ParentPlateId, ChildCount, Seed, false, 0.0, 0, 0.0);
+	return TriggerForcedRiftInternal(ParentPlateId, ChildCount, Seed, false, 0.0, 0.0, 0, 0.0);
+}
+
+bool FTectonicPlanet::TriggerForcedRiftInternal(
+	const int32 ParentPlateId,
+	const int32 ChildCount,
+	const int32 Seed,
+	const bool bAutomatic,
+	const double TriggerProbability,
+	const int32 ParentContinentalSampleCount,
+	const double ParentContinentalFraction)
+{
+	return TriggerForcedRiftInternal(
+		ParentPlateId,
+		ChildCount,
+		Seed,
+		bAutomatic,
+		TriggerProbability,
+		0.0,
+		ParentContinentalSampleCount,
+		ParentContinentalFraction);
 }
 
 bool FTectonicPlanet::TriggerForcedRiftInternal(
@@ -6355,6 +6377,7 @@ bool FTectonicPlanet::TriggerForcedRiftInternal(
 	const int32 Seed,
 	const bool bAutomatic,
 	const double TriggerProbability,
+	const double TriggerDraw,
 	const int32 ParentContinentalSampleCount,
 	const double ParentContinentalFraction)
 {
@@ -6503,6 +6526,7 @@ bool FTectonicPlanet::TriggerForcedRiftInternal(
 	PendingRiftEvent.FormerParentTerraneIds = MoveTemp(FormerParentTerraneIds);
 	PendingRiftEvent.ParentContinentalFraction = EffectiveParentContinentalFraction;
 	PendingRiftEvent.TriggerProbability = TriggerProbability;
+	PendingRiftEvent.TriggerDraw = TriggerDraw;
 	PendingRiftEvent.RiftMs = (FPlatformTime::Seconds() - RiftStartTime) * 1000.0;
 
 	const FString ChildPlateIdsString = JoinIntArrayForLog(ChildPlateIds);
@@ -6523,7 +6547,10 @@ bool FTectonicPlanet::TriggerForcedRiftInternal(
 		RiftEventSeed,
 		*ChildSampleCountsString);
 
-	PerformResampling(EResampleOwnershipMode::FullResolution, EResampleTriggerReason::RiftFollowup);
+	if (!bDeferRiftFollowupResamplingToV6)
+	{
+		PerformResampling(EResampleOwnershipMode::FullResolution, EResampleTriggerReason::RiftFollowup);
+	}
 	return true;
 }
 
