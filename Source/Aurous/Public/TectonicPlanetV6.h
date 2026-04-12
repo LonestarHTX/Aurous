@@ -328,6 +328,16 @@ struct AUROUS_API FTectonicPlanetV6PeriodicSolveStats
 	int32 SlabPullFrontSampleCount = 0;
 	int32 CachedAdjacencyEdgeDistanceCount = 0;
 	int64 CachedAdjacencyEdgeLookupCount = 0;
+	int64 SubductionQueuePushCount = 0;
+	int64 SubductionQueuePopCount = 0;
+	int64 SubductionRelaxationCount = 0;
+	double SubductionConvergentEdgeBuildMs = 0.0;
+	double SubductionSeedInitializationMs = 0.0;
+	double SubductionPropagationMs = 0.0;
+	double SubductionFinalizeMs = 0.0;
+	double SlabPullConvergentEdgeBuildMs = 0.0;
+	double SlabPullFrontierBuildMs = 0.0;
+	double SlabPullApplyMs = 0.0;
 	int64 HitSearchPlateCandidateCountTotal = 0;
 	int32 HitSearchPlateCandidateCountMax = 0;
 	int32 HitSearchPrunedSampleCount = 0;

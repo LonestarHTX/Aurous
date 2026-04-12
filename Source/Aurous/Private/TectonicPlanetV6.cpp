@@ -16650,6 +16650,19 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			SubductionFieldDiagnostics.CachedAdjacencyEdgeDistanceCount,
 			SlabPullDiagnostics.CachedAdjacencyEdgeDistanceCount);
 	LastSolveStats.CachedAdjacencyEdgeLookupCount = SubductionFieldDiagnostics.CachedAdjacencyEdgeLookupCount;
+	LastSolveStats.SubductionQueuePushCount = SubductionFieldDiagnostics.SubductionQueuePushCount;
+	LastSolveStats.SubductionQueuePopCount = SubductionFieldDiagnostics.SubductionQueuePopCount;
+	LastSolveStats.SubductionRelaxationCount = SubductionFieldDiagnostics.SubductionRelaxationCount;
+	LastSolveStats.SubductionConvergentEdgeBuildMs =
+		SubductionFieldDiagnostics.SubductionConvergentEdgeBuildMs;
+	LastSolveStats.SubductionSeedInitializationMs =
+		SubductionFieldDiagnostics.SubductionSeedInitializationMs;
+	LastSolveStats.SubductionPropagationMs = SubductionFieldDiagnostics.SubductionPropagationMs;
+	LastSolveStats.SubductionFinalizeMs = SubductionFieldDiagnostics.SubductionFinalizeMs;
+	LastSolveStats.SlabPullConvergentEdgeBuildMs =
+		SlabPullDiagnostics.SlabPullConvergentEdgeBuildMs;
+	LastSolveStats.SlabPullFrontierBuildMs = SlabPullDiagnostics.SlabPullFrontierBuildMs;
+	LastSolveStats.SlabPullApplyMs = SlabPullDiagnostics.SlabPullApplyMs;
 	LastSolveStats.HitSearchPlateCandidateCountTotal = HitSearchPlateCandidateCountTotal;
 	LastSolveStats.HitSearchPlateCandidateCountMax = HitSearchPlateCandidateCountMax;
 	LastSolveStats.HitSearchPrunedSampleCount = HitSearchPrunedSampleCount;

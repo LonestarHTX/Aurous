@@ -223,9 +223,19 @@ struct FSubductionComputationDiagnostics
 	int32 SlabPullTotalFrontSamples = 0;
 	int32 CachedAdjacencyEdgeDistanceCount = 0;
 	int64 CachedAdjacencyEdgeLookupCount = 0;
+	int64 SubductionQueuePushCount = 0;
+	int64 SubductionQueuePopCount = 0;
+	int64 SubductionRelaxationCount = 0;
 	double ConvergentEdgeBuildMs = 0.0;
 	double SubductionFieldMs = 0.0;
 	double SlabPullMs = 0.0;
+	double SubductionConvergentEdgeBuildMs = 0.0;
+	double SubductionSeedInitializationMs = 0.0;
+	double SubductionPropagationMs = 0.0;
+	double SubductionFinalizeMs = 0.0;
+	double SlabPullConvergentEdgeBuildMs = 0.0;
+	double SlabPullFrontierBuildMs = 0.0;
+	double SlabPullApplyMs = 0.0;
 };
 
 struct FTectonicPlanetStepBudget
@@ -811,6 +821,7 @@ struct AUROUS_API FTectonicPlanet
 	bool bDeferRiftFollowupResamplingToV6 = false;
 	bool bUseVertexLevelSoupInclusionForTest = false; // Spike: include triangle in every plate that owns >= 1 vertex.
 	bool bUseCachedSubductionAdjacencyEdgeDistancesForTest = true;
+	bool bUseSubductionPerformanceOptimizationsForTest = true;
 	double SubductionBaseUpliftKmPerMyForTest = -1.0; // < 0 uses the compiled default.
 	bool bDisableSubductionElevationTransferForTest = false;
 	double RiftBoundaryWarpAmplitude = 0.18;
