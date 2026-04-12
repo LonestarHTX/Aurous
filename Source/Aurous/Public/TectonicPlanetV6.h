@@ -317,6 +317,17 @@ struct AUROUS_API FTectonicPlanetV6PeriodicSolveStats
 	int32 PlateSubmeshComponentCount = 0;
 	int32 PlateSubmeshWholeMixedTriangleDuplicationCount = 0;
 	int32 InteriorHitCount = 0;
+	int32 SubductionFieldComputeCount = 0;
+	int32 SlabPullComputeCount = 0;
+	int32 ConvergentEdgeBuildCount = 0;
+	int32 ReusedConvergentEdgeSetCount = 0;
+	int32 SubductionConvergentEdgeCount = 0;
+	int32 SlabPullConvergentEdgeCount = 0;
+	int32 SubductionSeedSampleCount = 0;
+	int32 SubductionInfluencedCount = 0;
+	int32 SlabPullFrontSampleCount = 0;
+	int32 CachedAdjacencyEdgeDistanceCount = 0;
+	int64 CachedAdjacencyEdgeLookupCount = 0;
 	int32 DestructiveTriangleGeometryExcludedCount = 0;
 	int32 DestructiveTriangleRejectedCount = 0;
 	int32 TrackedDestructiveTriangleCount = 0;

@@ -14415,6 +14415,12 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 		TArray<uint8> Step0CoastAdjacentFlags;
 	};
 
+	struct FVariantConfig
+	{
+		FString LabelSuffix;
+		bool bUseCachedSubductionAdjacencyEdgeDistances = true;
+	};
+
 	const auto ComputeDriftMeans = [](const FTectonicPlanetV6PeriodicSolveStats& SolveStats)
 	{
 		FSurrogateDriftMeans Drift;
@@ -14455,7 +14461,9 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 		return Drift;
 	};
 
-	const auto InitializePlanet = [=](const int32 SampleCount)
+	const auto InitializePlanet = [=](
+		const int32 SampleCount,
+		const bool bUseCachedSubductionAdjacencyEdgeDistances)
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
@@ -14486,6 +14494,8 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
 		Planet.SetPhaseTimingForTest(true);
 		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
+		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest =
+			bUseCachedSubductionAdjacencyEdgeDistances;
 		return Planet;
 	};
 
@@ -14616,7 +14626,7 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 		Run.SolveTimings.Add(SolveStep, SolveStats);
 		const FTectonicPlanetV6PhaseTiming& Phase = SolveStats.PhaseTiming;
 		AddInfo(FString::Printf(
-			TEXT("[V9Perf %s solve=%d] total_ms=%.3f pre_solve_ms=%.3f sample_adjacency_ms=%.3f active_zone_ms=%.3f copied_frontier_mesh_ms=%.3f query_geometry_ms=%.3f frontier_point_sets_ms=%.3f resolve_transfer_loop_ms=%.3f hit_search_ms=%.3f zero_hit_recovery_ms=%.3f direct_hit_transfer_ms=%.3f fallback_transfer_ms=%.3f quiet_interior_preserve_ms=%.3f attribution_ms=%.3f repartition_ms=%.3f subduction_field_ms=%.3f plate_scores_ms=%.3f slab_pull_ms=%.3f terrane_ms=%.3f component_audit_ms=%.3f rebuild_meshes_ms=%.3f collision_shadow_ms=%.3f collision_exec_ms=%.3f work_samples=%d work_plates=%d plate_local_vertices=%d plate_local_triangles=%d copied_frontier_vertices=%d copied_frontier_triangles=%d copied_frontier_carried=%d direct_hit_transfer_count=%d zero_hit_recovery_count=%d nearest_member_fallback_count=%d explicit_fallback_count=%d quiet_interior_touched=%d tracked_destructive=%d tracked_subduction=%d tracked_collision=%d"),
+			TEXT("[V9Perf %s solve=%d] total_ms=%.3f pre_solve_ms=%.3f sample_adjacency_ms=%.3f active_zone_ms=%.3f copied_frontier_mesh_ms=%.3f query_geometry_ms=%.3f frontier_point_sets_ms=%.3f resolve_transfer_loop_ms=%.3f hit_search_ms=%.3f zero_hit_recovery_ms=%.3f direct_hit_transfer_ms=%.3f fallback_transfer_ms=%.3f quiet_interior_preserve_ms=%.3f attribution_ms=%.3f repartition_ms=%.3f subduction_field_ms=%.3f plate_scores_ms=%.3f slab_pull_ms=%.3f terrane_ms=%.3f component_audit_ms=%.3f rebuild_meshes_ms=%.3f collision_shadow_ms=%.3f collision_exec_ms=%.3f work_samples=%d work_plates=%d plate_local_vertices=%d plate_local_triangles=%d copied_frontier_vertices=%d copied_frontier_triangles=%d copied_frontier_carried=%d direct_hit_transfer_count=%d zero_candidate_count=%d miss_count=%d nearest_member_fallback_count=%d explicit_fallback_count=%d quiet_interior_touched=%d tracked_destructive=%d tracked_subduction=%d tracked_collision=%d"),
 			*Run.Label,
 			SolveStep,
 			SolveStats.SolveMilliseconds,
@@ -14650,6 +14660,7 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 			SolveStats.CopiedFrontierTriangleCount,
 			SolveStats.CopiedFrontierCarriedSampleCount,
 			SolveStats.DirectHitTriangleTransferCount,
+			SolveStats.ZeroCandidateCount,
 			SolveStats.MissCount,
 			SolveStats.NearestMemberFallbackTransferCount,
 			SolveStats.ExplicitFallbackTransferCount,
@@ -14657,6 +14668,21 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 			SolveStats.TrackedDestructiveTriangleCount,
 			SolveStats.TrackedSubductionTriangleCount,
 			SolveStats.TrackedCollisionTriangleCount));
+		AddInfo(FString::Printf(
+			TEXT("[V9Perf %s solve=%d work] subduction_compute_count=%d slab_pull_compute_count=%d convergent_edge_build_count=%d convergent_edge_reuse_count=%d subduction_convergent_edges=%d slab_pull_convergent_edges=%d subduction_seed_count=%d subduction_influenced_count=%d slab_pull_front_sample_count=%d cached_adjacency_edge_count=%d cached_adjacency_lookup_count=%lld"),
+			*Run.Label,
+			SolveStep,
+			SolveStats.SubductionFieldComputeCount,
+			SolveStats.SlabPullComputeCount,
+			SolveStats.ConvergentEdgeBuildCount,
+			SolveStats.ReusedConvergentEdgeSetCount,
+			SolveStats.SubductionConvergentEdgeCount,
+			SolveStats.SlabPullConvergentEdgeCount,
+			SolveStats.SubductionSeedSampleCount,
+			SolveStats.SubductionInfluencedCount,
+			SolveStats.SlabPullFrontSampleCount,
+			SolveStats.CachedAdjacencyEdgeDistanceCount,
+			SolveStats.CachedAdjacencyEdgeLookupCount));
 	};
 
 	const auto AdvanceToStep =
@@ -14753,47 +14779,57 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 		return bHealthy;
 	};
 
+	const TArray<FVariantConfig> Variants = {
+		{ TEXT("before_no_cache"), false },
+		{ TEXT("after_cache"), true }
+	};
+
 	for (const int32 SampleCount : SampleCounts)
 	{
-		FRunState Run;
-		Run.SampleCount = SampleCount;
-		Run.Label = FString::Printf(TEXT("%dk"), SampleCount / 1000);
-		Run.Planet = InitializePlanet(SampleCount);
-
-		CaptureCheckpoint(Run, 0);
-		BuildSeedFlags(
-			Run.MassDiagnostics.FindChecked(0),
-			Run.Step0ContinentalFlags,
-			Run.Step0BroadInteriorFlags,
-			Run.Step0CoastAdjacentFlags);
-		Run.SurvivalDiagnostics[0] = ComputeSeededContinentalSurvivalDiagnostic(
-			Run.Planet.GetPlanet(),
-			Run.Step0ContinentalFlags,
-			Run.Step0BroadInteriorFlags,
-			Run.Step0CoastAdjacentFlags);
-
-		AdvanceToStep(Run, 25);
-		CaptureCheckpoint(Run, 25);
-		AdvanceToStep(Run, 100);
-		CaptureCheckpoint(Run, 100);
-
-		const bool bAllowStep200 = EvaluateStep100Gate(Run);
-		TestTrue(
-			*FString::Printf(TEXT("%s step-100 gate passed"), *Run.Label),
-			bAllowStep200);
-
-		AdvanceToStep(Run, 200);
-		CaptureCheckpoint(Run, 200);
-		const bool bHealthyStep200 = EvaluateStep200Health(Run);
-		TestTrue(
-			*FString::Printf(TEXT("%s step-200 remained healthy"), *Run.Label),
-			bHealthyStep200);
-
-		for (const int32 SolveStep : TimingSolveSteps)
+		for (const FVariantConfig& Variant : Variants)
 		{
+			FRunState Run;
+			Run.SampleCount = SampleCount;
+			Run.Label = FString::Printf(TEXT("%dk_%s"), SampleCount / 1000, *Variant.LabelSuffix);
+			Run.Planet = InitializePlanet(
+				SampleCount,
+				Variant.bUseCachedSubductionAdjacencyEdgeDistances);
+
+			CaptureCheckpoint(Run, 0);
+			BuildSeedFlags(
+				Run.MassDiagnostics.FindChecked(0),
+				Run.Step0ContinentalFlags,
+				Run.Step0BroadInteriorFlags,
+				Run.Step0CoastAdjacentFlags);
+			Run.SurvivalDiagnostics[0] = ComputeSeededContinentalSurvivalDiagnostic(
+				Run.Planet.GetPlanet(),
+				Run.Step0ContinentalFlags,
+				Run.Step0BroadInteriorFlags,
+				Run.Step0CoastAdjacentFlags);
+
+			AdvanceToStep(Run, 25);
+			CaptureCheckpoint(Run, 25);
+			AdvanceToStep(Run, 100);
+			CaptureCheckpoint(Run, 100);
+
+			const bool bAllowStep200 = EvaluateStep100Gate(Run);
 			TestTrue(
-				*FString::Printf(TEXT("%s captured timing solve %d"), *Run.Label, SolveStep),
-				Run.SolveTimings.Contains(SolveStep));
+				*FString::Printf(TEXT("%s step-100 gate passed"), *Run.Label),
+				bAllowStep200);
+
+			AdvanceToStep(Run, 200);
+			CaptureCheckpoint(Run, 200);
+			const bool bHealthyStep200 = EvaluateStep200Health(Run);
+			TestTrue(
+				*FString::Printf(TEXT("%s step-200 remained healthy"), *Run.Label),
+				bHealthyStep200);
+
+			for (const int32 SolveStep : TimingSolveSteps)
+			{
+				TestTrue(
+					*FString::Printf(TEXT("%s captured timing solve %d"), *Run.Label, SolveStep),
+					Run.SolveTimings.Contains(SolveStep));
+			}
 		}
 	}
 

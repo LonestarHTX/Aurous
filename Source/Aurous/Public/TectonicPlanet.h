@@ -210,6 +210,24 @@ struct FPendingRiftEvent
 	double RiftMs = 0.0;
 };
 
+struct FSubductionComputationDiagnostics
+{
+	int32 SubductionFieldComputeCount = 0;
+	int32 SlabPullComputeCount = 0;
+	int32 ConvergentEdgeBuildCount = 0;
+	int32 ReusedConvergentEdgeSetCount = 0;
+	int32 ConvergentEdgeCount = 0;
+	int32 SeedSampleCount = 0;
+	int32 InfluencedSampleCount = 0;
+	int32 SlabPullPlateCount = 0;
+	int32 SlabPullTotalFrontSamples = 0;
+	int32 CachedAdjacencyEdgeDistanceCount = 0;
+	int64 CachedAdjacencyEdgeLookupCount = 0;
+	double ConvergentEdgeBuildMs = 0.0;
+	double SubductionFieldMs = 0.0;
+	double SlabPullMs = 0.0;
+};
+
 struct FResamplingStats
 {
 	EResampleTriggerReason TriggerReason = EResampleTriggerReason::None;
@@ -735,6 +753,7 @@ struct AUROUS_API FTectonicPlanet
 	TArray<FTerrane> Terranes;
 	TArray<FIntVector> TriangleIndices;
 	TArray<TArray<int32>> SampleAdjacency;
+	TArray<TArray<double>> SampleAdjacencyEdgeDistancesKm;
 	TArray<TArray<int32>> TriangleAdjacency;
 	double PlanetRadiusKm = 6371.0;
 	double ContainmentRecoveryTolerance = 0.003;
@@ -771,6 +790,7 @@ struct AUROUS_API FTectonicPlanet
 	bool bEnableWarpedRiftBoundaries = true;
 	bool bDeferRiftFollowupResamplingToV6 = false;
 	bool bUseVertexLevelSoupInclusionForTest = false; // Spike: include triangle in every plate that owns >= 1 vertex.
+	bool bUseCachedSubductionAdjacencyEdgeDistancesForTest = true;
 	double SubductionBaseUpliftKmPerMyForTest = -1.0; // < 0 uses the compiled default.
 	bool bDisableSubductionElevationTransferForTest = false;
 	double RiftBoundaryWarpAmplitude = 0.18;
@@ -790,6 +810,7 @@ struct AUROUS_API FTectonicPlanet
 	FPendingBoundaryContactCollisionEvent PendingBoundaryContactCollisionEvent;
 	FPendingGeometricCollisionEvent PendingGeometricCollisionEvent;
 	FPendingRiftEvent PendingRiftEvent;
+	FSubductionComputationDiagnostics LastSubductionDiagnostics;
 	int32 ResamplingExecutionOrdinal = 0;
 
 	void Initialize(int32 InSampleCount, double InPlanetRadiusKm);
@@ -921,6 +942,7 @@ struct AUROUS_API FTectonicPlanet
 		FResamplingStats* InOutStats = nullptr);
 	void ComputeSubductionDistanceField(FResamplingStats* InOutStats = nullptr);
 	void ComputeSlabPullCorrections(FResamplingStats* InOutStats = nullptr);
+	void ComputeSubductionState(FResamplingStats* InOutStats = nullptr);
 	static double SubductionDistanceTransfer(double DistanceRad, double ControlDistanceRad, double MaxDistanceRad);
 	static double CollisionBiweightKernel(double DistanceRad, double RadiusRad);
 	void ClassifyOverlaps(

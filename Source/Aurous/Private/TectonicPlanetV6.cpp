@@ -15909,8 +15909,11 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	{
 		AccumulatePhaseTimingMs(PhaseTiming.RepartitionMembershipMs, RepartitionStartTime);
 	}
+	FSubductionComputationDiagnostics SubductionFieldDiagnostics;
+	FSubductionComputationDiagnostics SlabPullDiagnostics;
 	const double SubductionDistanceFieldStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 	Planet.ComputeSubductionDistanceField();
+	SubductionFieldDiagnostics = Planet.LastSubductionDiagnostics;
 	if (bRecordPhaseTiming)
 	{
 		AccumulatePhaseTimingMs(
@@ -15941,6 +15944,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	}
 	const double SlabPullStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 	Planet.ComputeSlabPullCorrections();
+	SlabPullDiagnostics = Planet.LastSubductionDiagnostics;
 	if (bRecordPhaseTiming)
 	{
 		AccumulatePhaseTimingMs(PhaseTiming.SlabPullMs, SlabPullStartTime);
@@ -16259,6 +16263,24 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	LastSolveStats.CopiedFrontierCarriedSampleCount = CopiedFrontierCarriedSampleCount;
 	LastSolveStats.CopiedFrontierHitCount = CopiedFrontierHitCount.Load();
 	LastSolveStats.InteriorHitCount = InteriorHitCount.Load();
+	LastSolveStats.SubductionFieldComputeCount = SubductionFieldDiagnostics.SubductionFieldComputeCount;
+	LastSolveStats.SlabPullComputeCount = SlabPullDiagnostics.SlabPullComputeCount;
+	LastSolveStats.ConvergentEdgeBuildCount =
+		SubductionFieldDiagnostics.ConvergentEdgeBuildCount +
+		SlabPullDiagnostics.ConvergentEdgeBuildCount;
+	LastSolveStats.ReusedConvergentEdgeSetCount =
+		SubductionFieldDiagnostics.ReusedConvergentEdgeSetCount +
+		SlabPullDiagnostics.ReusedConvergentEdgeSetCount;
+	LastSolveStats.SubductionConvergentEdgeCount = SubductionFieldDiagnostics.ConvergentEdgeCount;
+	LastSolveStats.SlabPullConvergentEdgeCount = SlabPullDiagnostics.ConvergentEdgeCount;
+	LastSolveStats.SubductionSeedSampleCount = SubductionFieldDiagnostics.SeedSampleCount;
+	LastSolveStats.SubductionInfluencedCount = SubductionFieldDiagnostics.InfluencedSampleCount;
+	LastSolveStats.SlabPullFrontSampleCount = SlabPullDiagnostics.SlabPullTotalFrontSamples;
+	LastSolveStats.CachedAdjacencyEdgeDistanceCount =
+		FMath::Max(
+			SubductionFieldDiagnostics.CachedAdjacencyEdgeDistanceCount,
+			SlabPullDiagnostics.CachedAdjacencyEdgeDistanceCount);
+	LastSolveStats.CachedAdjacencyEdgeLookupCount = SubductionFieldDiagnostics.CachedAdjacencyEdgeLookupCount;
 	LastSolveStats.DestructiveTriangleGeometryExcludedCount = DestructiveFilterState.GeometryExcludedLocalTriangleCount;
 	LastSolveStats.DestructiveTriangleRejectedCount = DestructiveTriangleRejectedCount.Load();
 	LastSolveStats.TrackedDestructiveTriangleCount = DestructiveTrackingStats.TrackedTriangleCount;

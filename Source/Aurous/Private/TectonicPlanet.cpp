@@ -153,6 +153,37 @@ namespace
 		}
 	}
 
+	void BuildSampleAdjacencyEdgeDistanceCache(FTectonicPlanet& Planet)
+	{
+		Planet.SampleAdjacencyEdgeDistancesKm.Reset();
+		Planet.SampleAdjacencyEdgeDistancesKm.SetNum(Planet.SampleAdjacency.Num());
+		for (int32 SampleIndex = 0; SampleIndex < Planet.SampleAdjacency.Num(); ++SampleIndex)
+		{
+			TArray<double>& CachedDistancesKm = Planet.SampleAdjacencyEdgeDistancesKm[SampleIndex];
+			const TArray<int32>& Neighbors = Planet.SampleAdjacency[SampleIndex];
+			CachedDistancesKm.SetNum(Neighbors.Num());
+
+			if (!Planet.Samples.IsValidIndex(SampleIndex))
+			{
+				for (double& CachedDistanceKm : CachedDistancesKm)
+				{
+					CachedDistanceKm = 0.0;
+				}
+				continue;
+			}
+
+			const FVector3d Position = Planet.Samples[SampleIndex].Position.GetSafeNormal();
+			for (int32 NeighborOffset = 0; NeighborOffset < Neighbors.Num(); ++NeighborOffset)
+			{
+				const int32 NeighborIndex = Neighbors[NeighborOffset];
+				CachedDistancesKm[NeighborOffset] =
+					Planet.Samples.IsValidIndex(NeighborIndex)
+						? ComputeGeodesicDistance(Position, Planet.Samples[NeighborIndex].Position.GetSafeNormal()) * Planet.PlanetRadiusKm
+						: 0.0;
+			}
+		}
+	}
+
 	FSphericalBoundingCap BuildBoundingCapFromVertices(const TArray<FVector3d>& Vertices)
 	{
 		FSphericalBoundingCap Cap;
@@ -1813,18 +1844,93 @@ namespace
 		return true;
 	}
 
-	TArray<FConvergentBoundaryEdge> BuildConvergentBoundaryEdges(const FTectonicPlanet& Planet)
+	struct FConvergentBoundaryPlateData
 	{
+		double OverlapScore = 0.0;
+		FVector3d AngularVelocity = FVector3d::ZeroVector;
+	};
+
+	bool TryComputeConvergentBoundaryEdgeMetrics(
+		const FTectonicPlanet& Planet,
+		const int32 SampleIndexA,
+		const int32 SampleIndexB,
+		const FConvergentBoundaryPlateData& PlateAData,
+		const FConvergentBoundaryPlateData& PlateBData,
+		double& OutNormalComponent,
+		float& OutConvergenceSpeedKmPerMy)
+	{
+		OutNormalComponent = 0.0;
+		OutConvergenceSpeedKmPerMy = 0.0f;
+
+		if (!Planet.Samples.IsValidIndex(SampleIndexA) || !Planet.Samples.IsValidIndex(SampleIndexB))
+		{
+			return false;
+		}
+
+		const FVector3d PosA = Planet.Samples[SampleIndexA].Position.GetSafeNormal();
+		const FVector3d PosB = Planet.Samples[SampleIndexB].Position.GetSafeNormal();
+		FVector3d Midpoint = (PosA + PosB).GetSafeNormal();
+		if (Midpoint.IsNearlyZero())
+		{
+			Midpoint = PosA;
+		}
+
+		const FVector3d SurfVelA = FVector3d::CrossProduct(PlateAData.AngularVelocity, Midpoint);
+		const FVector3d SurfVelB = FVector3d::CrossProduct(PlateBData.AngularVelocity, Midpoint);
+		const FVector3d RelVel = SurfVelB - SurfVelA;
+		const double RelSpeed = RelVel.Length();
+		if (RelSpeed <= UE_DOUBLE_SMALL_NUMBER)
+		{
+			return false;
+		}
+
+		const FVector3d Separation = (PosB - PosA).GetSafeNormal();
+		const double NormalComponent = RelVel.Dot(Separation);
+		const double Ratio = NormalComponent / RelSpeed;
+		if (Ratio >= ConvergentThresholdRatio)
+		{
+			return false;
+		}
+
+		OutNormalComponent = NormalComponent;
+		OutConvergenceSpeedKmPerMy = static_cast<float>(
+			(FMath::Abs(NormalComponent) * Planet.PlanetRadiusKm) / FMath::Max(DeltaTimeMyears, UE_DOUBLE_SMALL_NUMBER));
+		return true;
+	}
+
+	TArray<FConvergentBoundaryEdge> BuildConvergentBoundaryEdges(
+		const FTectonicPlanet& Planet,
+		FSubductionComputationDiagnostics* OutDiagnostics = nullptr)
+	{
+		const double StartTime = FPlatformTime::Seconds();
 		TArray<FConvergentBoundaryEdge> ConvergentEdges;
 		if (Planet.SampleAdjacency.Num() != Planet.Samples.Num() || Planet.Plates.IsEmpty())
 		{
 			return ConvergentEdges;
 		}
 
+		if (OutDiagnostics != nullptr)
+		{
+			++OutDiagnostics->ConvergentEdgeBuildCount;
+		}
+
+		TMap<int32, FConvergentBoundaryPlateData> PlateDataById;
+		PlateDataById.Reserve(Planet.Plates.Num());
+		for (const FPlate& Plate : Planet.Plates)
+		{
+			FConvergentBoundaryPlateData& PlateData = PlateDataById.Add(Plate.Id);
+			PlateData.OverlapScore = Plate.OverlapScore;
+			const FVector3d Axis = Plate.RotationAxis.IsNearlyZero()
+				? FVector3d::ZeroVector
+				: Plate.RotationAxis.GetSafeNormal();
+			PlateData.AngularVelocity = Axis * Plate.AngularSpeed;
+		}
+
 		for (int32 SampleIndexA = 0; SampleIndexA < Planet.SampleAdjacency.Num(); ++SampleIndexA)
 		{
 			const int32 PlateA = Planet.Samples.IsValidIndex(SampleIndexA) ? Planet.Samples[SampleIndexA].PlateId : INDEX_NONE;
-			if (FindPlateById(Planet, PlateA) == nullptr)
+			const FConvergentBoundaryPlateData* PlateAData = PlateDataById.Find(PlateA);
+			if (PlateAData == nullptr)
 			{
 				continue;
 			}
@@ -1837,7 +1943,8 @@ namespace
 				}
 
 				const int32 PlateB = Planet.Samples[SampleIndexB].PlateId;
-				if (FindPlateById(Planet, PlateB) == nullptr || PlateA == PlateB)
+				const FConvergentBoundaryPlateData* PlateBData = PlateDataById.Find(PlateB);
+				if (PlateBData == nullptr || PlateA == PlateB)
 				{
 					continue;
 				}
@@ -1848,13 +1955,17 @@ namespace
 						Planet,
 						SampleIndexA,
 						SampleIndexB,
+						*PlateAData,
+						*PlateBData,
 						NormalComponent,
 						ConvergenceSpeedKmPerMy))
 				{
 					continue;
 				}
 
-				const bool bPlateAOverriding = IsOverridingPlate(Planet, PlateA, PlateB);
+				const bool bPlateAOverriding =
+					PlateAData->OverlapScore > PlateBData->OverlapScore ||
+					(PlateAData->OverlapScore == PlateBData->OverlapScore && PlateA < PlateB);
 				FConvergentBoundaryEdge& Edge = ConvergentEdges.AddDefaulted_GetRef();
 				Edge.SampleIndexA = SampleIndexA;
 				Edge.SampleIndexB = SampleIndexB;
@@ -1867,6 +1978,12 @@ namespace
 				Edge.NormalComponent = NormalComponent;
 				Edge.ConvergenceSpeedKmPerMy = ConvergenceSpeedKmPerMy;
 			}
+		}
+
+		if (OutDiagnostics != nullptr)
+		{
+			OutDiagnostics->ConvergentEdgeCount = ConvergentEdges.Num();
+			OutDiagnostics->ConvergentEdgeBuildMs += (FPlatformTime::Seconds() - StartTime) * 1000.0;
 		}
 
 		return ConvergentEdges;
@@ -5691,7 +5808,9 @@ void FTectonicPlanet::Initialize(const int32 InSampleCount, const double InPlane
 	Terranes.Reset();
 	TriangleIndices.Reset();
 	SampleAdjacency.Reset();
+	SampleAdjacencyEdgeDistancesKm.Reset();
 	TriangleAdjacency.Reset();
+	LastSubductionDiagnostics = FSubductionComputationDiagnostics{};
 
 	if (InSampleCount <= 0)
 	{
@@ -5717,6 +5836,7 @@ void FTectonicPlanet::Initialize(const int32 InSampleCount, const double InPlane
 	if (Samples.Num() < 4)
 	{
 		SampleAdjacency.SetNum(Samples.Num());
+		SampleAdjacencyEdgeDistancesKm.SetNum(Samples.Num());
 		TriangleAdjacency.SetNum(0);
 		return;
 	}
@@ -5754,6 +5874,7 @@ void FTectonicPlanet::Initialize(const int32 InSampleCount, const double InPlane
 		AddUniqueNeighbor(SampleAdjacency[Triangle.Z], Triangle.X);
 		AddUniqueNeighbor(SampleAdjacency[Triangle.Z], Triangle.Y);
 	}
+	BuildSampleAdjacencyEdgeDistanceCache(*this);
 
 	TriangleAdjacency.SetNum(TriangleIndices.Num());
 	TMap<uint64, int32> EdgeToTriangle;
@@ -5960,8 +6081,7 @@ void FTectonicPlanet::InitializePlates(
 	RebuildCarriedSamplesFromSoupVertices(*this);
 	ComputePlateScores();
 	AssignInitialPlateMotion(*this, InRandomSeed);
-	ComputeSubductionDistanceField();
-	ComputeSlabPullCorrections();
+	ComputeSubductionState();
 	LastComputedResampleInterval = ComputeResampleInterval();
 }
 
@@ -8299,223 +8419,350 @@ double FTectonicPlanet::CollisionBiweightKernel(const double DistanceRad, const 
 	return OneMinusSquared * OneMinusSquared;
 }
 
-void FTectonicPlanet::ComputeSubductionDistanceField(FResamplingStats* InOutStats)
+namespace
 {
-	const double StartTime = FPlatformTime::Seconds();
-	const double MaxDistanceKmForPlanet = SubductionMaxDistanceRad * PlanetRadiusKm;
-	const double DistanceComparisonEpsilon = 1.0e-6;
-
-	TArray<double> DistanceKmBySample;
-	DistanceKmBySample.Init(TNumericLimits<double>::Max(), Samples.Num());
-	TArray<float> SpeedKmPerMyBySample;
-	SpeedKmPerMyBySample.Init(0.0f, Samples.Num());
-
-	int32 FrontEdgeCount = 0;
-	TMap<int32, float> SeedSpeedBySample;
-
-	for (FSample& Sample : Samples)
+	void PopulateCachedAdjacencyEdgeDistanceCount(
+		const FTectonicPlanet& Planet,
+		FSubductionComputationDiagnostics& OutDiagnostics)
 	{
-		Sample.SubductionDistanceKm = -1.0f;
+		OutDiagnostics.CachedAdjacencyEdgeDistanceCount = 0;
+		for (const TArray<double>& DistancesKm : Planet.SampleAdjacencyEdgeDistancesKm)
+		{
+			OutDiagnostics.CachedAdjacencyEdgeDistanceCount += DistancesKm.Num();
+		}
 	}
 
-	const TArray<FConvergentBoundaryEdge> ConvergentEdges = BuildConvergentBoundaryEdges(*this);
-	for (const FConvergentBoundaryEdge& Edge : ConvergentEdges)
+	void ComputeSubductionDistanceFieldFromConvergentEdges(
+		FTectonicPlanet& Planet,
+		const TArray<FConvergentBoundaryEdge>& ConvergentEdges,
+		FSubductionComputationDiagnostics* Diagnostics,
+		FResamplingStats* InOutStats)
 	{
-		++FrontEdgeCount;
-		float& SeedSpeedKmPerMy = SeedSpeedBySample.FindOrAdd(Edge.OverridingSampleIndex);
-		SeedSpeedKmPerMy = FMath::Max(SeedSpeedKmPerMy, Edge.ConvergenceSpeedKmPerMy);
-	}
+		const double StartTime = FPlatformTime::Seconds();
+		const double MaxDistanceKmForPlanet = SubductionMaxDistanceRad * Planet.PlanetRadiusKm;
+		const double DistanceComparisonEpsilon = 1.0e-6;
 
-	TArray<FSubductionQueueEntry> Queue;
-	Queue.Reserve(SeedSpeedBySample.Num());
-	for (const TPair<int32, float>& Seed : SeedSpeedBySample)
-	{
-		const int32 SampleIndex = Seed.Key;
-		if (!Samples.IsValidIndex(SampleIndex))
+		if (Diagnostics != nullptr)
 		{
-			continue;
+			++Diagnostics->SubductionFieldComputeCount;
+			Diagnostics->ConvergentEdgeCount = ConvergentEdges.Num();
 		}
 
-		DistanceKmBySample[SampleIndex] = 0.0;
-		SpeedKmPerMyBySample[SampleIndex] = Seed.Value;
-		Queue.HeapPush(
-			FSubductionQueueEntry{ SampleIndex, 0.0, Seed.Value },
-			FSubductionQueueLess());
-	}
+		TArray<double> DistanceKmBySample;
+		DistanceKmBySample.Init(TNumericLimits<double>::Max(), Planet.Samples.Num());
+		TArray<float> SpeedKmPerMyBySample;
+		SpeedKmPerMyBySample.Init(0.0f, Planet.Samples.Num());
 
-	while (!Queue.IsEmpty())
-	{
-		FSubductionQueueEntry Entry;
-		Queue.HeapPop(Entry, FSubductionQueueLess(), EAllowShrinking::No);
-		if (!Samples.IsValidIndex(Entry.SampleIndex))
+		int32 FrontEdgeCount = 0;
+		TMap<int32, float> SeedSpeedBySample;
+		TSet<int32> ValidPlateIds;
+		ValidPlateIds.Reserve(Planet.Plates.Num());
+		for (const FPlate& Plate : Planet.Plates)
 		{
-			continue;
+			ValidPlateIds.Add(Plate.Id);
 		}
 
-		if (Entry.DistanceKm > DistanceKmBySample[Entry.SampleIndex] + DistanceComparisonEpsilon ||
-			Entry.DistanceKm > MaxDistanceKmForPlanet + DistanceComparisonEpsilon)
+		for (FSample& Sample : Planet.Samples)
 		{
-			continue;
+			Sample.SubductionDistanceKm = -1.0f;
 		}
 
-		const int32 PlateId = Samples[Entry.SampleIndex].PlateId;
-		if (FindPlateById(*this, PlateId) == nullptr)
+		for (const FConvergentBoundaryEdge& Edge : ConvergentEdges)
 		{
-			continue;
+			++FrontEdgeCount;
+			float& SeedSpeedKmPerMy = SeedSpeedBySample.FindOrAdd(Edge.OverridingSampleIndex);
+			SeedSpeedKmPerMy = FMath::Max(SeedSpeedKmPerMy, Edge.ConvergenceSpeedKmPerMy);
 		}
 
-		const FVector3d Position = Samples[Entry.SampleIndex].Position.GetSafeNormal();
-		for (const int32 NeighborIndex : SampleAdjacency[Entry.SampleIndex])
+		TArray<FSubductionQueueEntry> Queue;
+		Queue.Reserve(SeedSpeedBySample.Num());
+		for (const TPair<int32, float>& Seed : SeedSpeedBySample)
 		{
-			if (!Samples.IsValidIndex(NeighborIndex) || Samples[NeighborIndex].PlateId != PlateId)
+			const int32 SampleIndex = Seed.Key;
+			if (!Planet.Samples.IsValidIndex(SampleIndex))
 			{
 				continue;
 			}
 
-			const double EdgeDistanceKm =
-				ComputeGeodesicDistance(Position, Samples[NeighborIndex].Position.GetSafeNormal()) * PlanetRadiusKm;
-			const double CandidateDistanceKm = Entry.DistanceKm + EdgeDistanceKm;
-			if (CandidateDistanceKm > MaxDistanceKmForPlanet + DistanceComparisonEpsilon)
-			{
-				continue;
-			}
-
-			const bool bBetterDistance = CandidateDistanceKm + DistanceComparisonEpsilon < DistanceKmBySample[NeighborIndex];
-			const bool bTieButFaster =
-				FMath::IsNearlyEqual(CandidateDistanceKm, DistanceKmBySample[NeighborIndex], DistanceComparisonEpsilon) &&
-				Entry.SpeedKmPerMy > SpeedKmPerMyBySample[NeighborIndex] + UE_KINDA_SMALL_NUMBER;
-			if (!bBetterDistance && !bTieButFaster)
-			{
-				continue;
-			}
-
-			DistanceKmBySample[NeighborIndex] = CandidateDistanceKm;
-			SpeedKmPerMyBySample[NeighborIndex] = Entry.SpeedKmPerMy;
+			DistanceKmBySample[SampleIndex] = 0.0;
+			SpeedKmPerMyBySample[SampleIndex] = Seed.Value;
 			Queue.HeapPush(
-				FSubductionQueueEntry{ NeighborIndex, CandidateDistanceKm, Entry.SpeedKmPerMy },
+				FSubductionQueueEntry{ SampleIndex, 0.0, Seed.Value },
 				FSubductionQueueLess());
 		}
-	}
 
-	int32 InfluencedCount = 0;
-	double DistanceSumKm = 0.0;
-	double MaxObservedDistanceKm = 0.0;
-	for (int32 SampleIndex = 0; SampleIndex < Samples.Num(); ++SampleIndex)
-	{
-		const bool bInfluenced =
-			FMath::IsFinite(DistanceKmBySample[SampleIndex]) &&
-			DistanceKmBySample[SampleIndex] <= MaxDistanceKmForPlanet + DistanceComparisonEpsilon;
-		Samples[SampleIndex].SubductionDistanceKm = bInfluenced
-			? static_cast<float>(DistanceKmBySample[SampleIndex])
-			: -1.0f;
-		if (!bInfluenced)
+		while (!Queue.IsEmpty())
 		{
-			SpeedKmPerMyBySample[SampleIndex] = 0.0f;
-			continue;
-		}
-
-		++InfluencedCount;
-		DistanceSumKm += DistanceKmBySample[SampleIndex];
-		MaxObservedDistanceKm = FMath::Max(MaxObservedDistanceKm, DistanceKmBySample[SampleIndex]);
-	}
-
-	for (FPlate& Plate : Plates)
-	{
-		for (FCarriedSample& CarriedSample : Plate.CarriedSamples)
-		{
-			const int32 SampleIndex = CarriedSample.CanonicalSampleIndex;
-			if (!Samples.IsValidIndex(SampleIndex))
+			FSubductionQueueEntry Entry;
+			Queue.HeapPop(Entry, FSubductionQueueLess(), EAllowShrinking::No);
+			if (!Planet.Samples.IsValidIndex(Entry.SampleIndex))
 			{
-				CarriedSample.SubductionDistanceKm = -1.0f;
-				CarriedSample.SubductionSpeed = 0.0f;
 				continue;
 			}
 
-			CarriedSample.SubductionDistanceKm = Samples[SampleIndex].SubductionDistanceKm;
-			CarriedSample.SubductionSpeed = SpeedKmPerMyBySample[SampleIndex];
+			if (Entry.DistanceKm > DistanceKmBySample[Entry.SampleIndex] + DistanceComparisonEpsilon ||
+				Entry.DistanceKm > MaxDistanceKmForPlanet + DistanceComparisonEpsilon)
+			{
+				continue;
+			}
+
+			const int32 PlateId = Planet.Samples[Entry.SampleIndex].PlateId;
+			if (!ValidPlateIds.Contains(PlateId))
+			{
+				continue;
+			}
+
+			const TArray<int32>& Neighbors = Planet.SampleAdjacency[Entry.SampleIndex];
+			const TArray<double>* CachedNeighborDistancesKm =
+				Planet.SampleAdjacencyEdgeDistancesKm.IsValidIndex(Entry.SampleIndex)
+					? &Planet.SampleAdjacencyEdgeDistancesKm[Entry.SampleIndex]
+					: nullptr;
+			const bool bUseCachedNeighborDistances =
+				Planet.bUseCachedSubductionAdjacencyEdgeDistancesForTest &&
+				CachedNeighborDistancesKm != nullptr &&
+				CachedNeighborDistancesKm->Num() == Neighbors.Num();
+			const FVector3d Position = bUseCachedNeighborDistances
+				? FVector3d::ZeroVector
+				: Planet.Samples[Entry.SampleIndex].Position.GetSafeNormal();
+			for (int32 NeighborOffset = 0; NeighborOffset < Neighbors.Num(); ++NeighborOffset)
+			{
+				const int32 NeighborIndex = Neighbors[NeighborOffset];
+				if (!Planet.Samples.IsValidIndex(NeighborIndex) || Planet.Samples[NeighborIndex].PlateId != PlateId)
+				{
+					continue;
+				}
+
+				const double EdgeDistanceKm = bUseCachedNeighborDistances
+					? (*CachedNeighborDistancesKm)[NeighborOffset]
+					: ComputeGeodesicDistance(
+						Position,
+						Planet.Samples[NeighborIndex].Position.GetSafeNormal()) * Planet.PlanetRadiusKm;
+				if (Diagnostics != nullptr && bUseCachedNeighborDistances)
+				{
+					++Diagnostics->CachedAdjacencyEdgeLookupCount;
+				}
+
+				const double CandidateDistanceKm = Entry.DistanceKm + EdgeDistanceKm;
+				if (CandidateDistanceKm > MaxDistanceKmForPlanet + DistanceComparisonEpsilon)
+				{
+					continue;
+				}
+
+				const bool bBetterDistance =
+					CandidateDistanceKm + DistanceComparisonEpsilon < DistanceKmBySample[NeighborIndex];
+				const bool bTieButFaster =
+					FMath::IsNearlyEqual(
+						CandidateDistanceKm,
+						DistanceKmBySample[NeighborIndex],
+						DistanceComparisonEpsilon) &&
+					Entry.SpeedKmPerMy > SpeedKmPerMyBySample[NeighborIndex] + UE_KINDA_SMALL_NUMBER;
+				if (!bBetterDistance && !bTieButFaster)
+				{
+					continue;
+				}
+
+				DistanceKmBySample[NeighborIndex] = CandidateDistanceKm;
+				SpeedKmPerMyBySample[NeighborIndex] = Entry.SpeedKmPerMy;
+				Queue.HeapPush(
+					FSubductionQueueEntry{ NeighborIndex, CandidateDistanceKm, Entry.SpeedKmPerMy },
+					FSubductionQueueLess());
+			}
+		}
+
+		int32 InfluencedCount = 0;
+		double DistanceSumKm = 0.0;
+		double MaxObservedDistanceKm = 0.0;
+		for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+		{
+			const bool bInfluenced =
+				FMath::IsFinite(DistanceKmBySample[SampleIndex]) &&
+				DistanceKmBySample[SampleIndex] <= MaxDistanceKmForPlanet + DistanceComparisonEpsilon;
+			Planet.Samples[SampleIndex].SubductionDistanceKm = bInfluenced
+				? static_cast<float>(DistanceKmBySample[SampleIndex])
+				: -1.0f;
+			if (!bInfluenced)
+			{
+				SpeedKmPerMyBySample[SampleIndex] = 0.0f;
+				continue;
+			}
+
+			++InfluencedCount;
+			DistanceSumKm += DistanceKmBySample[SampleIndex];
+			MaxObservedDistanceKm = FMath::Max(MaxObservedDistanceKm, DistanceKmBySample[SampleIndex]);
+		}
+
+		for (FPlate& Plate : Planet.Plates)
+		{
+			for (FCarriedSample& CarriedSample : Plate.CarriedSamples)
+			{
+				const int32 SampleIndex = CarriedSample.CanonicalSampleIndex;
+				if (!Planet.Samples.IsValidIndex(SampleIndex))
+				{
+					CarriedSample.SubductionDistanceKm = -1.0f;
+					CarriedSample.SubductionSpeed = 0.0f;
+					continue;
+				}
+
+				CarriedSample.SubductionDistanceKm = Planet.Samples[SampleIndex].SubductionDistanceKm;
+				CarriedSample.SubductionSpeed = SpeedKmPerMyBySample[SampleIndex];
+			}
+		}
+
+		if (Diagnostics != nullptr)
+		{
+			Diagnostics->SeedSampleCount = SeedSpeedBySample.Num();
+			Diagnostics->InfluencedSampleCount = InfluencedCount;
+		}
+
+		if (InOutStats != nullptr)
+		{
+			InOutStats->SubductionFrontEdgeCount = FrontEdgeCount;
+			InOutStats->SubductionSeedSampleCount = SeedSpeedBySample.Num();
+			InOutStats->SubductionInfluencedCount = InfluencedCount;
+			InOutStats->SubductionMeanDistanceKm =
+				InfluencedCount > 0 ? (DistanceSumKm / static_cast<double>(InfluencedCount)) : 0.0;
+			InOutStats->SubductionMaxDistanceKm = MaxObservedDistanceKm;
+			InOutStats->SubductionDistanceFieldMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+		}
+		if (Diagnostics != nullptr)
+		{
+			Diagnostics->SubductionFieldMs += (FPlatformTime::Seconds() - StartTime) * 1000.0;
 		}
 	}
 
-	if (InOutStats != nullptr)
+	void ComputeSlabPullCorrectionsFromConvergentEdges(
+		FTectonicPlanet& Planet,
+		const TArray<FConvergentBoundaryEdge>& ConvergentEdges,
+		FSubductionComputationDiagnostics* Diagnostics,
+		FResamplingStats* InOutStats)
 	{
-		InOutStats->SubductionFrontEdgeCount = FrontEdgeCount;
-		InOutStats->SubductionSeedSampleCount = SeedSpeedBySample.Num();
-		InOutStats->SubductionInfluencedCount = InfluencedCount;
-		InOutStats->SubductionMeanDistanceKm =
-			InfluencedCount > 0 ? (DistanceSumKm / static_cast<double>(InfluencedCount)) : 0.0;
-		InOutStats->SubductionMaxDistanceKm = MaxObservedDistanceKm;
-		InOutStats->SubductionDistanceFieldMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+		const double StartTime = FPlatformTime::Seconds();
+		if (Diagnostics != nullptr)
+		{
+			++Diagnostics->SlabPullComputeCount;
+			Diagnostics->ConvergentEdgeCount = ConvergentEdges.Num();
+		}
+
+		const double Perturbation =
+			(!Planet.Samples.IsEmpty() && !Planet.Plates.IsEmpty())
+				? (SlabPullEpsilon * static_cast<double>(Planet.Plates.Num()) / static_cast<double>(Planet.Samples.Num()))
+				: 0.0;
+
+		TMap<int32, TSet<int32>> FrontSamplesByPlate;
+		for (const FConvergentBoundaryEdge& Edge : ConvergentEdges)
+		{
+			FrontSamplesByPlate.FindOrAdd(Edge.SubductingPlateId).Add(Edge.SubductingSampleIndex);
+		}
+
+		int32 SlabPullPlateCount = 0;
+		int32 TotalFrontSamples = 0;
+		double MaxAxisChangeRad = 0.0;
+		for (FPlate& Plate : Planet.Plates)
+		{
+			Plate.SlabPullCorrectionAxis = FVector3d::ZeroVector;
+			Plate.SlabPullFrontSampleCount = 0;
+
+			const FVector3d Centroid = ComputePlateCentroidOnUnitSphere(Planet, Plate);
+			const TSet<int32>* FrontSamples = FrontSamplesByPlate.Find(Plate.Id);
+			if (Centroid.IsNearlyZero() || FrontSamples == nullptr)
+			{
+				continue;
+			}
+
+			FVector3d CorrectionSum = FVector3d::ZeroVector;
+			for (const int32 SampleIndex : *FrontSamples)
+			{
+				if (!Planet.Samples.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				const FVector3d Correction =
+					FVector3d::CrossProduct(Centroid, Planet.Samples[SampleIndex].Position.GetSafeNormal()).GetSafeNormal();
+				if (Correction.IsNearlyZero() || !IsFiniteVector(Correction))
+				{
+					continue;
+				}
+
+				CorrectionSum += Correction;
+			}
+
+			Plate.SlabPullCorrectionAxis = CorrectionSum;
+			Plate.SlabPullFrontSampleCount = FrontSamples->Num();
+			TotalFrontSamples += Plate.SlabPullFrontSampleCount;
+			if (CorrectionSum.IsNearlyZero())
+			{
+				continue;
+			}
+
+			++SlabPullPlateCount;
+			const double RawAxisChangeRad = Perturbation * CorrectionSum.Length() * DeltaTimeMyears;
+			MaxAxisChangeRad = FMath::Max(MaxAxisChangeRad, FMath::Min(RawAxisChangeRad, MaxAxisChangePerStepRad));
+		}
+
+		if (Diagnostics != nullptr)
+		{
+			Diagnostics->SlabPullPlateCount = SlabPullPlateCount;
+			Diagnostics->SlabPullTotalFrontSamples = TotalFrontSamples;
+		}
+
+		if (InOutStats != nullptr)
+		{
+			InOutStats->SlabPullPlateCount = SlabPullPlateCount;
+			InOutStats->SlabPullTotalFrontSamples = TotalFrontSamples;
+			InOutStats->SlabPullMaxAxisChangeRad = MaxAxisChangeRad;
+			InOutStats->SlabPullMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+		}
+		if (Diagnostics != nullptr)
+		{
+			Diagnostics->SlabPullMs += (FPlatformTime::Seconds() - StartTime) * 1000.0;
+		}
 	}
+}
+
+void FTectonicPlanet::ComputeSubductionDistanceField(FResamplingStats* InOutStats)
+{
+	LastSubductionDiagnostics = FSubductionComputationDiagnostics{};
+	PopulateCachedAdjacencyEdgeDistanceCount(*this, LastSubductionDiagnostics);
+	const TArray<FConvergentBoundaryEdge> ConvergentEdges =
+		BuildConvergentBoundaryEdges(*this, &LastSubductionDiagnostics);
+	ComputeSubductionDistanceFieldFromConvergentEdges(
+		*this,
+		ConvergentEdges,
+		&LastSubductionDiagnostics,
+		InOutStats);
 }
 
 void FTectonicPlanet::ComputeSlabPullCorrections(FResamplingStats* InOutStats)
 {
-	const double StartTime = FPlatformTime::Seconds();
-	const TArray<FConvergentBoundaryEdge> ConvergentEdges = BuildConvergentBoundaryEdges(*this);
-	const double Perturbation =
-		(!Samples.IsEmpty() && !Plates.IsEmpty())
-			? (SlabPullEpsilon * static_cast<double>(Plates.Num()) / static_cast<double>(Samples.Num()))
-			: 0.0;
+	LastSubductionDiagnostics = FSubductionComputationDiagnostics{};
+	PopulateCachedAdjacencyEdgeDistanceCount(*this, LastSubductionDiagnostics);
+	const TArray<FConvergentBoundaryEdge> ConvergentEdges =
+		BuildConvergentBoundaryEdges(*this, &LastSubductionDiagnostics);
+	ComputeSlabPullCorrectionsFromConvergentEdges(
+		*this,
+		ConvergentEdges,
+		&LastSubductionDiagnostics,
+		InOutStats);
+}
 
-	TMap<int32, TSet<int32>> FrontSamplesByPlate;
-	for (const FConvergentBoundaryEdge& Edge : ConvergentEdges)
-	{
-		FrontSamplesByPlate.FindOrAdd(Edge.SubductingPlateId).Add(Edge.SubductingSampleIndex);
-	}
-
-	int32 SlabPullPlateCount = 0;
-	int32 TotalFrontSamples = 0;
-	double MaxAxisChangeRad = 0.0;
-	for (FPlate& Plate : Plates)
-	{
-		Plate.SlabPullCorrectionAxis = FVector3d::ZeroVector;
-		Plate.SlabPullFrontSampleCount = 0;
-
-		const FVector3d Centroid = ComputePlateCentroidOnUnitSphere(*this, Plate);
-		const TSet<int32>* FrontSamples = FrontSamplesByPlate.Find(Plate.Id);
-		if (Centroid.IsNearlyZero() || FrontSamples == nullptr)
-		{
-			continue;
-		}
-
-		FVector3d CorrectionSum = FVector3d::ZeroVector;
-		for (const int32 SampleIndex : *FrontSamples)
-		{
-			if (!Samples.IsValidIndex(SampleIndex))
-			{
-				continue;
-			}
-
-			const FVector3d Correction =
-				FVector3d::CrossProduct(Centroid, Samples[SampleIndex].Position.GetSafeNormal()).GetSafeNormal();
-			if (Correction.IsNearlyZero() || !IsFiniteVector(Correction))
-			{
-				continue;
-			}
-
-			CorrectionSum += Correction;
-		}
-
-		Plate.SlabPullCorrectionAxis = CorrectionSum;
-		Plate.SlabPullFrontSampleCount = FrontSamples->Num();
-		TotalFrontSamples += Plate.SlabPullFrontSampleCount;
-		if (CorrectionSum.IsNearlyZero())
-		{
-			continue;
-		}
-
-		++SlabPullPlateCount;
-		const double RawAxisChangeRad = Perturbation * CorrectionSum.Length() * DeltaTimeMyears;
-		MaxAxisChangeRad = FMath::Max(MaxAxisChangeRad, FMath::Min(RawAxisChangeRad, MaxAxisChangePerStepRad));
-	}
-
-	if (InOutStats != nullptr)
-	{
-		InOutStats->SlabPullPlateCount = SlabPullPlateCount;
-		InOutStats->SlabPullTotalFrontSamples = TotalFrontSamples;
-		InOutStats->SlabPullMaxAxisChangeRad = MaxAxisChangeRad;
-		InOutStats->SlabPullMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
-	}
+void FTectonicPlanet::ComputeSubductionState(FResamplingStats* InOutStats)
+{
+	LastSubductionDiagnostics = FSubductionComputationDiagnostics{};
+	PopulateCachedAdjacencyEdgeDistanceCount(*this, LastSubductionDiagnostics);
+	const TArray<FConvergentBoundaryEdge> ConvergentEdges =
+		BuildConvergentBoundaryEdges(*this, &LastSubductionDiagnostics);
+	ComputeSubductionDistanceFieldFromConvergentEdges(
+		*this,
+		ConvergentEdges,
+		&LastSubductionDiagnostics,
+		InOutStats);
+	++LastSubductionDiagnostics.ReusedConvergentEdgeSetCount;
+	ComputeSlabPullCorrectionsFromConvergentEdges(
+		*this,
+		ConvergentEdges,
+		&LastSubductionDiagnostics,
+		InOutStats);
 }
 
 void FTectonicPlanet::RepartitionMembership(
@@ -11609,8 +11856,7 @@ void FTectonicPlanet::PerformResampling(
 		bPendingFullResolutionResample = true;
 	}
 
-	ComputeSubductionDistanceField(&Stats);
-	ComputeSlabPullCorrections(&Stats);
+	ComputeSubductionState(&Stats);
 
 	FTerraneDetectionDiagnostics TerraneDetectionDiagnostics;
 	const double TerraneDetectionStartTime = FPlatformTime::Seconds();
