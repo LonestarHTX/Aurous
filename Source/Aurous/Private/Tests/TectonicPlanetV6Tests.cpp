@@ -372,6 +372,64 @@ namespace
 		int32 ContinentalSamplesAbove5Km = 0;
 	};
 
+	constexpr int32 V9ElevationHistogramBinCount = 10;
+
+	struct FV9ElevationDistributionSummary
+	{
+		double MeanElevationKm = 0.0;
+		double P50ElevationKm = 0.0;
+		double P95ElevationKm = 0.0;
+		double MaxElevationKm = 0.0;
+		int32 SampleCount = 0;
+		int32 SubmergedSampleCount = 0;
+		int32 Samples0To0p5Km = 0;
+		int32 Samples0p5To1Km = 0;
+		int32 Samples1To2Km = 0;
+		int32 Samples2To5Km = 0;
+		int32 SamplesAbove5Km = 0;
+		TArray<int32> HistogramBinCounts;
+		int32 DominantBinIndex = INDEX_NONE;
+		double DominantBinFraction = 0.0;
+	};
+
+	struct FV9HypsometricDiagnostic
+	{
+		FV9ElevationDistributionSummary Global;
+		FV9ElevationDistributionSummary Continental;
+		FV9ElevationDistributionSummary SubaerialContinental;
+		FV9ElevationDistributionSummary Oceanic;
+		int32 GlobalNegativeDominantBinIndex = INDEX_NONE;
+		double GlobalNegativeDominantFraction = 0.0;
+		int32 GlobalPositiveDominantBinIndex = INDEX_NONE;
+		double GlobalPositiveDominantFraction = 0.0;
+		bool bGlobalBimodalProxy = false;
+	};
+
+	struct FV9CoastalAsymmetryDiagnostic
+	{
+		int32 CoastBandMinHops = 1;
+		int32 CoastBandMaxHops = 1;
+		int32 InlandBandMinHops = 2;
+		int32 InlandBandMaxHops = 4;
+		int32 SubductionFacingCoastSampleCount = 0;
+		int32 NonSubductionFacingCoastSampleCount = 0;
+		int32 SubductionFacingInlandSampleCount = 0;
+		int32 NonSubductionFacingInlandSampleCount = 0;
+		int32 AmbiguousInlandSampleCount = 0;
+		FV9ElevationDistributionSummary SubductionFacingCoast;
+		FV9ElevationDistributionSummary NonSubductionFacingCoast;
+		FV9ElevationDistributionSummary SubductionFacingInlandBand;
+		FV9ElevationDistributionSummary NonSubductionFacingInlandBand;
+		double SubductionFacingSlopeProxyKm = 0.0;
+		double NonSubductionFacingSlopeProxyKm = 0.0;
+	};
+
+	struct FV9ContinentalInteriorElevationDiagnostic
+	{
+		int32 BroadInteriorMinCoastHops = 2;
+		FV9ElevationDistributionSummary BroadInterior;
+	};
+
 	FV6CheckpointSnapshot BuildV6CheckpointSnapshot(const FTectonicPlanetV6& Planet);
 	int32 ComputeCollisionRegionSamplesAboveElevationThreshold(
 		const FTectonicPlanetV6& Planet,
@@ -2780,6 +2838,420 @@ namespace
 			Result.SubaerialP95ElevationKm = SubaerialContinentalElevations[P95Index];
 		}
 
+		return Result;
+	}
+
+	int32 GetV9ElevationHistogramBinIndex(const double ElevationKm)
+	{
+		if (ElevationKm < -8.0) { return 0; }
+		if (ElevationKm < -6.0) { return 1; }
+		if (ElevationKm < -4.0) { return 2; }
+		if (ElevationKm < -2.0) { return 3; }
+		if (ElevationKm < 0.0) { return 4; }
+		if (ElevationKm < 0.5) { return 5; }
+		if (ElevationKm < 1.0) { return 6; }
+		if (ElevationKm < 2.0) { return 7; }
+		if (ElevationKm <= 5.0) { return 8; }
+		return 9;
+	}
+
+	const TCHAR* GetV9ElevationHistogramBinLabel(const int32 BinIndex)
+	{
+		switch (BinIndex)
+		{
+		case 0: return TEXT("lt_neg8");
+		case 1: return TEXT("neg8_neg6");
+		case 2: return TEXT("neg6_neg4");
+		case 3: return TEXT("neg4_neg2");
+		case 4: return TEXT("neg2_0");
+		case 5: return TEXT("0_0p5");
+		case 6: return TEXT("0p5_1");
+		case 7: return TEXT("1_2");
+		case 8: return TEXT("2_5");
+		case 9: return TEXT("gt_5");
+		default: return TEXT("unknown");
+		}
+	}
+
+	void AccumulateElevationDistributionSample(
+		FV9ElevationDistributionSummary& Summary,
+		TArray<double>& ElevationsKm,
+		const double ElevationKm)
+	{
+		if (Summary.HistogramBinCounts.Num() != V9ElevationHistogramBinCount)
+		{
+			Summary.HistogramBinCounts.Init(0, V9ElevationHistogramBinCount);
+		}
+
+		ElevationsKm.Add(ElevationKm);
+		++Summary.SampleCount;
+		++Summary.HistogramBinCounts[GetV9ElevationHistogramBinIndex(ElevationKm)];
+		if (ElevationKm <= 0.0)
+		{
+			++Summary.SubmergedSampleCount;
+		}
+		else if (ElevationKm <= 0.5)
+		{
+			++Summary.Samples0To0p5Km;
+		}
+		else if (ElevationKm <= 1.0)
+		{
+			++Summary.Samples0p5To1Km;
+		}
+		else if (ElevationKm <= 2.0)
+		{
+			++Summary.Samples1To2Km;
+		}
+		else if (ElevationKm <= 5.0)
+		{
+			++Summary.Samples2To5Km;
+		}
+		else
+		{
+			++Summary.SamplesAbove5Km;
+		}
+	}
+
+	int32 FindDominantElevationHistogramBin(
+		const TArray<int32>& HistogramBinCounts,
+		const int32 FirstIndex = 0,
+		const int32 LastIndex = V9ElevationHistogramBinCount - 1)
+	{
+		if (HistogramBinCounts.Num() != V9ElevationHistogramBinCount)
+		{
+			return INDEX_NONE;
+		}
+
+		int32 BestIndex = INDEX_NONE;
+		int32 BestCount = -1;
+		for (int32 BinIndex = FirstIndex; BinIndex <= LastIndex; ++BinIndex)
+		{
+			if (HistogramBinCounts[BinIndex] > BestCount)
+			{
+				BestCount = HistogramBinCounts[BinIndex];
+				BestIndex = BinIndex;
+			}
+		}
+		return BestCount > 0 ? BestIndex : INDEX_NONE;
+	}
+
+	double GetDominantElevationHistogramBinFraction(
+		const FV9ElevationDistributionSummary& Summary,
+		const int32 DominantBinIndex)
+	{
+		if (DominantBinIndex == INDEX_NONE ||
+			Summary.SampleCount <= 0 ||
+			!Summary.HistogramBinCounts.IsValidIndex(DominantBinIndex))
+		{
+			return 0.0;
+		}
+
+		return static_cast<double>(Summary.HistogramBinCounts[DominantBinIndex]) /
+			static_cast<double>(Summary.SampleCount);
+	}
+
+	void FinalizeElevationDistributionSummary(
+		FV9ElevationDistributionSummary& Summary,
+		TArray<double>& ElevationsKm)
+	{
+		if (Summary.SampleCount <= 0 || ElevationsKm.IsEmpty())
+		{
+			return;
+		}
+
+		double SumElevationKm = 0.0;
+		for (const double ElevationKm : ElevationsKm)
+		{
+			SumElevationKm += ElevationKm;
+		}
+		Summary.MeanElevationKm =
+			SumElevationKm / static_cast<double>(ElevationsKm.Num());
+
+		ElevationsKm.Sort();
+		Summary.P50ElevationKm = ElevationsKm[ElevationsKm.Num() / 2];
+		Summary.P95ElevationKm = ElevationsKm[FMath::Min(
+			static_cast<int32>(static_cast<double>(ElevationsKm.Num()) * 0.95),
+			ElevationsKm.Num() - 1)];
+		Summary.MaxElevationKm = ElevationsKm.Last();
+		Summary.DominantBinIndex = FindDominantElevationHistogramBin(Summary.HistogramBinCounts);
+		Summary.DominantBinFraction =
+			GetDominantElevationHistogramBinFraction(Summary, Summary.DominantBinIndex);
+	}
+
+	FV9HypsometricDiagnostic ComputeHypsometricDiagnostic(const FTectonicPlanetV6& Planet)
+	{
+		FV9HypsometricDiagnostic Result;
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		TArray<double> GlobalElevationsKm;
+		TArray<double> ContinentalElevationsKm;
+		TArray<double> SubaerialContinentalElevationsKm;
+		TArray<double> OceanicElevationsKm;
+		GlobalElevationsKm.Reserve(PlanetData.Samples.Num());
+		ContinentalElevationsKm.Reserve(PlanetData.Samples.Num() / 2);
+		SubaerialContinentalElevationsKm.Reserve(PlanetData.Samples.Num() / 2);
+		OceanicElevationsKm.Reserve(PlanetData.Samples.Num() / 2);
+
+		for (const FSample& Sample : PlanetData.Samples)
+		{
+			const double ElevationKm = static_cast<double>(Sample.Elevation);
+			AccumulateElevationDistributionSample(Result.Global, GlobalElevationsKm, ElevationKm);
+			if (Sample.ContinentalWeight >= 0.5f)
+			{
+				AccumulateElevationDistributionSample(
+					Result.Continental,
+					ContinentalElevationsKm,
+					ElevationKm);
+				if (Sample.Elevation > 0.0f)
+				{
+					AccumulateElevationDistributionSample(
+						Result.SubaerialContinental,
+						SubaerialContinentalElevationsKm,
+						ElevationKm);
+				}
+			}
+			else
+			{
+				AccumulateElevationDistributionSample(Result.Oceanic, OceanicElevationsKm, ElevationKm);
+			}
+		}
+
+		FinalizeElevationDistributionSummary(Result.Global, GlobalElevationsKm);
+		FinalizeElevationDistributionSummary(Result.Continental, ContinentalElevationsKm);
+		FinalizeElevationDistributionSummary(
+			Result.SubaerialContinental,
+			SubaerialContinentalElevationsKm);
+		FinalizeElevationDistributionSummary(Result.Oceanic, OceanicElevationsKm);
+
+		Result.GlobalNegativeDominantBinIndex =
+			FindDominantElevationHistogramBin(Result.Global.HistogramBinCounts, 0, 4);
+		Result.GlobalPositiveDominantBinIndex =
+			FindDominantElevationHistogramBin(Result.Global.HistogramBinCounts, 5, 9);
+		Result.GlobalNegativeDominantFraction =
+			GetDominantElevationHistogramBinFraction(
+				Result.Global,
+				Result.GlobalNegativeDominantBinIndex);
+		Result.GlobalPositiveDominantFraction =
+			GetDominantElevationHistogramBinFraction(
+				Result.Global,
+				Result.GlobalPositiveDominantBinIndex);
+		Result.bGlobalBimodalProxy =
+			Result.GlobalNegativeDominantFraction >= 0.10 &&
+			Result.GlobalPositiveDominantFraction >= 0.08;
+
+		return Result;
+	}
+
+	void RunContinentalSeedBfs(
+		const FTectonicPlanet& PlanetData,
+		const TArray<int32>& SeedSampleIndices,
+		TArray<int32>& OutDistances)
+	{
+		const int32 SampleCount = PlanetData.Samples.Num();
+		OutDistances.Init(-1, SampleCount);
+		if (SeedSampleIndices.IsEmpty())
+		{
+			return;
+		}
+
+		TArray<int32> Queue;
+		Queue.Reserve(SampleCount);
+		for (const int32 SeedSampleIndex : SeedSampleIndices)
+		{
+			if (!PlanetData.Samples.IsValidIndex(SeedSampleIndex) ||
+				PlanetData.Samples[SeedSampleIndex].ContinentalWeight < 0.5f ||
+				OutDistances[SeedSampleIndex] >= 0)
+			{
+				continue;
+			}
+
+			OutDistances[SeedSampleIndex] = 0;
+			Queue.Add(SeedSampleIndex);
+		}
+
+		for (int32 Head = 0; Head < Queue.Num(); ++Head)
+		{
+			const int32 Current = Queue[Head];
+			if (!PlanetData.SampleAdjacency.IsValidIndex(Current))
+			{
+				continue;
+			}
+
+			for (const int32 Neighbor : PlanetData.SampleAdjacency[Current])
+			{
+				if (!PlanetData.Samples.IsValidIndex(Neighbor) ||
+					PlanetData.Samples[Neighbor].ContinentalWeight < 0.5f ||
+					OutDistances[Neighbor] >= 0)
+				{
+					continue;
+				}
+
+				OutDistances[Neighbor] = OutDistances[Current] + 1;
+				Queue.Add(Neighbor);
+			}
+		}
+	}
+
+	FV9CoastalAsymmetryDiagnostic ComputeCoastalAsymmetryDiagnostic(
+		const FTectonicPlanetV6& Planet,
+		const FV9ContinentalMassDiagnostic& MassDiag)
+	{
+		FV9CoastalAsymmetryDiagnostic Result;
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		const TArray<uint8>& ActiveZoneCauseValues = Planet.GetCurrentSolveActiveZoneCauseValuesForTest();
+		const bool bHasActiveZoneCauses = ActiveZoneCauseValues.Num() == PlanetData.Samples.Num();
+		TArray<double> SubductionFacingCoastElevationsKm;
+		TArray<double> NonSubductionFacingCoastElevationsKm;
+		TArray<double> SubductionFacingInlandElevationsKm;
+		TArray<double> NonSubductionFacingInlandElevationsKm;
+		TArray<int32> SubductionFacingCoastSeeds;
+		TArray<int32> NonSubductionFacingCoastSeeds;
+
+		for (int32 SampleIndex = 0; SampleIndex < PlanetData.Samples.Num(); ++SampleIndex)
+		{
+			if (!MassDiag.SampleCoastDistHops.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			const FSample& Sample = PlanetData.Samples[SampleIndex];
+			if (Sample.ContinentalWeight < 0.5f || MassDiag.SampleCoastDistHops[SampleIndex] != 1)
+			{
+				continue;
+			}
+
+			const bool bSubductionSupported =
+				Sample.SubductionDistanceKm >= 0.0f ||
+				(bHasActiveZoneCauses &&
+					ActiveZoneCauseValues[SampleIndex] ==
+						static_cast<uint8>(ETectonicPlanetV6ActiveZoneCause::ConvergentSubduction));
+			if (bSubductionSupported)
+			{
+				SubductionFacingCoastSeeds.Add(SampleIndex);
+				AccumulateElevationDistributionSample(
+					Result.SubductionFacingCoast,
+					SubductionFacingCoastElevationsKm,
+					static_cast<double>(Sample.Elevation));
+			}
+			else
+			{
+				NonSubductionFacingCoastSeeds.Add(SampleIndex);
+				AccumulateElevationDistributionSample(
+					Result.NonSubductionFacingCoast,
+					NonSubductionFacingCoastElevationsKm,
+					static_cast<double>(Sample.Elevation));
+			}
+		}
+
+		Result.SubductionFacingCoastSampleCount = Result.SubductionFacingCoast.SampleCount;
+		Result.NonSubductionFacingCoastSampleCount = Result.NonSubductionFacingCoast.SampleCount;
+
+		TArray<int32> DistToSubductionFacingCoast;
+		TArray<int32> DistToNonSubductionFacingCoast;
+		RunContinentalSeedBfs(PlanetData, SubductionFacingCoastSeeds, DistToSubductionFacingCoast);
+		RunContinentalSeedBfs(PlanetData, NonSubductionFacingCoastSeeds, DistToNonSubductionFacingCoast);
+
+		for (int32 SampleIndex = 0; SampleIndex < PlanetData.Samples.Num(); ++SampleIndex)
+		{
+			if (!MassDiag.SampleCoastDistHops.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			const int32 CoastDepth = MassDiag.SampleCoastDistHops[SampleIndex];
+			const FSample& Sample = PlanetData.Samples[SampleIndex];
+			if (Sample.ContinentalWeight < 0.5f ||
+				CoastDepth < Result.InlandBandMinHops ||
+				CoastDepth > Result.InlandBandMaxHops)
+			{
+				continue;
+			}
+
+			const int32 SubductionDistance =
+				DistToSubductionFacingCoast.IsValidIndex(SampleIndex)
+					? DistToSubductionFacingCoast[SampleIndex]
+					: -1;
+			const int32 NonSubductionDistance =
+				DistToNonSubductionFacingCoast.IsValidIndex(SampleIndex)
+					? DistToNonSubductionFacingCoast[SampleIndex]
+					: -1;
+
+			if (SubductionDistance >= 0 &&
+				(NonSubductionDistance < 0 || SubductionDistance < NonSubductionDistance))
+			{
+				AccumulateElevationDistributionSample(
+					Result.SubductionFacingInlandBand,
+					SubductionFacingInlandElevationsKm,
+					static_cast<double>(Sample.Elevation));
+			}
+			else if (
+				NonSubductionDistance >= 0 &&
+				(SubductionDistance < 0 || NonSubductionDistance < SubductionDistance))
+			{
+				AccumulateElevationDistributionSample(
+					Result.NonSubductionFacingInlandBand,
+					NonSubductionFacingInlandElevationsKm,
+					static_cast<double>(Sample.Elevation));
+			}
+			else if (SubductionDistance >= 0 || NonSubductionDistance >= 0)
+			{
+				++Result.AmbiguousInlandSampleCount;
+			}
+		}
+
+		FinalizeElevationDistributionSummary(
+			Result.SubductionFacingCoast,
+			SubductionFacingCoastElevationsKm);
+		FinalizeElevationDistributionSummary(
+			Result.NonSubductionFacingCoast,
+			NonSubductionFacingCoastElevationsKm);
+		FinalizeElevationDistributionSummary(
+			Result.SubductionFacingInlandBand,
+			SubductionFacingInlandElevationsKm);
+		FinalizeElevationDistributionSummary(
+			Result.NonSubductionFacingInlandBand,
+			NonSubductionFacingInlandElevationsKm);
+
+		Result.SubductionFacingInlandSampleCount = Result.SubductionFacingInlandBand.SampleCount;
+		Result.NonSubductionFacingInlandSampleCount = Result.NonSubductionFacingInlandBand.SampleCount;
+		Result.SubductionFacingSlopeProxyKm =
+			Result.SubductionFacingInlandBand.MeanElevationKm -
+			Result.SubductionFacingCoast.MeanElevationKm;
+		Result.NonSubductionFacingSlopeProxyKm =
+			Result.NonSubductionFacingInlandBand.MeanElevationKm -
+			Result.NonSubductionFacingCoast.MeanElevationKm;
+
+		return Result;
+	}
+
+	FV9ContinentalInteriorElevationDiagnostic ComputeContinentalInteriorElevationDiagnostic(
+		const FTectonicPlanetV6& Planet,
+		const FV9ContinentalMassDiagnostic& MassDiag)
+	{
+		FV9ContinentalInteriorElevationDiagnostic Result;
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		TArray<double> BroadInteriorElevationsKm;
+		BroadInteriorElevationsKm.Reserve(PlanetData.Samples.Num() / 3);
+		for (int32 SampleIndex = 0; SampleIndex < PlanetData.Samples.Num(); ++SampleIndex)
+		{
+			if (!MassDiag.SampleCoastDistHops.IsValidIndex(SampleIndex) ||
+				MassDiag.SampleCoastDistHops[SampleIndex] < Result.BroadInteriorMinCoastHops)
+			{
+				continue;
+			}
+
+			const FSample& Sample = PlanetData.Samples[SampleIndex];
+			if (Sample.ContinentalWeight < 0.5f)
+			{
+				continue;
+			}
+
+			AccumulateElevationDistributionSample(
+				Result.BroadInterior,
+				BroadInteriorElevationsKm,
+				static_cast<double>(Sample.Elevation));
+		}
+
+		FinalizeElevationDistributionSummary(Result.BroadInterior, BroadInteriorElevationsKm);
 		return Result;
 	}
 
@@ -17583,6 +18055,9 @@ bool FTectonicPlanetV6V9TectonicBalanceAuditTest::RunTest(const FString& Paramet
 		TMap<int32, FV6CheckpointSnapshot> Snapshots;
 		TMap<int32, FV9ContinentalMassDiagnostic> MassDiagnostics;
 		TMap<int32, FV9ContinentalElevationBandDiagnostic> ElevationBandDiagnostics;
+		TMap<int32, FV9HypsometricDiagnostic> HypsometricDiagnostics;
+		TMap<int32, FV9CoastalAsymmetryDiagnostic> CoastalAsymmetryDiagnostics;
+		TMap<int32, FV9ContinentalInteriorElevationDiagnostic> InteriorElevationDiagnostics;
 		TMap<int32, FV9SeededContinentalSurvivalDiagnostic> SurvivalDiagnostics;
 		TArray<uint8> Step0ContinentalFlags;
 		TArray<uint8> Step0BroadInteriorFlags;
@@ -17799,6 +18274,12 @@ bool FTectonicPlanetV6V9TectonicBalanceAuditTest::RunTest(const FString& Paramet
 		const FV9ContinentalMassDiagnostic& MassDiag = Run.MassDiagnostics.FindChecked(Step);
 		const FV9ContinentalElevationBandDiagnostic& ElevDiag =
 			Run.ElevationBandDiagnostics.FindChecked(Step);
+		const FV9HypsometricDiagnostic& HypsDiag =
+			Run.HypsometricDiagnostics.FindChecked(Step);
+		const FV9CoastalAsymmetryDiagnostic& CoastalDiag =
+			Run.CoastalAsymmetryDiagnostics.FindChecked(Step);
+		const FV9ContinentalInteriorElevationDiagnostic& InteriorDiag =
+			Run.InteriorElevationDiagnostics.FindChecked(Step);
 		const FV9SeededContinentalSurvivalDiagnostic& SurvivalDiag =
 			Run.SurvivalDiagnostics.FindChecked(Step);
 		const double BoundaryCoverageFraction =
@@ -17864,6 +18345,96 @@ bool FTectonicPlanetV6V9TectonicBalanceAuditTest::RunTest(const FString& Paramet
 			SafeFrac(ElevDiag.ContinentalSamplesAbove5Km, ElevDiag.ContinentalSampleCount),
 			ElevDiag.SamplesAbove2Km,
 			ElevDiag.SamplesAbove5Km));
+
+		const auto EmitHistogram = [this, &Run, Step, &SafeFrac](const TCHAR* SetLabel, const FV9ElevationDistributionSummary& Summary)
+		{
+			AddInfo(FString::Printf(
+				TEXT("[V9BalanceAudit hyps label=%s sample_count=%d seed=%d step=%d set=%s samples=%d dominant_bin=%s dominant_frac=%.4f lt_neg8=%.4f neg8_neg6=%.4f neg6_neg4=%.4f neg4_neg2=%.4f neg2_0=%.4f 0_0p5=%.4f 0p5_1=%.4f 1_2=%.4f 2_5=%.4f gt_5=%.4f"),
+				*Run.Config.Label,
+				Run.Config.SampleCount,
+				Run.Config.Seed,
+				Step,
+				SetLabel,
+				Summary.SampleCount,
+				GetV9ElevationHistogramBinLabel(Summary.DominantBinIndex),
+				Summary.DominantBinFraction,
+				SafeFrac(Summary.HistogramBinCounts.IsValidIndex(0) ? Summary.HistogramBinCounts[0] : 0, Summary.SampleCount),
+				SafeFrac(Summary.HistogramBinCounts.IsValidIndex(1) ? Summary.HistogramBinCounts[1] : 0, Summary.SampleCount),
+				SafeFrac(Summary.HistogramBinCounts.IsValidIndex(2) ? Summary.HistogramBinCounts[2] : 0, Summary.SampleCount),
+				SafeFrac(Summary.HistogramBinCounts.IsValidIndex(3) ? Summary.HistogramBinCounts[3] : 0, Summary.SampleCount),
+				SafeFrac(Summary.HistogramBinCounts.IsValidIndex(4) ? Summary.HistogramBinCounts[4] : 0, Summary.SampleCount),
+				SafeFrac(Summary.HistogramBinCounts.IsValidIndex(5) ? Summary.HistogramBinCounts[5] : 0, Summary.SampleCount),
+				SafeFrac(Summary.HistogramBinCounts.IsValidIndex(6) ? Summary.HistogramBinCounts[6] : 0, Summary.SampleCount),
+				SafeFrac(Summary.HistogramBinCounts.IsValidIndex(7) ? Summary.HistogramBinCounts[7] : 0, Summary.SampleCount),
+				SafeFrac(Summary.HistogramBinCounts.IsValidIndex(8) ? Summary.HistogramBinCounts[8] : 0, Summary.SampleCount),
+				SafeFrac(Summary.HistogramBinCounts.IsValidIndex(9) ? Summary.HistogramBinCounts[9] : 0, Summary.SampleCount)));
+		};
+
+		EmitHistogram(TEXT("global"), HypsDiag.Global);
+		EmitHistogram(TEXT("continental"), HypsDiag.Continental);
+		EmitHistogram(TEXT("subaerial_continental"), HypsDiag.SubaerialContinental);
+		EmitHistogram(TEXT("oceanic"), HypsDiag.Oceanic);
+
+		AddInfo(FString::Printf(
+			TEXT("[V9BalanceAudit hyps_summary label=%s sample_count=%d seed=%d step=%d global_bimodal_proxy=%d global_neg_mode=%s neg_frac=%.4f global_pos_mode=%s pos_frac=%.4f continental_mode=%s subaerial_mode=%s oceanic_mode=%s"),
+			*Run.Config.Label,
+			Run.Config.SampleCount,
+			Run.Config.Seed,
+			Step,
+			HypsDiag.bGlobalBimodalProxy ? 1 : 0,
+			GetV9ElevationHistogramBinLabel(HypsDiag.GlobalNegativeDominantBinIndex),
+			HypsDiag.GlobalNegativeDominantFraction,
+			GetV9ElevationHistogramBinLabel(HypsDiag.GlobalPositiveDominantBinIndex),
+			HypsDiag.GlobalPositiveDominantFraction,
+			GetV9ElevationHistogramBinLabel(HypsDiag.Continental.DominantBinIndex),
+			GetV9ElevationHistogramBinLabel(HypsDiag.SubaerialContinental.DominantBinIndex),
+			GetV9ElevationHistogramBinLabel(HypsDiag.Oceanic.DominantBinIndex)));
+
+		AddInfo(FString::Printf(
+			TEXT("[V9BalanceAudit asym label=%s sample_count=%d seed=%d step=%d proxy=subduction_distance_or_active_convergent coast_band=%d-%d inland_band=%d-%d subduction_coast_n=%d subduction_coast_mean=%.4f subduction_coast_p95=%.4f non_subduction_coast_n=%d non_subduction_coast_mean=%.4f non_subduction_coast_p95=%.4f subduction_inland_n=%d subduction_inland_mean=%.4f subduction_inland_p95=%.4f non_subduction_inland_n=%d non_subduction_inland_mean=%.4f non_subduction_inland_p95=%.4f ambiguous_inland=%d subduction_slope_proxy=%.4f non_subduction_slope_proxy=%.4f"),
+			*Run.Config.Label,
+			Run.Config.SampleCount,
+			Run.Config.Seed,
+			Step,
+			CoastalDiag.CoastBandMinHops,
+			CoastalDiag.CoastBandMaxHops,
+			CoastalDiag.InlandBandMinHops,
+			CoastalDiag.InlandBandMaxHops,
+			CoastalDiag.SubductionFacingCoast.SampleCount,
+			CoastalDiag.SubductionFacingCoast.MeanElevationKm,
+			CoastalDiag.SubductionFacingCoast.P95ElevationKm,
+			CoastalDiag.NonSubductionFacingCoast.SampleCount,
+			CoastalDiag.NonSubductionFacingCoast.MeanElevationKm,
+			CoastalDiag.NonSubductionFacingCoast.P95ElevationKm,
+			CoastalDiag.SubductionFacingInlandBand.SampleCount,
+			CoastalDiag.SubductionFacingInlandBand.MeanElevationKm,
+			CoastalDiag.SubductionFacingInlandBand.P95ElevationKm,
+			CoastalDiag.NonSubductionFacingInlandBand.SampleCount,
+			CoastalDiag.NonSubductionFacingInlandBand.MeanElevationKm,
+			CoastalDiag.NonSubductionFacingInlandBand.P95ElevationKm,
+			CoastalDiag.AmbiguousInlandSampleCount,
+			CoastalDiag.SubductionFacingSlopeProxyKm,
+			CoastalDiag.NonSubductionFacingSlopeProxyKm));
+
+		AddInfo(FString::Printf(
+			TEXT("[V9BalanceAudit interior label=%s sample_count=%d seed=%d step=%d broad_interior_min_hops=%d samples=%d mean=%.4f p50=%.4f p95=%.4f submerged_frac=%.4f band_0_0p5=%.4f band_0p5_1=%.4f band_1_2=%.4f band_2_5=%.4f band_gt5=%.4f dominant_bin=%s dominant_frac=%.4f"),
+			*Run.Config.Label,
+			Run.Config.SampleCount,
+			Run.Config.Seed,
+			Step,
+			InteriorDiag.BroadInteriorMinCoastHops,
+			InteriorDiag.BroadInterior.SampleCount,
+			InteriorDiag.BroadInterior.MeanElevationKm,
+			InteriorDiag.BroadInterior.P50ElevationKm,
+			InteriorDiag.BroadInterior.P95ElevationKm,
+			SafeFrac(InteriorDiag.BroadInterior.SubmergedSampleCount, InteriorDiag.BroadInterior.SampleCount),
+			SafeFrac(InteriorDiag.BroadInterior.Samples0To0p5Km, InteriorDiag.BroadInterior.SampleCount),
+			SafeFrac(InteriorDiag.BroadInterior.Samples0p5To1Km, InteriorDiag.BroadInterior.SampleCount),
+			SafeFrac(InteriorDiag.BroadInterior.Samples1To2Km, InteriorDiag.BroadInterior.SampleCount),
+			SafeFrac(InteriorDiag.BroadInterior.Samples2To5Km, InteriorDiag.BroadInterior.SampleCount),
+			SafeFrac(InteriorDiag.BroadInterior.SamplesAbove5Km, InteriorDiag.BroadInterior.SampleCount),
+			GetV9ElevationHistogramBinLabel(InteriorDiag.BroadInterior.DominantBinIndex),
+			InteriorDiag.BroadInterior.DominantBinFraction));
 	};
 
 	const auto EmitDrift = [this, &SafeFrac](
@@ -17905,6 +18476,12 @@ bool FTectonicPlanetV6V9TectonicBalanceAuditTest::RunTest(const FString& Paramet
 		const FV9ContinentalMassDiagnostic MassDiag = ComputeContinentalMassDiagnostic(Run.Planet);
 		const FV9ContinentalElevationBandDiagnostic ElevDiag =
 			ComputeContinentalElevationBandDiagnostic(Run.Planet);
+		const FV9HypsometricDiagnostic HypsDiag =
+			ComputeHypsometricDiagnostic(Run.Planet);
+		const FV9CoastalAsymmetryDiagnostic CoastalDiag =
+			ComputeCoastalAsymmetryDiagnostic(Run.Planet, MassDiag);
+		const FV9ContinentalInteriorElevationDiagnostic InteriorDiag =
+			ComputeContinentalInteriorElevationDiagnostic(Run.Planet, MassDiag);
 		const FV9SeededContinentalSurvivalDiagnostic SurvivalDiag =
 			ComputeSeededContinentalSurvivalDiagnostic(
 				Run.Planet.GetPlanet(),
@@ -17914,6 +18491,9 @@ bool FTectonicPlanetV6V9TectonicBalanceAuditTest::RunTest(const FString& Paramet
 		Run.Snapshots.Add(Step, Snapshot);
 		Run.MassDiagnostics.Add(Step, MassDiag);
 		Run.ElevationBandDiagnostics.Add(Step, ElevDiag);
+		Run.HypsometricDiagnostics.Add(Step, HypsDiag);
+		Run.CoastalAsymmetryDiagnostics.Add(Step, CoastalDiag);
+		Run.InteriorElevationDiagnostics.Add(Step, InteriorDiag);
 		Run.SurvivalDiagnostics.Add(Step, SurvivalDiag);
 	};
 
@@ -17932,6 +18512,24 @@ bool FTectonicPlanetV6V9TectonicBalanceAuditTest::RunTest(const FString& Paramet
 		{ TEXT("250k_kept"), 250000, CanonicalSeed, true },
 		{ TEXT("250k_kept"), 250000, Secondary250kSeed, true },
 	};
+
+	constexpr double AuditSanityDeltaTimeMyears = 2.0;
+	constexpr double AuditSanityBaseUpliftKmPerMy = 0.6;
+	constexpr double AuditSanityContinentalErosionKmPerStep = 0.06;
+	constexpr double AuditSanityContinentalErosionKmPerMy =
+		AuditSanityContinentalErosionKmPerStep / AuditSanityDeltaTimeMyears;
+	constexpr double AuditSanityBoundFactor = 2.244;
+	constexpr double AuditSanityElevationCeilingKm = 10.0;
+	constexpr double AuditSanityHMaxContextKm =
+		AuditSanityBoundFactor *
+		(AuditSanityBaseUpliftKmPerMy / AuditSanityContinentalErosionKmPerMy);
+	AddInfo(FString::Printf(
+		TEXT("[V9BalanceAudit sanity uplift_erosion] u0_km_per_my=%.4f erosion_k_km_per_my=%.4f bound_factor=%.3f hmax_context_km=%.4f elevation_ceiling_km=%.4f note=rough_context_only_not_a_direct_target"),
+		AuditSanityBaseUpliftKmPerMy,
+		AuditSanityContinentalErosionKmPerMy,
+		AuditSanityBoundFactor,
+		AuditSanityHMaxContextKm,
+		AuditSanityElevationCeilingKm));
 
 	for (const FRunConfig& Config : RunsToExecute)
 	{
@@ -17963,6 +18561,9 @@ bool FTectonicPlanetV6V9TectonicBalanceAuditTest::RunTest(const FString& Paramet
 				Run.Snapshots.Contains(Step) &&
 				Run.MassDiagnostics.Contains(Step) &&
 				Run.ElevationBandDiagnostics.Contains(Step) &&
+				Run.HypsometricDiagnostics.Contains(Step) &&
+				Run.CoastalAsymmetryDiagnostics.Contains(Step) &&
+				Run.InteriorElevationDiagnostics.Contains(Step) &&
 				Run.SurvivalDiagnostics.Contains(Step));
 		}
 	}
