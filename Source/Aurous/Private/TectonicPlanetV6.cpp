@@ -10882,6 +10882,266 @@ namespace
 			UsesFallback(TransferDebug.FoldDirectionTransferKind);
 	}
 
+	bool ChooseExplicitFallback(
+		const FTectonicPlanet& Planet,
+		int32& OutPlateId,
+		int32& OutSourceSampleIndex);
+
+	struct FV6CopiedFrontierZeroHitResolvedDecisionStageContext
+	{
+		const FTectonicPlanet* Planet = nullptr;
+		const TArray<FV6PlateFrontierPointSet>* FrontierPointSets = nullptr;
+		const FV6CopiedFrontierDestructiveFilterState* DestructiveFilterState = nullptr;
+		const TArray<int32>* PreSolvePlateIds = nullptr;
+		const TArray<uint8>* MissLineageCounts = nullptr;
+		const TArray<uint8>* CurrentSolvePreviousSyntheticFlags = nullptr;
+		const TArray<uint8>* CurrentSolvePreviousRetainedSyntheticCoverageFlags = nullptr;
+		TArray<uint8>* CurrentSolveRetainedSyntheticCoverageFlags = nullptr;
+		const TArray<uint8>* CurrentSolvePreviousOwnerRecoveryFlags = nullptr;
+		const TArray<uint8>* CurrentSolvePreviousOwnerCanonicalVertexInMeshFlags = nullptr;
+		const TArray<uint8>* CurrentSolvePreviousOwnerAdjacentTriangleInMeshFlags = nullptr;
+		const TArray<uint8>* CurrentSolvePreviousTransferSourceKindValues = nullptr;
+		const TArray<uint8>* CurrentSolvePreviousResolutionKindValues = nullptr;
+		const TArray<uint8>* ConvergentActiveFieldContinuityFlags = nullptr;
+		const TArray<uint8>* AdjacentToConvergentActiveFieldContinuityFlags = nullptr;
+		TArray<uint8>* CurrentSolveLocalParticipationPlateCounts = nullptr;
+		TArray<uint8>* RecoveryMissPlateCandidateCounts = nullptr;
+		const TArray<uint8>* RecoveryCandidatePlateCandidateCounts = nullptr;
+		const TArray<int32>* UnfilteredExactCandidateCounts = nullptr;
+		const TArray<int32>* UnfilteredDestructiveCandidateCounts = nullptr;
+		TAtomic<int32>* ActiveBandPreviousOwnerCompatibleRecoveryCount = nullptr;
+		TAtomic<int32>* ActiveBandSyntheticLoopBreakCount = nullptr;
+		TAtomic<int32>* MissCount = nullptr;
+		bool bEnableSyntheticCoverageRetentionForTest = false;
+		bool bEnableStructuredGapFill = false;
+		bool bApplyDestructiveFilter = false;
+	};
+
+	void ApplyCopiedFrontierZeroHitResolvedDecisionStage(
+		const FV6CopiedFrontierZeroHitResolvedDecisionStageContext& Context,
+		const int32 SampleIndex,
+		const FVector3d& QueryPoint,
+		const int32 PreviousPlateId,
+		const TArray<FV6ThesisRemeshRayHit>& UnfilteredHitCandidates,
+		const FTectonicPlanetV6RecoveryCandidate* PreviousOwnerRecoveryCandidate,
+		const TArray<FTectonicPlanetV6RecoveryCandidate>& RecoveryCandidates,
+		FTectonicPlanetV6ResolvedSample& Resolved)
+	{
+		(*Context.CurrentSolveLocalParticipationPlateCounts)[SampleIndex] = static_cast<uint8>(FMath::Clamp(
+			CountDistinctRecoveryCandidatePlates(RecoveryCandidates),
+			0,
+			255));
+		(*Context.RecoveryMissPlateCandidateCounts)[SampleIndex] =
+			(*Context.RecoveryCandidatePlateCandidateCounts)[SampleIndex];
+
+		const bool bPreviousSynthetic = (*Context.CurrentSolvePreviousSyntheticFlags)[SampleIndex] != 0;
+		const bool bPreviousRetainedSyntheticCoverage =
+			Context.CurrentSolvePreviousRetainedSyntheticCoverageFlags->IsValidIndex(SampleIndex) &&
+			(*Context.CurrentSolvePreviousRetainedSyntheticCoverageFlags)[SampleIndex] != 0;
+		const bool bPreviousOwnerAdjacentTriangleSupportPresent =
+			Context.CurrentSolvePreviousOwnerAdjacentTriangleInMeshFlags->IsValidIndex(SampleIndex) &&
+			(*Context.CurrentSolvePreviousOwnerAdjacentTriangleInMeshFlags)[SampleIndex] != 0;
+		const bool bConvergentActiveFieldContinuityLocality =
+			IsCopiedFrontierConvergentFieldContinuityLocality(
+				*Context.ConvergentActiveFieldContinuityFlags,
+				*Context.AdjacentToConvergentActiveFieldContinuityFlags,
+				SampleIndex);
+		const bool bRetainPreviousSyntheticCoverage =
+			Context.bEnableSyntheticCoverageRetentionForTest &&
+			ShouldRetainPreviousSyntheticCoverageForMiss(
+				*Context.Planet,
+				SampleIndex,
+				PreviousPlateId,
+				bPreviousSynthetic,
+				bPreviousRetainedSyntheticCoverage,
+				bPreviousOwnerAdjacentTriangleSupportPresent,
+				RecoveryCandidates);
+		if (bRetainPreviousSyntheticCoverage)
+		{
+			Resolved.FinalPlateId = PreviousPlateId;
+			Resolved.PreCoherencePlateId = PreviousPlateId;
+			Resolved.SourceCanonicalSampleIndex = SampleIndex;
+			Resolved.RecoveryDistanceRadians =
+				PreviousOwnerRecoveryCandidate != nullptr
+					? PreviousOwnerRecoveryCandidate->DistanceRadians
+					: -1.0;
+			if (const FTectonicPlanetV6RecoveryCandidate* OtherRecoveryCandidate =
+					FindBestRecoveryCandidateForOtherPlate(RecoveryCandidates, PreviousPlateId))
+			{
+				Resolved.BoundaryOtherPlateId = OtherRecoveryCandidate->PlateId;
+			}
+			Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshRetainedSyntheticCoverage;
+			Resolved.bRetainedSyntheticCoverage = true;
+			(*Context.CurrentSolveRetainedSyntheticCoverageFlags)[SampleIndex] = 1;
+			return;
+		}
+
+		int32 ExplicitFallbackPlateId = INDEX_NONE;
+		int32 ExplicitFallbackSampleIndex = INDEX_NONE;
+		ChooseExplicitFallback(*Context.Planet, ExplicitFallbackPlateId, ExplicitFallbackSampleIndex);
+
+		int32 PrimaryPlateId = INDEX_NONE;
+		int32 SecondaryPlateId = INDEX_NONE;
+		double PrimaryDistance = -1.0;
+		ChooseThesisRemeshMissOwnerPlates(
+			RecoveryCandidates,
+			PreviousPlateId,
+			ExplicitFallbackPlateId,
+			PrimaryPlateId,
+			SecondaryPlateId,
+			PrimaryDistance);
+
+		const int32 UnfilteredCandidateCount =
+			(Context.bApplyDestructiveFilter && Context.UnfilteredExactCandidateCounts->IsValidIndex(SampleIndex))
+				? (*Context.UnfilteredExactCandidateCounts)[SampleIndex]
+				: 0;
+		const int32 UnfilteredDestructiveCandidateCount =
+			(Context.bApplyDestructiveFilter && Context.UnfilteredDestructiveCandidateCounts->IsValidIndex(SampleIndex))
+				? (*Context.UnfilteredDestructiveCandidateCounts)[SampleIndex]
+				: 0;
+
+		Resolved.BoundaryOtherPlateId = SecondaryPlateId;
+		Resolved.RecoveryDistanceRadians = PrimaryDistance;
+		int32 FillPreferredPrimaryPlateId = PrimaryPlateId;
+		int32 FillPreferredSecondaryPlateId = SecondaryPlateId;
+		if (Context.bApplyDestructiveFilter &&
+			UnfilteredCandidateCount > 0 &&
+			UnfilteredDestructiveCandidateCount == UnfilteredCandidateCount)
+		{
+			const int32 PreferredPlateId = ChooseDestructiveExclusionContinuationPlateId(
+				*Context.Planet,
+				UnfilteredHitCandidates,
+				*Context.DestructiveFilterState,
+				PreviousPlateId,
+				PrimaryPlateId);
+			const FTectonicPlanetV6RecoveryCandidate* PreferredOtherRecoveryCandidate =
+				FindBestRecoveryCandidateForOtherPlate(RecoveryCandidates, PreferredPlateId);
+			FillPreferredPrimaryPlateId = PreferredPlateId != INDEX_NONE ? PreferredPlateId : PrimaryPlateId;
+			FillPreferredSecondaryPlateId =
+				PreferredOtherRecoveryCandidate != nullptr
+					? PreferredOtherRecoveryCandidate->PlateId
+					: SecondaryPlateId;
+			Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshMissDestructiveExclusion;
+		}
+		else if (Context.bApplyDestructiveFilter && UnfilteredCandidateCount > 0)
+		{
+			Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshMissAmbiguous;
+		}
+		else
+		{
+			Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshMissOceanic;
+		}
+
+		bool bUseActiveBandCompatibleRecovery = false;
+		bool bUsedSyntheticLoopBreak = false;
+		int32 ActiveBandPreferredSourceCanonicalSampleIndex = INDEX_NONE;
+		if (bConvergentActiveFieldContinuityLocality &&
+			PreviousPlateId != INDEX_NONE &&
+			FindPlateById(*Context.Planet, PreviousPlateId) != nullptr &&
+			HasCopiedFrontierPreviousOwnerFieldRecoveryContext(
+				Resolved,
+				*Context.CurrentSolvePreviousOwnerRecoveryFlags,
+				*Context.CurrentSolvePreviousOwnerCanonicalVertexInMeshFlags,
+				*Context.CurrentSolvePreviousOwnerAdjacentTriangleInMeshFlags,
+				SampleIndex))
+		{
+			FillPreferredPrimaryPlateId = PreviousPlateId;
+			if (const FTectonicPlanetV6RecoveryCandidate* OtherRecoveryCandidate =
+					FindBestRecoveryCandidateForOtherPlate(RecoveryCandidates, PreviousPlateId))
+			{
+				FillPreferredSecondaryPlateId = OtherRecoveryCandidate->PlateId;
+			}
+			if (FindCarriedSampleForCanonicalVertex(*Context.Planet, PreviousPlateId, SampleIndex) != nullptr)
+			{
+				ActiveBandPreferredSourceCanonicalSampleIndex = SampleIndex;
+			}
+			bUseActiveBandCompatibleRecovery = true;
+		}
+		else if (bConvergentActiveFieldContinuityLocality &&
+			bPreviousSynthetic &&
+			Context.MissLineageCounts->IsValidIndex(SampleIndex) &&
+			(*Context.MissLineageCounts)[SampleIndex] >= 2)
+		{
+			int32 LoopBreakPlateId = INDEX_NONE;
+			int32 LoopBreakSourceCanonicalSampleIndex = INDEX_NONE;
+			int32 LoopBreakSupportCount = 0;
+			if (TryChooseActiveBandSyntheticLoopBreakSource(
+					*Context.Planet,
+					SampleIndex,
+					PreviousPlateId,
+					*Context.PreSolvePlateIds,
+					RecoveryCandidates,
+					*Context.CurrentSolvePreviousSyntheticFlags,
+					*Context.CurrentSolvePreviousTransferSourceKindValues,
+					*Context.CurrentSolvePreviousResolutionKindValues,
+					LoopBreakPlateId,
+					LoopBreakSourceCanonicalSampleIndex,
+					LoopBreakSupportCount))
+			{
+				FillPreferredPrimaryPlateId = LoopBreakPlateId;
+				if (const FTectonicPlanetV6RecoveryCandidate* OtherRecoveryCandidate =
+						FindBestRecoveryCandidateForOtherPlate(RecoveryCandidates, LoopBreakPlateId))
+				{
+					FillPreferredSecondaryPlateId = OtherRecoveryCandidate->PlateId;
+				}
+				ActiveBandPreferredSourceCanonicalSampleIndex = LoopBreakSourceCanonicalSampleIndex;
+				bUseActiveBandCompatibleRecovery = true;
+				bUsedSyntheticLoopBreak = true;
+			}
+		}
+
+		Resolved.FinalPlateId = FillPreferredPrimaryPlateId;
+		Resolved.PreCoherencePlateId = FillPreferredPrimaryPlateId;
+		Resolved.BoundaryOtherPlateId = FillPreferredSecondaryPlateId;
+		if (bUseActiveBandCompatibleRecovery)
+		{
+			SeedStructuredDestructiveGapSource(
+				*Context.Planet,
+				FillPreferredPrimaryPlateId,
+				RecoveryCandidates,
+				Resolved,
+				QueryPoint);
+			if (ActiveBandPreferredSourceCanonicalSampleIndex != INDEX_NONE)
+			{
+				Resolved.SourceCanonicalSampleIndex = ActiveBandPreferredSourceCanonicalSampleIndex;
+			}
+			Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshTransferFallback;
+			if (!bUsedSyntheticLoopBreak)
+			{
+				++(*Context.ActiveBandPreviousOwnerCompatibleRecoveryCount);
+			}
+			if (bUsedSyntheticLoopBreak)
+			{
+				++(*Context.ActiveBandSyntheticLoopBreakCount);
+			}
+			return;
+		}
+
+		++(*Context.MissCount);
+		if (Context.bEnableStructuredGapFill)
+		{
+			int32 FrontierPrimaryPlateId = INDEX_NONE;
+			int32 FrontierSecondaryPlateId = INDEX_NONE;
+			if (TryBuildStructuredFrontierPairFill(
+					*Context.FrontierPointSets,
+					QueryPoint,
+					FillPreferredPrimaryPlateId,
+					FillPreferredSecondaryPlateId,
+					Resolved.StructuredSyntheticFillSample,
+					FrontierPrimaryPlateId,
+					FrontierSecondaryPlateId))
+			{
+				Resolved.bHasStructuredSyntheticFill = true;
+				if (FrontierPrimaryPlateId != INDEX_NONE)
+				{
+					Resolved.FinalPlateId = FrontierPrimaryPlateId;
+					Resolved.PreCoherencePlateId = FrontierPrimaryPlateId;
+				}
+				Resolved.BoundaryOtherPlateId = FrontierSecondaryPlateId;
+			}
+		}
+	}
+
 	struct FV6CopiedFrontierTransferStageContext
 	{
 		const FTectonicPlanet* Planet = nullptr;
@@ -14485,9 +14745,36 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	HitSearchPrunedSampleFlags.Init(0, Planet.Samples.Num());
 	TArray<uint8> RecoveryCandidatePrunedSampleFlags;
 	RecoveryCandidatePrunedSampleFlags.Init(0, Planet.Samples.Num());
+	const FV6CopiedFrontierZeroHitResolvedDecisionStageContext ZeroHitResolvedDecisionStageContext{
+		&Planet,
+		&FrontierPointSets,
+		&DestructiveFilterState,
+		&PreSolvePlateIds,
+		&MissLineageCounts,
+		&CurrentSolvePreviousSyntheticFlags,
+		&CurrentSolvePreviousRetainedSyntheticCoverageFlags,
+		&CurrentSolveRetainedSyntheticCoverageFlags,
+		&CurrentSolvePreviousOwnerRecoveryFlags,
+		&CurrentSolvePreviousOwnerCanonicalVertexInMeshFlags,
+		&CurrentSolvePreviousOwnerAdjacentTriangleInMeshFlags,
+		&CurrentSolvePreviousTransferSourceKindValues,
+		&CurrentSolvePreviousResolutionKindValues,
+		&ConvergentActiveFieldContinuityFlags,
+		&AdjacentToConvergentActiveFieldContinuityFlags,
+		&CurrentSolveLocalParticipationPlateCounts,
+		&RecoveryMissPlateCandidateCounts,
+		&RecoveryCandidatePlateCandidateCounts,
+		&UnfilteredExactCandidateCounts,
+		&UnfilteredDestructiveCandidateCounts,
+		&ActiveBandPreviousOwnerCompatibleRecoveryCount,
+		&ActiveBandSyntheticLoopBreakCount,
+		&MissCount,
+		bEnableSyntheticCoverageRetentionForTest,
+		bEnableStructuredGapFill,
+		bApplyDestructiveFilter};
 
 		const double ResolveTransferLoopStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
-		ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &QueryGeometries, &QueryGeometryIndexByPlateId, &FrontierPointSets, &UnfilteredComparisonQueryGeometries, &UnfilteredComparisonQueryGeometryIndexByPlateId, &DestructiveFilterState, &SampleToAdjacentTriangles, &PreSolvePlateIds, &NewPlateIds, &UnfilteredExactCandidateCounts, &UnfilteredDestructiveCandidateCounts, &MultiHitTrackedCandidateFlags, &MultiHitPlateMixValues, &MultiHitGeometryMixValues, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &HitSearchPlateCandidateCounts, &RecoveryCandidatePlateCandidateCounts, &RecoveryMissPlateCandidateCounts, &RecoveryMissSampleFlags, &RecoveryCandidateGatherSampleFlags, &HitSearchPrunedSampleFlags, &RecoveryCandidatePrunedSampleFlags, &HitCount, &MissCount, &MultiHitCount, &CopiedFrontierHitCount, &InteriorHitCount, &DestructiveTriangleRejectedCount, &OverlapCoherenceSupportPrunedSampleCount, &OverlapCoherencePreviousPlateStabilizedSampleCount, &OverlapCoherenceSuppressedCandidateCount, &ActiveBandPreviousOwnerCompatibleRecoveryCount, &ActiveBandSyntheticLoopBreakCount, &HitSearchMicroseconds, &ZeroHitRecoveryMicroseconds, &DirectHitTransferMicroseconds, &FallbackTransferMicroseconds, &QuietInteriorPreservationMicroseconds, bApplyDestructiveFilter, bEnableStructuredGapFill, bEnableV9Phase1Authority, bRecordPhaseTiming](const int32 SampleIndex)
+		ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &QueryGeometries, &QueryGeometryIndexByPlateId, &FrontierPointSets, &UnfilteredComparisonQueryGeometries, &UnfilteredComparisonQueryGeometryIndexByPlateId, &DestructiveFilterState, &SampleToAdjacentTriangles, &PreSolvePlateIds, &NewPlateIds, &UnfilteredExactCandidateCounts, &UnfilteredDestructiveCandidateCounts, &MultiHitTrackedCandidateFlags, &MultiHitPlateMixValues, &MultiHitGeometryMixValues, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &HitSearchPlateCandidateCounts, &RecoveryCandidatePlateCandidateCounts, &RecoveryMissPlateCandidateCounts, &RecoveryMissSampleFlags, &RecoveryCandidateGatherSampleFlags, &HitSearchPrunedSampleFlags, &RecoveryCandidatePrunedSampleFlags, &HitCount, &MissCount, &MultiHitCount, &CopiedFrontierHitCount, &InteriorHitCount, &DestructiveTriangleRejectedCount, &OverlapCoherenceSupportPrunedSampleCount, &OverlapCoherencePreviousPlateStabilizedSampleCount, &OverlapCoherenceSuppressedCandidateCount, &ActiveBandPreviousOwnerCompatibleRecoveryCount, &ActiveBandSyntheticLoopBreakCount, &HitSearchMicroseconds, &ZeroHitRecoveryMicroseconds, &DirectHitTransferMicroseconds, &FallbackTransferMicroseconds, &QuietInteriorPreservationMicroseconds, &ZeroHitResolvedDecisionStageContext, bApplyDestructiveFilter, bEnableStructuredGapFill, bEnableV9Phase1Authority, bRecordPhaseTiming](const int32 SampleIndex)
 		{
 			const FVector3d QueryPoint = Planet.Samples[SampleIndex].Position;
 			const int32 PreviousPlateId = Planet.Samples[SampleIndex].PlateId;
@@ -14952,220 +15239,15 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				CurrentSolvePreviousOwnerRecoveryFlags[SampleIndex] =
 					PreviousOwnerRecoveryCandidate != nullptr ? 1 : 0;
 			}
-			CurrentSolveLocalParticipationPlateCounts[SampleIndex] = static_cast<uint8>(FMath::Clamp(
-				CountDistinctRecoveryCandidatePlates(RecoveryCandidates),
-				0,
-				255));
-			RecoveryMissPlateCandidateCounts[SampleIndex] = RecoveryCandidatePlateCandidateCounts[SampleIndex];
-
-			const bool bPreviousSynthetic = CurrentSolvePreviousSyntheticFlags[SampleIndex] != 0;
-			const bool bPreviousRetainedSyntheticCoverage =
-				CurrentSolvePreviousRetainedSyntheticCoverageFlags.IsValidIndex(SampleIndex) &&
-				CurrentSolvePreviousRetainedSyntheticCoverageFlags[SampleIndex] != 0;
-			const bool bPreviousOwnerAdjacentTriangleSupportPresent =
-				CurrentSolvePreviousOwnerAdjacentTriangleInMeshFlags.IsValidIndex(SampleIndex) &&
-				CurrentSolvePreviousOwnerAdjacentTriangleInMeshFlags[SampleIndex] != 0;
-			const bool bConvergentActiveFieldContinuityLocality =
-				IsCopiedFrontierConvergentFieldContinuityLocality(
-					ConvergentActiveFieldContinuityFlags,
-					AdjacentToConvergentActiveFieldContinuityFlags,
-					SampleIndex);
-			const bool bRetainPreviousSyntheticCoverage =
-				bEnableSyntheticCoverageRetentionForTest &&
-				ShouldRetainPreviousSyntheticCoverageForMiss(
-					Planet,
-					SampleIndex,
-					PreviousPlateId,
-					bPreviousSynthetic,
-					bPreviousRetainedSyntheticCoverage,
-					bPreviousOwnerAdjacentTriangleSupportPresent,
-					RecoveryCandidates);
-			if (bRetainPreviousSyntheticCoverage)
-			{
-				Resolved.FinalPlateId = PreviousPlateId;
-				Resolved.PreCoherencePlateId = PreviousPlateId;
-				Resolved.SourceCanonicalSampleIndex = SampleIndex;
-				Resolved.RecoveryDistanceRadians =
-					PreviousOwnerRecoveryCandidate != nullptr
-						? PreviousOwnerRecoveryCandidate->DistanceRadians
-						: -1.0;
-				if (const FTectonicPlanetV6RecoveryCandidate* OtherRecoveryCandidate =
-						FindBestRecoveryCandidateForOtherPlate(RecoveryCandidates, PreviousPlateId))
-				{
-					Resolved.BoundaryOtherPlateId = OtherRecoveryCandidate->PlateId;
-				}
-				Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshRetainedSyntheticCoverage;
-				Resolved.bRetainedSyntheticCoverage = true;
-				CurrentSolveRetainedSyntheticCoverageFlags[SampleIndex] = 1;
-			}
-			else
-			{
-				int32 ExplicitFallbackPlateId = INDEX_NONE;
-				int32 ExplicitFallbackSampleIndex = INDEX_NONE;
-				ChooseExplicitFallback(Planet, ExplicitFallbackPlateId, ExplicitFallbackSampleIndex);
-
-				int32 PrimaryPlateId = INDEX_NONE;
-				int32 SecondaryPlateId = INDEX_NONE;
-				double PrimaryDistance = -1.0;
-				ChooseThesisRemeshMissOwnerPlates(
-					RecoveryCandidates,
-					PreviousPlateId,
-					ExplicitFallbackPlateId,
-					PrimaryPlateId,
-					SecondaryPlateId,
-					PrimaryDistance);
-
-				const int32 UnfilteredCandidateCount =
-					(bApplyDestructiveFilter && UnfilteredExactCandidateCounts.IsValidIndex(SampleIndex))
-						? UnfilteredExactCandidateCounts[SampleIndex]
-						: 0;
-				const int32 UnfilteredDestructiveCandidateCount =
-					(bApplyDestructiveFilter && UnfilteredDestructiveCandidateCounts.IsValidIndex(SampleIndex))
-						? UnfilteredDestructiveCandidateCounts[SampleIndex]
-						: 0;
-
-				Resolved.BoundaryOtherPlateId = SecondaryPlateId;
-				Resolved.RecoveryDistanceRadians = PrimaryDistance;
-				int32 FillPreferredPrimaryPlateId = PrimaryPlateId;
-				int32 FillPreferredSecondaryPlateId = SecondaryPlateId;
-				if (bApplyDestructiveFilter &&
-					UnfilteredCandidateCount > 0 &&
-					UnfilteredDestructiveCandidateCount == UnfilteredCandidateCount)
-				{
-					const int32 PreferredPlateId = ChooseDestructiveExclusionContinuationPlateId(
-						Planet,
-						UnfilteredHitCandidates,
-						DestructiveFilterState,
-						PreviousPlateId,
-						PrimaryPlateId);
-					const FTectonicPlanetV6RecoveryCandidate* PreferredOtherRecoveryCandidate =
-						FindBestRecoveryCandidateForOtherPlate(RecoveryCandidates, PreferredPlateId);
-					FillPreferredPrimaryPlateId = PreferredPlateId != INDEX_NONE ? PreferredPlateId : PrimaryPlateId;
-					FillPreferredSecondaryPlateId =
-						PreferredOtherRecoveryCandidate != nullptr
-							? PreferredOtherRecoveryCandidate->PlateId
-							: SecondaryPlateId;
-					Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshMissDestructiveExclusion;
-				}
-				else if (bApplyDestructiveFilter && UnfilteredCandidateCount > 0)
-				{
-					Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshMissAmbiguous;
-				}
-				else
-				{
-					Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshMissOceanic;
-				}
-
-				bool bUseActiveBandCompatibleRecovery = false;
-				bool bUsedSyntheticLoopBreak = false;
-				int32 ActiveBandPreferredSourceCanonicalSampleIndex = INDEX_NONE;
-				if (bConvergentActiveFieldContinuityLocality &&
-					PreviousPlateId != INDEX_NONE &&
-					FindPlateById(Planet, PreviousPlateId) != nullptr &&
-					HasCopiedFrontierPreviousOwnerFieldRecoveryContext(
-						Resolved,
-						CurrentSolvePreviousOwnerRecoveryFlags,
-						CurrentSolvePreviousOwnerCanonicalVertexInMeshFlags,
-						CurrentSolvePreviousOwnerAdjacentTriangleInMeshFlags,
-						SampleIndex))
-				{
-					FillPreferredPrimaryPlateId = PreviousPlateId;
-					if (const FTectonicPlanetV6RecoveryCandidate* OtherRecoveryCandidate =
-							FindBestRecoveryCandidateForOtherPlate(RecoveryCandidates, PreviousPlateId))
-					{
-						FillPreferredSecondaryPlateId = OtherRecoveryCandidate->PlateId;
-					}
-					if (FindCarriedSampleForCanonicalVertex(Planet, PreviousPlateId, SampleIndex) != nullptr)
-					{
-						ActiveBandPreferredSourceCanonicalSampleIndex = SampleIndex;
-					}
-					bUseActiveBandCompatibleRecovery = true;
-				}
-				else if (bConvergentActiveFieldContinuityLocality &&
-					bPreviousSynthetic &&
-					MissLineageCounts.IsValidIndex(SampleIndex) &&
-					MissLineageCounts[SampleIndex] >= 2)
-				{
-					int32 LoopBreakPlateId = INDEX_NONE;
-					int32 LoopBreakSourceCanonicalSampleIndex = INDEX_NONE;
-					int32 LoopBreakSupportCount = 0;
-					if (TryChooseActiveBandSyntheticLoopBreakSource(
-							Planet,
-							SampleIndex,
-							PreviousPlateId,
-							PreSolvePlateIds,
-							RecoveryCandidates,
-							CurrentSolvePreviousSyntheticFlags,
-							CurrentSolvePreviousTransferSourceKindValues,
-							CurrentSolvePreviousResolutionKindValues,
-							LoopBreakPlateId,
-							LoopBreakSourceCanonicalSampleIndex,
-							LoopBreakSupportCount))
-					{
-						FillPreferredPrimaryPlateId = LoopBreakPlateId;
-						if (const FTectonicPlanetV6RecoveryCandidate* OtherRecoveryCandidate =
-								FindBestRecoveryCandidateForOtherPlate(RecoveryCandidates, LoopBreakPlateId))
-						{
-							FillPreferredSecondaryPlateId = OtherRecoveryCandidate->PlateId;
-						}
-						ActiveBandPreferredSourceCanonicalSampleIndex = LoopBreakSourceCanonicalSampleIndex;
-						bUseActiveBandCompatibleRecovery = true;
-						bUsedSyntheticLoopBreak = true;
-					}
-				}
-
-				Resolved.FinalPlateId = FillPreferredPrimaryPlateId;
-				Resolved.PreCoherencePlateId = FillPreferredPrimaryPlateId;
-				Resolved.BoundaryOtherPlateId = FillPreferredSecondaryPlateId;
-				if (bUseActiveBandCompatibleRecovery)
-				{
-					SeedStructuredDestructiveGapSource(
-						Planet,
-						FillPreferredPrimaryPlateId,
-						RecoveryCandidates,
-						Resolved,
-						QueryPoint);
-					if (ActiveBandPreferredSourceCanonicalSampleIndex != INDEX_NONE)
-					{
-						Resolved.SourceCanonicalSampleIndex = ActiveBandPreferredSourceCanonicalSampleIndex;
-					}
-					Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshTransferFallback;
-					if (!bUsedSyntheticLoopBreak)
-					{
-						++ActiveBandPreviousOwnerCompatibleRecoveryCount;
-					}
-					if (bUsedSyntheticLoopBreak)
-					{
-						++ActiveBandSyntheticLoopBreakCount;
-					}
-				}
-				else
-				{
-					++MissCount;
-					if (bEnableStructuredGapFill)
-					{
-						int32 FrontierPrimaryPlateId = INDEX_NONE;
-						int32 FrontierSecondaryPlateId = INDEX_NONE;
-						if (TryBuildStructuredFrontierPairFill(
-								FrontierPointSets,
-								QueryPoint,
-								FillPreferredPrimaryPlateId,
-								FillPreferredSecondaryPlateId,
-								Resolved.StructuredSyntheticFillSample,
-								FrontierPrimaryPlateId,
-								FrontierSecondaryPlateId))
-						{
-							Resolved.bHasStructuredSyntheticFill = true;
-							if (FrontierPrimaryPlateId != INDEX_NONE)
-							{
-								Resolved.FinalPlateId = FrontierPrimaryPlateId;
-								Resolved.PreCoherencePlateId = FrontierPrimaryPlateId;
-							}
-							Resolved.BoundaryOtherPlateId = FrontierSecondaryPlateId;
-						}
-					}
-				}
-			}
+			ApplyCopiedFrontierZeroHitResolvedDecisionStage(
+				ZeroHitResolvedDecisionStageContext,
+				SampleIndex,
+				QueryPoint,
+				PreviousPlateId,
+				UnfilteredHitCandidates,
+				PreviousOwnerRecoveryCandidate,
+				RecoveryCandidates,
+				Resolved);
 			if (bRecordPhaseTiming)
 			{
 				AccumulatePhaseTimingMicroseconds(ZeroHitRecoveryMicroseconds, ZeroHitRecoveryStartTime);
