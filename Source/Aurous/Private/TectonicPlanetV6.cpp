@@ -4378,6 +4378,23 @@ namespace
 		return Cap;
 	}
 
+	template <int32 InlineSize>
+	void AppendQueryGeometryIndexForPlateId(
+		const TMap<int32, int32>& QueryGeometryIndexByPlateId,
+		const int32 PlateId,
+		TArray<int32, TInlineAllocator<InlineSize>>& OutQueryGeometryIndices)
+	{
+		if (PlateId == INDEX_NONE)
+		{
+			return;
+		}
+
+		if (const int32* QueryGeometryIndexPtr = QueryGeometryIndexByPlateId.Find(PlateId))
+		{
+			OutQueryGeometryIndices.AddUnique(*QueryGeometryIndexPtr);
+		}
+	}
+
 	double ComputeGeodesicDistance(const FVector3d& A, const FVector3d& B)
 	{
 		return FMath::Acos(FMath::Clamp(A.Dot(B), -1.0, 1.0));
@@ -8006,11 +8023,129 @@ namespace
 		return true;
 	}
 
+	bool TryFindThesisRemeshRayHit(
+		const FV6PlateQueryGeometry& QueryGeometry,
+		const FVector3d& QueryPoint,
+		FV6ThesisRemeshRayHit& OutHit,
+		int32* OutRejectedDestructiveHitCount = nullptr);
+
+	bool TryFindThesisRemeshRayHitForPlate(
+		const TArray<FV6PlateQueryGeometry>& QueryGeometries,
+		const TMap<int32, int32>& QueryGeometryIndexByPlateId,
+		const int32 PlateId,
+		const FVector3d& QueryPoint,
+		FV6ThesisRemeshRayHit& OutHit,
+		int32* OutRejectedDestructiveHitCount = nullptr)
+	{
+		OutHit = FV6ThesisRemeshRayHit{};
+		const int32* QueryGeometryIndexPtr = QueryGeometryIndexByPlateId.Find(PlateId);
+		if (QueryGeometryIndexPtr == nullptr || !QueryGeometries.IsValidIndex(*QueryGeometryIndexPtr))
+		{
+			return false;
+		}
+
+		return TryFindThesisRemeshRayHit(
+			QueryGeometries[*QueryGeometryIndexPtr],
+			QueryPoint,
+			OutHit,
+			OutRejectedDestructiveHitCount);
+	}
+
+	bool TryFindThesisRemeshRecoveryCandidateForPlate(
+		const TArray<FV6PlateQueryGeometry>& QueryGeometries,
+		const TMap<int32, int32>& QueryGeometryIndexByPlateId,
+		const int32 PlateId,
+		const FVector3d& QueryPoint,
+		FTectonicPlanetV6RecoveryCandidate& OutCandidate)
+	{
+		OutCandidate = FTectonicPlanetV6RecoveryCandidate{};
+		const int32* QueryGeometryIndexPtr = QueryGeometryIndexByPlateId.Find(PlateId);
+		if (QueryGeometryIndexPtr == nullptr || !QueryGeometries.IsValidIndex(*QueryGeometryIndexPtr))
+		{
+			return false;
+		}
+
+		FRecoveredContainmentHit RecoveryHit;
+		if (!TryFindNearestTriangleRecoveryHit(QueryGeometries[*QueryGeometryIndexPtr], QueryPoint, RecoveryHit))
+		{
+			return false;
+		}
+
+		OutCandidate.PlateId = RecoveryHit.PlateId;
+		OutCandidate.TriangleIndex = RecoveryHit.GlobalTriangleIndex;
+		OutCandidate.LocalTriangleIndex = RecoveryHit.LocalTriangleIndex;
+		OutCandidate.Barycentric = RecoveryHit.Barycentric;
+		OutCandidate.DistanceRadians = RecoveryHit.Distance;
+		return true;
+	}
+
+	template <typename CandidateAllocatorType>
+	void CollectThesisRemeshRayHitCandidates(
+		const TArray<FV6PlateQueryGeometry>& QueryGeometries,
+		const TArray<int32, CandidateAllocatorType>* CandidateQueryGeometryIndices,
+		const FVector3d& QueryPoint,
+		TArray<FV6ThesisRemeshRayHit>& OutHitCandidates,
+		int32* OutRejectedDestructiveHitCount = nullptr,
+		int32* OutTestedPlateCount = nullptr)
+	{
+		OutHitCandidates.Reset();
+		const int32 ReserveCount =
+			CandidateQueryGeometryIndices != nullptr
+				? CandidateQueryGeometryIndices->Num()
+				: QueryGeometries.Num();
+		OutHitCandidates.Reserve(ReserveCount);
+
+		int32 LocalRejectedDestructiveHitCount = 0;
+		int32 LocalTestedPlateCount = 0;
+		if (CandidateQueryGeometryIndices != nullptr)
+		{
+			for (const int32 QueryGeometryIndex : *CandidateQueryGeometryIndices)
+			{
+				if (!QueryGeometries.IsValidIndex(QueryGeometryIndex))
+				{
+					continue;
+				}
+
+				++LocalTestedPlateCount;
+				FV6ThesisRemeshRayHit Hit;
+				if (TryFindThesisRemeshRayHit(
+						QueryGeometries[QueryGeometryIndex],
+						QueryPoint,
+						Hit,
+						&LocalRejectedDestructiveHitCount))
+				{
+					OutHitCandidates.Add(Hit);
+				}
+			}
+		}
+		else
+		{
+			for (const FV6PlateQueryGeometry& QueryGeometry : QueryGeometries)
+			{
+				++LocalTestedPlateCount;
+				FV6ThesisRemeshRayHit Hit;
+				if (TryFindThesisRemeshRayHit(QueryGeometry, QueryPoint, Hit, &LocalRejectedDestructiveHitCount))
+				{
+					OutHitCandidates.Add(Hit);
+				}
+			}
+		}
+
+		if (OutRejectedDestructiveHitCount != nullptr)
+		{
+			*OutRejectedDestructiveHitCount += LocalRejectedDestructiveHitCount;
+		}
+		if (OutTestedPlateCount != nullptr)
+		{
+			*OutTestedPlateCount = LocalTestedPlateCount;
+		}
+	}
+
 		bool TryFindThesisRemeshRayHit(
 			const FV6PlateQueryGeometry& QueryGeometry,
 			const FVector3d& QueryPoint,
 			FV6ThesisRemeshRayHit& OutHit,
-			int32* OutRejectedDestructiveHitCount = nullptr)
+			int32* OutRejectedDestructiveHitCount)
 	{
 		OutHit = FV6ThesisRemeshRayHit{};
 		if (QueryGeometry.SoupData.LocalTriangles.IsEmpty())
@@ -8074,30 +8209,19 @@ namespace
 			return bFoundHit;
 		}
 
-		void CollectThesisRemeshRayHitCandidates(
-			const TArray<FV6PlateQueryGeometry>& QueryGeometries,
-			const FVector3d& QueryPoint,
-			TArray<FV6ThesisRemeshRayHit>& OutHitCandidates,
-			int32* OutRejectedDestructiveHitCount = nullptr)
-		{
-			OutHitCandidates.Reset();
-			OutHitCandidates.Reserve(QueryGeometries.Num());
-
-			int32 LocalRejectedDestructiveHitCount = 0;
-			for (const FV6PlateQueryGeometry& QueryGeometry : QueryGeometries)
-			{
-				FV6ThesisRemeshRayHit Hit;
-				if (TryFindThesisRemeshRayHit(QueryGeometry, QueryPoint, Hit, &LocalRejectedDestructiveHitCount))
-				{
-					OutHitCandidates.Add(Hit);
-				}
-			}
-
-			if (OutRejectedDestructiveHitCount != nullptr)
-			{
-				*OutRejectedDestructiveHitCount += LocalRejectedDestructiveHitCount;
-			}
-		}
+	void CollectThesisRemeshRayHitCandidates(
+		const TArray<FV6PlateQueryGeometry>& QueryGeometries,
+		const FVector3d& QueryPoint,
+		TArray<FV6ThesisRemeshRayHit>& OutHitCandidates,
+		int32* OutRejectedDestructiveHitCount = nullptr)
+	{
+		CollectThesisRemeshRayHitCandidates(
+			QueryGeometries,
+			static_cast<const TArray<int32>*>(nullptr),
+			QueryPoint,
+			OutHitCandidates,
+			OutRejectedDestructiveHitCount);
+	}
 
 	bool IsBetterThesisRemeshHit(const FV6ThesisRemeshRayHit& Candidate, const FV6ThesisRemeshRayHit& Best)
 	{
@@ -8288,28 +8412,82 @@ namespace
 		InOutHitCandidates.Add(StableCandidate);
 	}
 
+	template <typename CandidateAllocatorType>
+	void CollectThesisRemeshMissRecoveryCandidates(
+		const TArray<FV6PlateQueryGeometry>& QueryGeometries,
+		const TArray<int32, CandidateAllocatorType>* CandidateQueryGeometryIndices,
+		const FVector3d& QueryPoint,
+		TArray<FTectonicPlanetV6RecoveryCandidate>& OutRecoveryCandidates,
+		int32* OutTestedPlateCount = nullptr)
+	{
+		OutRecoveryCandidates.Reset();
+		const int32 ReserveCount =
+			CandidateQueryGeometryIndices != nullptr
+				? CandidateQueryGeometryIndices->Num()
+				: QueryGeometries.Num();
+		OutRecoveryCandidates.Reserve(ReserveCount);
+
+		int32 LocalTestedPlateCount = 0;
+		if (CandidateQueryGeometryIndices != nullptr)
+		{
+			for (const int32 QueryGeometryIndex : *CandidateQueryGeometryIndices)
+			{
+				if (!QueryGeometries.IsValidIndex(QueryGeometryIndex))
+				{
+					continue;
+				}
+
+				++LocalTestedPlateCount;
+				FRecoveredContainmentHit RecoveryHit;
+				if (!TryFindNearestTriangleRecoveryHit(QueryGeometries[QueryGeometryIndex], QueryPoint, RecoveryHit))
+				{
+					continue;
+				}
+
+				FTectonicPlanetV6RecoveryCandidate& Candidate = OutRecoveryCandidates.AddDefaulted_GetRef();
+				Candidate.PlateId = RecoveryHit.PlateId;
+				Candidate.TriangleIndex = RecoveryHit.GlobalTriangleIndex;
+				Candidate.LocalTriangleIndex = RecoveryHit.LocalTriangleIndex;
+				Candidate.Barycentric = RecoveryHit.Barycentric;
+				Candidate.DistanceRadians = RecoveryHit.Distance;
+			}
+		}
+		else
+		{
+			for (const FV6PlateQueryGeometry& QueryGeometry : QueryGeometries)
+			{
+				++LocalTestedPlateCount;
+				FRecoveredContainmentHit RecoveryHit;
+				if (!TryFindNearestTriangleRecoveryHit(QueryGeometry, QueryPoint, RecoveryHit))
+				{
+					continue;
+				}
+
+				FTectonicPlanetV6RecoveryCandidate& Candidate = OutRecoveryCandidates.AddDefaulted_GetRef();
+				Candidate.PlateId = RecoveryHit.PlateId;
+				Candidate.TriangleIndex = RecoveryHit.GlobalTriangleIndex;
+				Candidate.LocalTriangleIndex = RecoveryHit.LocalTriangleIndex;
+				Candidate.Barycentric = RecoveryHit.Barycentric;
+				Candidate.DistanceRadians = RecoveryHit.Distance;
+			}
+		}
+
+		if (OutTestedPlateCount != nullptr)
+		{
+			*OutTestedPlateCount = LocalTestedPlateCount;
+		}
+	}
+
 	void CollectThesisRemeshMissRecoveryCandidates(
 		const TArray<FV6PlateQueryGeometry>& QueryGeometries,
 		const FVector3d& QueryPoint,
 		TArray<FTectonicPlanetV6RecoveryCandidate>& OutRecoveryCandidates)
 	{
-		OutRecoveryCandidates.Reset();
-		OutRecoveryCandidates.Reserve(QueryGeometries.Num());
-		for (const FV6PlateQueryGeometry& QueryGeometry : QueryGeometries)
-		{
-			FRecoveredContainmentHit RecoveryHit;
-			if (!TryFindNearestTriangleRecoveryHit(QueryGeometry, QueryPoint, RecoveryHit))
-			{
-				continue;
-			}
-
-			FTectonicPlanetV6RecoveryCandidate& Candidate = OutRecoveryCandidates.AddDefaulted_GetRef();
-			Candidate.PlateId = RecoveryHit.PlateId;
-			Candidate.TriangleIndex = RecoveryHit.GlobalTriangleIndex;
-			Candidate.LocalTriangleIndex = RecoveryHit.LocalTriangleIndex;
-			Candidate.Barycentric = RecoveryHit.Barycentric;
-			Candidate.DistanceRadians = RecoveryHit.Distance;
-		}
+		CollectThesisRemeshMissRecoveryCandidates(
+			QueryGeometries,
+			static_cast<const TArray<int32>*>(nullptr),
+			QueryPoint,
+			OutRecoveryCandidates);
 	}
 
 	void FilterThesisRemeshHitCandidatesToAllowedPlates(
@@ -13786,6 +13964,23 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			AccumulatePhaseTimingMs(PhaseTiming.QueryGeometryBuildMs, UnfilteredQueryGeometryBuildStartTime);
 		}
 	}
+	TMap<int32, int32> QueryGeometryIndexByPlateId;
+	QueryGeometryIndexByPlateId.Reserve(QueryGeometries.Num());
+	for (int32 QueryGeometryIndex = 0; QueryGeometryIndex < QueryGeometries.Num(); ++QueryGeometryIndex)
+	{
+		QueryGeometryIndexByPlateId.Add(QueryGeometries[QueryGeometryIndex].PlateId, QueryGeometryIndex);
+	}
+	TMap<int32, int32> UnfilteredComparisonQueryGeometryIndexByPlateId;
+	if (bApplyDestructiveFilter)
+	{
+		UnfilteredComparisonQueryGeometryIndexByPlateId.Reserve(UnfilteredComparisonQueryGeometries.Num());
+		for (int32 QueryGeometryIndex = 0; QueryGeometryIndex < UnfilteredComparisonQueryGeometries.Num(); ++QueryGeometryIndex)
+		{
+			UnfilteredComparisonQueryGeometryIndexByPlateId.Add(
+				UnfilteredComparisonQueryGeometries[QueryGeometryIndex].PlateId,
+				QueryGeometryIndex);
+		}
+	}
 
 	LastResolvedSamples.SetNum(Planet.Samples.Num());
 	TArray<int32> NewPlateIds;
@@ -13839,26 +14034,112 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	TAtomic<int64> DirectHitTransferMicroseconds(0);
 	TAtomic<int64> FallbackTransferMicroseconds(0);
 	TAtomic<int64> QuietInteriorPreservationMicroseconds(0);
+	TArray<uint8> HitSearchPlateCandidateCounts;
+	HitSearchPlateCandidateCounts.Init(0, Planet.Samples.Num());
+	TArray<uint8> RecoveryCandidatePlateCandidateCounts;
+	RecoveryCandidatePlateCandidateCounts.Init(0, Planet.Samples.Num());
+	TArray<uint8> RecoveryMissPlateCandidateCounts;
+	RecoveryMissPlateCandidateCounts.Init(0, Planet.Samples.Num());
+	TArray<uint8> RecoveryMissSampleFlags;
+	RecoveryMissSampleFlags.Init(0, Planet.Samples.Num());
+	TArray<uint8> RecoveryCandidateGatherSampleFlags;
+	RecoveryCandidateGatherSampleFlags.Init(0, Planet.Samples.Num());
+	TArray<uint8> HitSearchPrunedSampleFlags;
+	HitSearchPrunedSampleFlags.Init(0, Planet.Samples.Num());
+	TArray<uint8> RecoveryCandidatePrunedSampleFlags;
+	RecoveryCandidatePrunedSampleFlags.Init(0, Planet.Samples.Num());
 
 		const double ResolveTransferLoopStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
-		ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &QueryGeometries, &FrontierPointSets, &UnfilteredComparisonQueryGeometries, &DestructiveFilterState, &SampleToAdjacentTriangles, &PreSolvePlateIds, &NewPlateIds, &UnfilteredExactCandidateCounts, &UnfilteredDestructiveCandidateCounts, &MultiHitTrackedCandidateFlags, &MultiHitPlateMixValues, &MultiHitGeometryMixValues, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &HitCount, &MissCount, &MultiHitCount, &CopiedFrontierHitCount, &InteriorHitCount, &DestructiveTriangleRejectedCount, &OverlapCoherenceSupportPrunedSampleCount, &OverlapCoherencePreviousPlateStabilizedSampleCount, &OverlapCoherenceSuppressedCandidateCount, &ActiveBandPreviousOwnerCompatibleRecoveryCount, &ActiveBandSyntheticLoopBreakCount, &HitSearchMicroseconds, &ZeroHitRecoveryMicroseconds, &DirectHitTransferMicroseconds, &FallbackTransferMicroseconds, &QuietInteriorPreservationMicroseconds, bApplyDestructiveFilter, bEnableStructuredGapFill, bEnableV9Phase1Authority, bRecordPhaseTiming](const int32 SampleIndex)
+		ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &QueryGeometries, &QueryGeometryIndexByPlateId, &FrontierPointSets, &UnfilteredComparisonQueryGeometries, &UnfilteredComparisonQueryGeometryIndexByPlateId, &DestructiveFilterState, &SampleToAdjacentTriangles, &PreSolvePlateIds, &NewPlateIds, &UnfilteredExactCandidateCounts, &UnfilteredDestructiveCandidateCounts, &MultiHitTrackedCandidateFlags, &MultiHitPlateMixValues, &MultiHitGeometryMixValues, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &HitSearchPlateCandidateCounts, &RecoveryCandidatePlateCandidateCounts, &RecoveryMissPlateCandidateCounts, &RecoveryMissSampleFlags, &RecoveryCandidateGatherSampleFlags, &HitSearchPrunedSampleFlags, &RecoveryCandidatePrunedSampleFlags, &HitCount, &MissCount, &MultiHitCount, &CopiedFrontierHitCount, &InteriorHitCount, &DestructiveTriangleRejectedCount, &OverlapCoherenceSupportPrunedSampleCount, &OverlapCoherencePreviousPlateStabilizedSampleCount, &OverlapCoherenceSuppressedCandidateCount, &ActiveBandPreviousOwnerCompatibleRecoveryCount, &ActiveBandSyntheticLoopBreakCount, &HitSearchMicroseconds, &ZeroHitRecoveryMicroseconds, &DirectHitTransferMicroseconds, &FallbackTransferMicroseconds, &QuietInteriorPreservationMicroseconds, bApplyDestructiveFilter, bEnableStructuredGapFill, bEnableV9Phase1Authority, bRecordPhaseTiming](const int32 SampleIndex)
 		{
 			const FVector3d QueryPoint = Planet.Samples[SampleIndex].Position;
 			const int32 PreviousPlateId = Planet.Samples[SampleIndex].PlateId;
+			const bool bActiveZoneSample =
+				!bEnableV9Phase1Authority ||
+				(CurrentSolveActiveZoneFlags.IsValidIndex(SampleIndex) &&
+					CurrentSolveActiveZoneFlags[SampleIndex] != 0);
+			const int32 ActiveZonePrimaryPlateId =
+				CurrentSolveActiveZonePrimaryPlateIds.IsValidIndex(SampleIndex)
+					? CurrentSolveActiveZonePrimaryPlateIds[SampleIndex]
+					: INDEX_NONE;
+			const int32 ActiveZoneSecondaryPlateId =
+				CurrentSolveActiveZoneSecondaryPlateIds.IsValidIndex(SampleIndex)
+					? CurrentSolveActiveZoneSecondaryPlateIds[SampleIndex]
+					: INDEX_NONE;
+			const bool bUseActivePairFiltering =
+				bEnableV9Phase1Authority &&
+				(V9Phase1ActiveZoneClassifierModeForTest == ETectonicPlanetV6ActiveZoneClassifierMode::NarrowTectonicPairs ||
+					V9Phase1ActiveZoneClassifierModeForTest == ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocal) &&
+				bActiveZoneSample &&
+				ActiveZonePrimaryPlateId != INDEX_NONE &&
+				ActiveZoneSecondaryPlateId != INDEX_NONE;
+			const bool bUseOutsideActiveZoneAuthority =
+				bEnableV9Phase1Authority &&
+				!bActiveZoneSample &&
+				PreviousPlateId != INDEX_NONE;
+			TArray<int32, TInlineAllocator<4>> PrunedQueryGeometryIndices;
+			TArray<int32, TInlineAllocator<4>> PrunedUnfilteredQueryGeometryIndices;
+			const bool bUseSemanticPlateCandidatePruning =
+				bUsePlateCandidatePruningForTest &&
+				(bUseOutsideActiveZoneAuthority || bUseActivePairFiltering);
+			if (bUseSemanticPlateCandidatePruning)
+			{
+				if (bUseOutsideActiveZoneAuthority)
+				{
+					AppendQueryGeometryIndexForPlateId(QueryGeometryIndexByPlateId, PreviousPlateId, PrunedQueryGeometryIndices);
+					if (bApplyDestructiveFilter)
+					{
+						AppendQueryGeometryIndexForPlateId(
+							UnfilteredComparisonQueryGeometryIndexByPlateId,
+							PreviousPlateId,
+							PrunedUnfilteredQueryGeometryIndices);
+					}
+				}
+				else
+				{
+					AppendQueryGeometryIndexForPlateId(
+						QueryGeometryIndexByPlateId,
+						ActiveZonePrimaryPlateId,
+						PrunedQueryGeometryIndices);
+					AppendQueryGeometryIndexForPlateId(
+						QueryGeometryIndexByPlateId,
+						ActiveZoneSecondaryPlateId,
+						PrunedQueryGeometryIndices);
+					if (bApplyDestructiveFilter)
+					{
+						AppendQueryGeometryIndexForPlateId(
+							UnfilteredComparisonQueryGeometryIndexByPlateId,
+							ActiveZonePrimaryPlateId,
+							PrunedUnfilteredQueryGeometryIndices);
+						AppendQueryGeometryIndexForPlateId(
+							UnfilteredComparisonQueryGeometryIndexByPlateId,
+							ActiveZoneSecondaryPlateId,
+							PrunedUnfilteredQueryGeometryIndices);
+					}
+				}
+			}
+			const TArray<int32, TInlineAllocator<4>>* HitSearchCandidateQueryGeometryIndices =
+				PrunedQueryGeometryIndices.IsEmpty() ? nullptr : &PrunedQueryGeometryIndices;
+			const TArray<int32, TInlineAllocator<4>>* UnfilteredHitSearchCandidateQueryGeometryIndices =
+				PrunedUnfilteredQueryGeometryIndices.IsEmpty() ? nullptr : &PrunedUnfilteredQueryGeometryIndices;
 
 		TArray<FV6ThesisRemeshRayHit> HitCandidates;
 		TArray<FV6ThesisRemeshRayHit> UnfilteredHitCandidates;
 		int32 LocalRejectedDestructiveHitCount = 0;
+		int32 HitSearchTestedPlateCount = 0;
 		const double HitSearchStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		CollectThesisRemeshRayHitCandidates(
 			QueryGeometries,
+			HitSearchCandidateQueryGeometryIndices,
 			QueryPoint,
 			HitCandidates,
-			&LocalRejectedDestructiveHitCount);
+			&LocalRejectedDestructiveHitCount,
+			&HitSearchTestedPlateCount);
 		if (bApplyDestructiveFilter)
 		{
 			CollectThesisRemeshRayHitCandidates(
 				UnfilteredComparisonQueryGeometries,
+				UnfilteredHitSearchCandidateQueryGeometryIndices,
 				QueryPoint,
 				UnfilteredHitCandidates);
 			UnfilteredExactCandidateCounts[SampleIndex] = UnfilteredHitCandidates.Num();
@@ -13874,16 +14155,35 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		{
 			AccumulatePhaseTimingMicroseconds(HitSearchMicroseconds, HitSearchStartTime);
 		}
+		HitSearchPlateCandidateCounts[SampleIndex] =
+			static_cast<uint8>(FMath::Clamp(HitSearchTestedPlateCount, 0, 255));
+		HitSearchPrunedSampleFlags[SampleIndex] =
+			(HitSearchCandidateQueryGeometryIndices != nullptr &&
+				HitSearchCandidateQueryGeometryIndices->Num() < QueryGeometries.Num())
+				? 1
+				: 0;
 		if (LocalRejectedDestructiveHitCount > 0)
 		{
 			DestructiveTriangleRejectedCount += LocalRejectedDestructiveHitCount;
 		}
 
+			FV6ThesisRemeshRayHit PreviousOwnerFilteredHit;
 			const bool bPreviousOwnerFilteredHitPresent =
-				HasHitCandidateForPlate(HitCandidates, PreviousPlateId);
+				TryFindThesisRemeshRayHitForPlate(
+					QueryGeometries,
+					QueryGeometryIndexByPlateId,
+					PreviousPlateId,
+					QueryPoint,
+					PreviousOwnerFilteredHit);
+			FV6ThesisRemeshRayHit PreviousOwnerUnfilteredHit;
 			const bool bPreviousOwnerUnfilteredHitPresent =
 				bApplyDestructiveFilter
-					? HasHitCandidateForPlate(UnfilteredHitCandidates, PreviousPlateId)
+					? TryFindThesisRemeshRayHitForPlate(
+						UnfilteredComparisonQueryGeometries,
+						UnfilteredComparisonQueryGeometryIndexByPlateId,
+						PreviousPlateId,
+						QueryPoint,
+						PreviousOwnerUnfilteredHit)
 					: bPreviousOwnerFilteredHitPresent;
 				bool bPreviousOwnerIgnoringBoundingCapHitPresent = false;
 				bool bPreviousOwnerCanonicalVertexInMeshPresent = false;
@@ -13979,34 +14279,58 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 
 		FTectonicPlanetV6ResolvedSample Resolved;
 		Resolved.PreviousPlateId = PreviousPlateId;
-		Resolved.bActiveZoneSample =
-			!bEnableV9Phase1Authority ||
-			(CurrentSolveActiveZoneFlags.IsValidIndex(SampleIndex) &&
-				CurrentSolveActiveZoneFlags[SampleIndex] != 0);
+		Resolved.bActiveZoneSample = bActiveZoneSample;
 		Resolved.ActiveZoneCause =
 			CurrentSolveActiveZoneCauseValues.IsValidIndex(SampleIndex)
 				? static_cast<ETectonicPlanetV6ActiveZoneCause>(CurrentSolveActiveZoneCauseValues[SampleIndex])
 				: ETectonicPlanetV6ActiveZoneCause::None;
-		Resolved.ActiveZonePrimaryPlateId =
-			CurrentSolveActiveZonePrimaryPlateIds.IsValidIndex(SampleIndex)
-				? CurrentSolveActiveZonePrimaryPlateIds[SampleIndex]
-				: INDEX_NONE;
-		Resolved.ActiveZoneSecondaryPlateId =
-			CurrentSolveActiveZoneSecondaryPlateIds.IsValidIndex(SampleIndex)
-				? CurrentSolveActiveZoneSecondaryPlateIds[SampleIndex]
-				: INDEX_NONE;
+		Resolved.ActiveZonePrimaryPlateId = ActiveZonePrimaryPlateId;
+		Resolved.ActiveZoneSecondaryPlateId = ActiveZoneSecondaryPlateId;
 
 		TArray<FTectonicPlanetV6RecoveryCandidate> RecoveryCandidates;
 		const bool bNeedsRecoveryCandidates =
-			bEnableV9Phase1Authority || HitCandidates.IsEmpty();
+			(bEnableV9Phase1Authority || HitCandidates.IsEmpty()) &&
+			(!bUseOutsideActiveZoneAuthority || !bUsePlateCandidatePruningForTest);
+		int32 RecoveryCandidateTestedPlateCount = 0;
 		if (bNeedsRecoveryCandidates)
 		{
-			CollectThesisRemeshMissRecoveryCandidates(QueryGeometries, QueryPoint, RecoveryCandidates);
+			RecoveryCandidateGatherSampleFlags[SampleIndex] = 1;
+			const double RecoveryCandidateGatherStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
+			CollectThesisRemeshMissRecoveryCandidates(
+				QueryGeometries,
+				HitSearchCandidateQueryGeometryIndices,
+				QueryPoint,
+				RecoveryCandidates,
+				&RecoveryCandidateTestedPlateCount);
+			if (bRecordPhaseTiming)
+			{
+				AccumulatePhaseTimingMicroseconds(ZeroHitRecoveryMicroseconds, RecoveryCandidateGatherStartTime);
+			}
 		}
+		FTectonicPlanetV6RecoveryCandidate PreviousOwnerRecoveryCandidateValue;
+		const bool bPreviousOwnerRecoveryCandidatePresent =
+			TryFindThesisRemeshRecoveryCandidateForPlate(
+				QueryGeometries,
+				QueryGeometryIndexByPlateId,
+				PreviousPlateId,
+				QueryPoint,
+				PreviousOwnerRecoveryCandidateValue);
 		const FTectonicPlanetV6RecoveryCandidate* PreviousOwnerRecoveryCandidate =
-			FindBestRecoveryCandidateForPlate(RecoveryCandidates, PreviousPlateId);
+			bPreviousOwnerRecoveryCandidatePresent
+				? &PreviousOwnerRecoveryCandidateValue
+				: FindBestRecoveryCandidateForPlate(RecoveryCandidates, PreviousPlateId);
 		CurrentSolvePreviousOwnerRecoveryFlags[SampleIndex] =
 			PreviousOwnerRecoveryCandidate != nullptr ? 1 : 0;
+		RecoveryCandidatePlateCandidateCounts[SampleIndex] = static_cast<uint8>(FMath::Clamp(
+			RecoveryCandidateTestedPlateCount,
+			0,
+			255));
+		RecoveryCandidatePrunedSampleFlags[SampleIndex] =
+			(bNeedsRecoveryCandidates &&
+				HitSearchCandidateQueryGeometryIndices != nullptr &&
+				HitSearchCandidateQueryGeometryIndices->Num() < QueryGeometries.Num())
+				? 1
+				: 0;
 		if (bNeedsRecoveryCandidates)
 		{
 			CurrentSolveLocalParticipationPlateCounts[SampleIndex] = static_cast<uint8>(FMath::Clamp(
@@ -14014,14 +14338,6 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				0,
 				255));
 		}
-
-		const bool bUseActivePairFiltering =
-			bEnableV9Phase1Authority &&
-			(V9Phase1ActiveZoneClassifierModeForTest == ETectonicPlanetV6ActiveZoneClassifierMode::NarrowTectonicPairs ||
-				V9Phase1ActiveZoneClassifierModeForTest == ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocal) &&
-			Resolved.bActiveZoneSample &&
-			Resolved.ActiveZonePrimaryPlateId != INDEX_NONE &&
-			Resolved.ActiveZoneSecondaryPlateId != INDEX_NONE;
 		if (bUseActivePairFiltering)
 		{
 			FilterThesisRemeshHitCandidatesToAllowedPlates(
@@ -14033,17 +14349,15 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				Resolved.ActiveZonePrimaryPlateId,
 				Resolved.ActiveZoneSecondaryPlateId);
 			PreviousOwnerRecoveryCandidate =
-				FindBestRecoveryCandidateForPlate(RecoveryCandidates, PreviousPlateId);
+				bPreviousOwnerRecoveryCandidatePresent
+					? &PreviousOwnerRecoveryCandidateValue
+					: FindBestRecoveryCandidateForPlate(RecoveryCandidates, PreviousPlateId);
 		}
 
-		const bool bUseOutsideActiveZoneAuthority =
-			bEnableV9Phase1Authority &&
-			!Resolved.bActiveZoneSample &&
-			PreviousPlateId != INDEX_NONE;
 		if (bUseOutsideActiveZoneAuthority)
 		{
 			const FV6ThesisRemeshRayHit* PreviousOwnerExactHit =
-				FindBestHitCandidateForPlate(HitCandidates, PreviousPlateId);
+				bPreviousOwnerFilteredHitPresent ? &PreviousOwnerFilteredHit : nullptr;
 			const bool bOutsideZoneQueryMiss = HitCandidates.IsEmpty();
 			const bool bOutsideZoneCoverageDeficit = PreviousOwnerExactHit == nullptr;
 			CurrentSolveOutsideActiveZoneQueryMissFlags[SampleIndex] =
@@ -14172,12 +14486,32 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		}
 		else
 		{
+			RecoveryMissSampleFlags[SampleIndex] = 1;
 			const double ZeroHitRecoveryStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 			if (!bNeedsRecoveryCandidates)
 			{
-				CollectThesisRemeshMissRecoveryCandidates(QueryGeometries, QueryPoint, RecoveryCandidates);
+				RecoveryCandidateGatherSampleFlags[SampleIndex] = 1;
+				int32 DeferredRecoveryCandidateTestedPlateCount = 0;
+				CollectThesisRemeshMissRecoveryCandidates(
+					QueryGeometries,
+					HitSearchCandidateQueryGeometryIndices,
+					QueryPoint,
+					RecoveryCandidates,
+					&DeferredRecoveryCandidateTestedPlateCount);
+				RecoveryCandidateTestedPlateCount = DeferredRecoveryCandidateTestedPlateCount;
+				RecoveryCandidatePlateCandidateCounts[SampleIndex] = static_cast<uint8>(FMath::Clamp(
+					DeferredRecoveryCandidateTestedPlateCount,
+					0,
+					255));
+				RecoveryCandidatePrunedSampleFlags[SampleIndex] =
+					(HitSearchCandidateQueryGeometryIndices != nullptr &&
+						HitSearchCandidateQueryGeometryIndices->Num() < QueryGeometries.Num())
+						? 1
+						: 0;
 				PreviousOwnerRecoveryCandidate =
-					FindBestRecoveryCandidateForPlate(RecoveryCandidates, PreviousPlateId);
+					bPreviousOwnerRecoveryCandidatePresent
+						? &PreviousOwnerRecoveryCandidateValue
+						: FindBestRecoveryCandidateForPlate(RecoveryCandidates, PreviousPlateId);
 				CurrentSolvePreviousOwnerRecoveryFlags[SampleIndex] =
 					PreviousOwnerRecoveryCandidate != nullptr ? 1 : 0;
 			}
@@ -14185,6 +14519,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				CountDistinctRecoveryCandidatePlates(RecoveryCandidates),
 				0,
 				255));
+			RecoveryMissPlateCandidateCounts[SampleIndex] = RecoveryCandidatePlateCandidateCounts[SampleIndex];
 
 			const bool bPreviousSynthetic = CurrentSolvePreviousSyntheticFlags[SampleIndex] != 0;
 			const bool bPreviousRetainedSyntheticCoverage =
@@ -16232,6 +16567,40 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	++PeriodicSolveCount;
 	PeriodicSolveSteps.Add(Planet.CurrentStep);
 
+	int64 HitSearchPlateCandidateCountTotal = 0;
+	int32 HitSearchPlateCandidateCountMax = 0;
+	int32 HitSearchPrunedSampleCount = 0;
+	int64 RecoveryCandidatePlateCandidateCountTotal = 0;
+	int32 RecoveryCandidatePlateCandidateCountMax = 0;
+	int32 RecoveryCandidateGatherSampleCount = 0;
+	int32 RecoveryCandidatePrunedSampleCount = 0;
+	int64 RecoveryMissPlateCandidateCountTotal = 0;
+	int32 RecoveryMissPlateCandidateCountMax = 0;
+	int32 RecoveryMissSampleCount = 0;
+	for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+	{
+		const int32 HitSearchCandidateCount = HitSearchPlateCandidateCounts[SampleIndex];
+		HitSearchPlateCandidateCountTotal += HitSearchCandidateCount;
+		HitSearchPlateCandidateCountMax =
+			FMath::Max(HitSearchPlateCandidateCountMax, HitSearchCandidateCount);
+		HitSearchPrunedSampleCount += HitSearchPrunedSampleFlags[SampleIndex] != 0 ? 1 : 0;
+
+		const int32 RecoveryCandidateCount = RecoveryCandidatePlateCandidateCounts[SampleIndex];
+		RecoveryCandidatePlateCandidateCountTotal += RecoveryCandidateCount;
+		RecoveryCandidatePlateCandidateCountMax =
+			FMath::Max(RecoveryCandidatePlateCandidateCountMax, RecoveryCandidateCount);
+		RecoveryCandidateGatherSampleCount +=
+			RecoveryCandidateGatherSampleFlags[SampleIndex] != 0 ? 1 : 0;
+		RecoveryCandidatePrunedSampleCount +=
+			RecoveryCandidatePrunedSampleFlags[SampleIndex] != 0 ? 1 : 0;
+
+		const int32 RecoveryMissCandidateCount = RecoveryMissPlateCandidateCounts[SampleIndex];
+		RecoveryMissPlateCandidateCountTotal += RecoveryMissCandidateCount;
+		RecoveryMissPlateCandidateCountMax =
+			FMath::Max(RecoveryMissPlateCandidateCountMax, RecoveryMissCandidateCount);
+		RecoveryMissSampleCount += RecoveryMissSampleFlags[SampleIndex] != 0 ? 1 : 0;
+	}
+
 	LastSolveStats = FTectonicPlanetV6PeriodicSolveStats{};
 	LastSolveStats.Trigger = Trigger;
 	LastSolveStats.SolveMode = PeriodicSolveMode;
@@ -16281,6 +16650,16 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			SubductionFieldDiagnostics.CachedAdjacencyEdgeDistanceCount,
 			SlabPullDiagnostics.CachedAdjacencyEdgeDistanceCount);
 	LastSolveStats.CachedAdjacencyEdgeLookupCount = SubductionFieldDiagnostics.CachedAdjacencyEdgeLookupCount;
+	LastSolveStats.HitSearchPlateCandidateCountTotal = HitSearchPlateCandidateCountTotal;
+	LastSolveStats.HitSearchPlateCandidateCountMax = HitSearchPlateCandidateCountMax;
+	LastSolveStats.HitSearchPrunedSampleCount = HitSearchPrunedSampleCount;
+	LastSolveStats.RecoveryCandidatePlateCandidateCountTotal = RecoveryCandidatePlateCandidateCountTotal;
+	LastSolveStats.RecoveryCandidatePlateCandidateCountMax = RecoveryCandidatePlateCandidateCountMax;
+	LastSolveStats.RecoveryCandidateGatherSampleCount = RecoveryCandidateGatherSampleCount;
+	LastSolveStats.RecoveryCandidatePrunedSampleCount = RecoveryCandidatePrunedSampleCount;
+	LastSolveStats.RecoveryMissPlateCandidateCountTotal = RecoveryMissPlateCandidateCountTotal;
+	LastSolveStats.RecoveryMissPlateCandidateCountMax = RecoveryMissPlateCandidateCountMax;
+	LastSolveStats.RecoveryMissSampleCount = RecoveryMissSampleCount;
 	LastSolveStats.DestructiveTriangleGeometryExcludedCount = DestructiveFilterState.GeometryExcludedLocalTriangleCount;
 	LastSolveStats.DestructiveTriangleRejectedCount = DestructiveTriangleRejectedCount.Load();
 	LastSolveStats.TrackedDestructiveTriangleCount = DestructiveTrackingStats.TrackedTriangleCount;
@@ -19626,6 +20005,11 @@ void FTectonicPlanetV6::SetPhaseTimingForTest(const bool bEnable)
 void FTectonicPlanetV6::SetDetailedCopiedFrontierAttributionForTest(const bool bEnable)
 {
 	bEnableDetailedCopiedFrontierAttributionForTest = bEnable;
+}
+
+void FTectonicPlanetV6::SetPlateCandidatePruningForTest(const bool bEnable)
+{
+	bUsePlateCandidatePruningForTest = bEnable;
 }
 
 void FTectonicPlanetV6::SetV9Phase1AuthorityForTest(const bool bEnable, const int32 InActiveBoundaryRingCount)

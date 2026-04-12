@@ -328,6 +328,16 @@ struct AUROUS_API FTectonicPlanetV6PeriodicSolveStats
 	int32 SlabPullFrontSampleCount = 0;
 	int32 CachedAdjacencyEdgeDistanceCount = 0;
 	int64 CachedAdjacencyEdgeLookupCount = 0;
+	int64 HitSearchPlateCandidateCountTotal = 0;
+	int32 HitSearchPlateCandidateCountMax = 0;
+	int32 HitSearchPrunedSampleCount = 0;
+	int64 RecoveryCandidatePlateCandidateCountTotal = 0;
+	int32 RecoveryCandidatePlateCandidateCountMax = 0;
+	int32 RecoveryCandidateGatherSampleCount = 0;
+	int32 RecoveryCandidatePrunedSampleCount = 0;
+	int64 RecoveryMissPlateCandidateCountTotal = 0;
+	int32 RecoveryMissPlateCandidateCountMax = 0;
+	int32 RecoveryMissSampleCount = 0;
 	int32 DestructiveTriangleGeometryExcludedCount = 0;
 	int32 DestructiveTriangleRejectedCount = 0;
 	int32 TrackedDestructiveTriangleCount = 0;
@@ -1255,6 +1265,7 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetAutomaticRiftingForTest(bool bEnable);
 	void SetPhaseTimingForTest(bool bEnable);
 	void SetDetailedCopiedFrontierAttributionForTest(bool bEnable);
+	void SetPlateCandidatePruningForTest(bool bEnable);
 	bool ForceLargestEligibleAutomaticRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
 	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
 	void SetUseLinearConvergentMaintenanceInfluenceForTest(bool bEnableLinear);
@@ -1423,6 +1434,7 @@ private:
 	bool bEnableAutomaticRiftingForTest = false;
 	bool bEnablePhaseTimingForTest = false;
 	bool bEnableDetailedCopiedFrontierAttributionForTest = true;
+	bool bUsePlateCandidatePruningForTest = true;
 	bool bUseLinearConvergentMaintenanceSpeedFactorForTest = true;
 	bool bUseLinearConvergentMaintenanceInfluenceForTest = true;
 	TArray<uint8> CurrentSolveThesisCollisionTerraneComponentMask;

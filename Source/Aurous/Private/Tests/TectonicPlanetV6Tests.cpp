@@ -14419,6 +14419,7 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 	{
 		FString LabelSuffix;
 		bool bUseCachedSubductionAdjacencyEdgeDistances = true;
+		bool bUsePlateCandidatePruning = true;
 	};
 
 	const auto ComputeDriftMeans = [](const FTectonicPlanetV6PeriodicSolveStats& SolveStats)
@@ -14463,7 +14464,8 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 
 	const auto InitializePlanet = [=](
 		const int32 SampleCount,
-		const bool bUseCachedSubductionAdjacencyEdgeDistances)
+		const bool bUseCachedSubductionAdjacencyEdgeDistances,
+		const bool bUsePlateCandidatePruning)
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
@@ -14494,6 +14496,7 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
 		Planet.SetPhaseTimingForTest(true);
 		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
+		Planet.SetPlateCandidatePruningForTest(bUsePlateCandidatePruning);
 		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest =
 			bUseCachedSubductionAdjacencyEdgeDistances;
 		return Planet;
@@ -14625,6 +14628,21 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 		const FTectonicPlanetV6PeriodicSolveStats SolveStats = Run.Planet.GetLastSolveStats();
 		Run.SolveTimings.Add(SolveStep, SolveStats);
 		const FTectonicPlanetV6PhaseTiming& Phase = SolveStats.PhaseTiming;
+		const double HitSearchAverageCandidateCount =
+			Run.Planet.GetPlanet().Samples.Num() > 0
+				? static_cast<double>(SolveStats.HitSearchPlateCandidateCountTotal) /
+					static_cast<double>(Run.Planet.GetPlanet().Samples.Num())
+				: 0.0;
+		const double RecoveryGatherAverageCandidateCount =
+			SolveStats.RecoveryCandidateGatherSampleCount > 0
+				? static_cast<double>(SolveStats.RecoveryCandidatePlateCandidateCountTotal) /
+					static_cast<double>(SolveStats.RecoveryCandidateGatherSampleCount)
+				: 0.0;
+		const double RecoveryMissAverageCandidateCount =
+			SolveStats.RecoveryMissSampleCount > 0
+				? static_cast<double>(SolveStats.RecoveryMissPlateCandidateCountTotal) /
+					static_cast<double>(SolveStats.RecoveryMissSampleCount)
+				: 0.0;
 		AddInfo(FString::Printf(
 			TEXT("[V9Perf %s solve=%d] total_ms=%.3f pre_solve_ms=%.3f sample_adjacency_ms=%.3f active_zone_ms=%.3f copied_frontier_mesh_ms=%.3f query_geometry_ms=%.3f frontier_point_sets_ms=%.3f resolve_transfer_loop_ms=%.3f hit_search_ms=%.3f zero_hit_recovery_ms=%.3f direct_hit_transfer_ms=%.3f fallback_transfer_ms=%.3f quiet_interior_preserve_ms=%.3f attribution_ms=%.3f repartition_ms=%.3f subduction_field_ms=%.3f plate_scores_ms=%.3f slab_pull_ms=%.3f terrane_ms=%.3f component_audit_ms=%.3f rebuild_meshes_ms=%.3f collision_shadow_ms=%.3f collision_exec_ms=%.3f work_samples=%d work_plates=%d plate_local_vertices=%d plate_local_triangles=%d copied_frontier_vertices=%d copied_frontier_triangles=%d copied_frontier_carried=%d direct_hit_transfer_count=%d zero_candidate_count=%d miss_count=%d nearest_member_fallback_count=%d explicit_fallback_count=%d quiet_interior_touched=%d tracked_destructive=%d tracked_subduction=%d tracked_collision=%d"),
 			*Run.Label,
@@ -14668,6 +14686,20 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 			SolveStats.TrackedDestructiveTriangleCount,
 			SolveStats.TrackedSubductionTriangleCount,
 			SolveStats.TrackedCollisionTriangleCount));
+		AddInfo(FString::Printf(
+			TEXT("[V9Perf %s solve=%d fanout] hit_avg=%.3f hit_max=%d hit_pruned_samples=%d recovery_gather_avg=%.3f recovery_gather_max=%d recovery_gather_samples=%d recovery_pruned_samples=%d recovery_miss_avg=%.3f recovery_miss_max=%d recovery_miss_samples=%d"),
+			*Run.Label,
+			SolveStep,
+			HitSearchAverageCandidateCount,
+			SolveStats.HitSearchPlateCandidateCountMax,
+			SolveStats.HitSearchPrunedSampleCount,
+			RecoveryGatherAverageCandidateCount,
+			SolveStats.RecoveryCandidatePlateCandidateCountMax,
+			SolveStats.RecoveryCandidateGatherSampleCount,
+			SolveStats.RecoveryCandidatePrunedSampleCount,
+			RecoveryMissAverageCandidateCount,
+			SolveStats.RecoveryMissPlateCandidateCountMax,
+			SolveStats.RecoveryMissSampleCount));
 		AddInfo(FString::Printf(
 			TEXT("[V9Perf %s solve=%d work] subduction_compute_count=%d slab_pull_compute_count=%d convergent_edge_build_count=%d convergent_edge_reuse_count=%d subduction_convergent_edges=%d slab_pull_convergent_edges=%d subduction_seed_count=%d subduction_influenced_count=%d slab_pull_front_sample_count=%d cached_adjacency_edge_count=%d cached_adjacency_lookup_count=%lld"),
 			*Run.Label,
@@ -14780,8 +14812,8 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 	};
 
 	const TArray<FVariantConfig> Variants = {
-		{ TEXT("before_no_cache"), false },
-		{ TEXT("after_cache"), true }
+		{ TEXT("before_no_prune"), true, false },
+		{ TEXT("after_prune"), true, true }
 	};
 
 	for (const int32 SampleCount : SampleCounts)
@@ -14793,7 +14825,8 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 			Run.Label = FString::Printf(TEXT("%dk_%s"), SampleCount / 1000, *Variant.LabelSuffix);
 			Run.Planet = InitializePlanet(
 				SampleCount,
-				Variant.bUseCachedSubductionAdjacencyEdgeDistances);
+				Variant.bUseCachedSubductionAdjacencyEdgeDistances,
+				Variant.bUsePlateCandidatePruning);
 
 			CaptureCheckpoint(Run, 0);
 			BuildSeedFlags(
