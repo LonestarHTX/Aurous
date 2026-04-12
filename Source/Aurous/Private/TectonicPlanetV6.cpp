@@ -21112,8 +21112,8 @@ void FTectonicPlanetV6::ApplyKeptV6RuntimeProfile(
 		Options.SubmergedContinentalFringeRelaxationRatePerStep,
 		Options.SubmergedContinentalFringeBoundaryOrActiveBonusRatePerStep);
 	SetAutomaticRiftingForTest(Options.bEnableAutomaticRifting);
-	SetPlateCandidatePruningForTest(Options.bEnablePlateCandidatePruning);
-	SetCopiedFrontierUnfilteredMeshReuseForTest(Options.bEnableCopiedFrontierUnfilteredMeshReuse);
+	SetPlateCandidatePruningEnabled(Options.bEnablePlateCandidatePruning);
+	SetCopiedFrontierUnfilteredMeshReuseEnabled(Options.bEnableCopiedFrontierUnfilteredMeshReuse);
 	Planet.bUseCachedSubductionAdjacencyEdgeDistancesForTest =
 		Options.bUseCachedSubductionAdjacencyEdgeDistances;
 	Planet.bUseSubductionPerformanceOptimizationsForTest =
@@ -21123,8 +21123,8 @@ void FTectonicPlanetV6::ApplyKeptV6RuntimeProfile(
 void FTectonicPlanetV6::ApplyKeptV6DiagnosticsProfile(
 	const FTectonicPlanetV6KeptDiagnosticsOptions& Options)
 {
-	SetPhaseTimingForTest(Options.bEnablePhaseTiming);
-	SetDetailedCopiedFrontierAttributionForTest(Options.bEnableDetailedCopiedFrontierAttribution);
+	SetPhaseTimingEnabled(Options.bEnablePhaseTiming);
+	SetDetailedCopiedFrontierAttributionEnabled(Options.bEnableDetailedCopiedFrontierAttribution);
 }
 
 void FTectonicPlanetV6::SetPeriodicSolveModeForTest(
@@ -21216,22 +21216,22 @@ void FTectonicPlanetV6::SetPerTimestepContainmentSoupRebuildForTest(const bool b
 	bForcePerTimestepContainmentSoupRebuildForTest = bEnable;
 }
 
-void FTectonicPlanetV6::SetPhaseTimingForTest(const bool bEnable)
+void FTectonicPlanetV6::SetPhaseTimingEnabled(const bool bEnable)
 {
 	bEnablePhaseTimingForTest = bEnable;
 }
 
-void FTectonicPlanetV6::SetDetailedCopiedFrontierAttributionForTest(const bool bEnable)
+void FTectonicPlanetV6::SetDetailedCopiedFrontierAttributionEnabled(const bool bEnable)
 {
 	bEnableDetailedCopiedFrontierAttributionForTest = bEnable;
 }
 
-void FTectonicPlanetV6::SetPlateCandidatePruningForTest(const bool bEnable)
+void FTectonicPlanetV6::SetPlateCandidatePruningEnabled(const bool bEnable)
 {
 	bUsePlateCandidatePruningForTest = bEnable;
 }
 
-void FTectonicPlanetV6::SetCopiedFrontierUnfilteredMeshReuseForTest(const bool bEnable)
+void FTectonicPlanetV6::SetCopiedFrontierUnfilteredMeshReuseEnabled(const bool bEnable)
 {
 	bUseCopiedFrontierUnfilteredMeshReuseForTest = bEnable;
 }

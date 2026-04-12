@@ -18,6 +18,47 @@ namespace
 
 	FString JoinIntArrayForDiagnostics(const TArray<int32>& Values);
 
+	FTectonicPlanetV6KeptRuntimeProfileOptions MakeKeptV6RuntimeProfileOptions(
+		const bool bEnableAutomaticRifting = true,
+		const bool bEnableShoulderFix = true,
+		const bool bEnablePlateCandidatePruning = true,
+		const bool bEnableCopiedFrontierUnfilteredMeshReuse = true,
+		const bool bUseCachedSubductionAdjacencyEdgeDistances = true,
+		const bool bUseSubductionPerformanceOptimizations = true)
+	{
+		FTectonicPlanetV6KeptRuntimeProfileOptions Options;
+		Options.bEnableAutomaticRifting = bEnableAutomaticRifting;
+		Options.bEnableSubmergedContinentalFringeRelaxation = bEnableShoulderFix;
+		Options.bEnablePlateCandidatePruning = bEnablePlateCandidatePruning;
+		Options.bEnableCopiedFrontierUnfilteredMeshReuse = bEnableCopiedFrontierUnfilteredMeshReuse;
+		Options.bUseCachedSubductionAdjacencyEdgeDistances =
+			bUseCachedSubductionAdjacencyEdgeDistances;
+		Options.bUseSubductionPerformanceOptimizations =
+			bUseSubductionPerformanceOptimizations;
+		return Options;
+	}
+
+	FTectonicPlanetV6KeptDiagnosticsOptions MakeKeptV6DiagnosticsOptions(
+		const bool bEnablePhaseTiming = true,
+		const bool bEnableDetailedCopiedFrontierAttribution = false)
+	{
+		FTectonicPlanetV6KeptDiagnosticsOptions Options;
+		Options.bEnablePhaseTiming = bEnablePhaseTiming;
+		Options.bEnableDetailedCopiedFrontierAttribution =
+			bEnableDetailedCopiedFrontierAttribution;
+		return Options;
+	}
+
+	void ApplyKeptV6TestProfile(
+		FTectonicPlanetV6& Planet,
+		const FTectonicPlanetV6KeptRuntimeProfileOptions& RuntimeOptions,
+		const FTectonicPlanetV6KeptDiagnosticsOptions& DiagnosticsOptions =
+			FTectonicPlanetV6KeptDiagnosticsOptions{})
+	{
+		Planet.ApplyKeptV6RuntimeProfile(RuntimeOptions);
+		Planet.ApplyKeptV6DiagnosticsProfile(DiagnosticsOptions);
+	}
+
 	struct FV6CheckpointSnapshot
 	{
 		int32 Step = 0;
@@ -13889,7 +13930,7 @@ bool FTectonicPlanetV6V9PaperSelectiveElevationConfirmationAndRobustnessTest::Ru
 		Planet.SetAutomaticRiftingForTest(true);
 		Planet.SetV9PaperSurrogateOwnershipForTest(bEnablePaperSurrogate);
 		Planet.SetV9PaperSurrogateFieldModeForTest(FieldMode);
-		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
+		Planet.ApplyKeptV6DiagnosticsProfile(MakeKeptV6DiagnosticsOptions(false, false));
 		return Planet;
 	};
 
@@ -14585,37 +14626,21 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 		const bool bUsePlateCandidatePruning)
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
-			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
-			FixedIntervalSteps,
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
 			INDEX_NONE,
 			SampleCount,
 			PlateCount,
 			CanonicalSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(true);
-		Planet.SetV9PaperSurrogateFieldModeForTest(
-			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
-		Planet.SetPhaseTimingForTest(true);
-		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
-		Planet.SetPlateCandidatePruningForTest(bUsePlateCandidatePruning);
-		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest =
+		FTectonicPlanetV6KeptRuntimeProfileOptions RuntimeOptions =
+			MakeKeptV6RuntimeProfileOptions();
+		RuntimeOptions.bEnablePlateCandidatePruning = bUsePlateCandidatePruning;
+		RuntimeOptions.bUseCachedSubductionAdjacencyEdgeDistances =
 			bUseCachedSubductionAdjacencyEdgeDistances;
+		ApplyKeptV6TestProfile(
+			Planet,
+			RuntimeOptions,
+			MakeKeptV6DiagnosticsOptions(true, false));
 		return Planet;
 	};
 
@@ -15058,36 +15083,16 @@ bool FTectonicPlanetV6V9PerformanceBudgetTest::RunTest(const FString& Parameters
 	const auto InitializePlanet = [=](const int32 SampleCount)
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
-			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
-			FixedIntervalSteps,
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
 			INDEX_NONE,
 			SampleCount,
 			PlateCount,
 			CanonicalSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(true);
-		Planet.SetV9PaperSurrogateFieldModeForTest(
-			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
-		Planet.SetPhaseTimingForTest(true);
-		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
-		Planet.SetPlateCandidatePruningForTest(true);
-		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest = true;
+		ApplyKeptV6TestProfile(
+			Planet,
+			MakeKeptV6RuntimeProfileOptions(),
+			MakeKeptV6DiagnosticsOptions(true, false));
 		return Planet;
 	};
 
@@ -15746,37 +15751,16 @@ bool FTectonicPlanetV6V9250kBehaviorDiagnosisTest::RunTest(const FString& Parame
 	const auto InitializePlanet = [=](const int32 Seed)
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
-			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
-			FixedIntervalSteps,
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
 			INDEX_NONE,
 			SampleCount,
 			PlateCount,
 			Seed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(true);
-		Planet.SetV9PaperSurrogateFieldModeForTest(
-			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
-		Planet.SetPhaseTimingForTest(true);
-		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
-		Planet.SetPlateCandidatePruningForTest(true);
-		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest = true;
-		Planet.GetPlanetMutable().bUseSubductionPerformanceOptimizationsForTest = true;
+		ApplyKeptV6TestProfile(
+			Planet,
+			MakeKeptV6RuntimeProfileOptions(),
+			MakeKeptV6DiagnosticsOptions(true, false));
 		return Planet;
 	};
 
@@ -16179,38 +16163,19 @@ bool FTectonicPlanetV6V9250kSubmergedShoulderFixTest::RunTest(const FString& Par
 	const auto InitializePlanet = [=](const int32 Seed, const FVariantConfig& Variant)
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
-			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
-			FixedIntervalSteps,
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
 			INDEX_NONE,
 			SampleCount,
 			PlateCount,
 			Seed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetV9SubmergedContinentalFringeRelaxationForTest(Variant.bEnableFringeFix, 0.004, 0.002);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(true);
-		Planet.SetV9PaperSurrogateFieldModeForTest(
-			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
-		Planet.SetPhaseTimingForTest(true);
-		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
-		Planet.SetPlateCandidatePruningForTest(true);
-		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest = true;
-		Planet.GetPlanetMutable().bUseSubductionPerformanceOptimizationsForTest = true;
+		FTectonicPlanetV6KeptRuntimeProfileOptions RuntimeOptions =
+			MakeKeptV6RuntimeProfileOptions();
+		RuntimeOptions.bEnableSubmergedContinentalFringeRelaxation = Variant.bEnableFringeFix;
+		ApplyKeptV6TestProfile(
+			Planet,
+			RuntimeOptions,
+			MakeKeptV6DiagnosticsOptions(true, false));
 		return Planet;
 	};
 
@@ -16679,37 +16644,16 @@ bool FTectonicPlanetV6V9250kReadinessProbeTest::RunTest(const FString& Parameter
 	const auto InitializePlanet = [=]()
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
-			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
-			FixedIntervalSteps,
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
 			INDEX_NONE,
 			SampleCount,
 			PlateCount,
 			CanonicalSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(true);
-		Planet.SetV9PaperSurrogateFieldModeForTest(
-			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
-		Planet.SetPhaseTimingForTest(true);
-		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
-		Planet.SetPlateCandidatePruningForTest(true);
-		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest = true;
-		Planet.GetPlanetMutable().bUseSubductionPerformanceOptimizationsForTest = true;
+		ApplyKeptV6TestProfile(
+			Planet,
+			MakeKeptV6RuntimeProfileOptions(),
+			MakeKeptV6DiagnosticsOptions(true, false));
 		return Planet;
 	};
 
@@ -17112,38 +17056,20 @@ bool FTectonicPlanetV6V9SubductionBudgetOptimizationTest::RunTest(const FString&
 		const bool bUseSubductionPerformanceOptimizations)
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
-			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
-			FixedIntervalSteps,
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
 			INDEX_NONE,
 			SampleCount,
 			PlateCount,
 			CanonicalSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(true);
-		Planet.SetV9PaperSurrogateFieldModeForTest(
-			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
-		Planet.SetPhaseTimingForTest(true);
-		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
-		Planet.SetPlateCandidatePruningForTest(true);
-		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest = true;
-		Planet.GetPlanetMutable().bUseSubductionPerformanceOptimizationsForTest =
+		FTectonicPlanetV6KeptRuntimeProfileOptions RuntimeOptions =
+			MakeKeptV6RuntimeProfileOptions();
+		RuntimeOptions.bUseSubductionPerformanceOptimizations =
 			bUseSubductionPerformanceOptimizations;
+		ApplyKeptV6TestProfile(
+			Planet,
+			RuntimeOptions,
+			MakeKeptV6DiagnosticsOptions(true, false));
 		return Planet;
 	};
 
@@ -17405,39 +17331,19 @@ bool FTectonicPlanetV6V9CopiedFrontierFrontEndOptimizationTest::RunTest(const FS
 		const bool bUseUnfilteredMeshReuse)
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
-			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
-			FixedIntervalSteps,
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
 			INDEX_NONE,
 			SampleCount,
 			PlateCount,
 			CanonicalSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetV9SubmergedContinentalFringeRelaxationForTest(true, 0.004, 0.002);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(true);
-		Planet.SetV9PaperSurrogateFieldModeForTest(
-			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
-		Planet.SetPhaseTimingForTest(true);
-		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
-		Planet.SetPlateCandidatePruningForTest(true);
-		Planet.SetCopiedFrontierUnfilteredMeshReuseForTest(bUseUnfilteredMeshReuse);
-		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest = true;
-		Planet.GetPlanetMutable().bUseSubductionPerformanceOptimizationsForTest = true;
+		FTectonicPlanetV6KeptRuntimeProfileOptions RuntimeOptions =
+			MakeKeptV6RuntimeProfileOptions();
+		RuntimeOptions.bEnableCopiedFrontierUnfilteredMeshReuse = bUseUnfilteredMeshReuse;
+		ApplyKeptV6TestProfile(
+			Planet,
+			RuntimeOptions,
+			MakeKeptV6DiagnosticsOptions(true, false));
 		return Planet;
 	};
 
@@ -17751,41 +17657,19 @@ bool FTectonicPlanetV6V9TectonicBalanceAuditTest::RunTest(const FString& Paramet
 	const auto InitializePlanet = [=](const FRunConfig& Config)
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
-			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
-			FixedIntervalSteps,
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
 			INDEX_NONE,
 			Config.SampleCount,
 			PlateCount,
 			Config.Seed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetV9SubmergedContinentalFringeRelaxationForTest(
-			Config.bEnableShoulderFix,
-			0.004,
-			0.002);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(true);
-		Planet.SetV9PaperSurrogateFieldModeForTest(
-			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
-		Planet.SetPhaseTimingForTest(true);
-		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
-		Planet.SetPlateCandidatePruningForTest(true);
-		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest = true;
-		Planet.GetPlanetMutable().bUseSubductionPerformanceOptimizationsForTest = true;
+		FTectonicPlanetV6KeptRuntimeProfileOptions RuntimeOptions =
+			MakeKeptV6RuntimeProfileOptions();
+		RuntimeOptions.bEnableSubmergedContinentalFringeRelaxation = Config.bEnableShoulderFix;
+		ApplyKeptV6TestProfile(
+			Planet,
+			RuntimeOptions,
+			MakeKeptV6DiagnosticsOptions(true, false));
 		return Planet;
 	};
 

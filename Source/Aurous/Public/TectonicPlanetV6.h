@@ -1277,6 +1277,8 @@ struct AUROUS_API FTectonicPlanetV6
 	const FTectonicPlanetV6PeriodicSolveStats& GetLastSolveStats() const;
 	const TArray<FTectonicPlanetV6ResolvedSample>& GetLastResolvedSamples() const;
 	const TArray<int32>& GetPeriodicSolveSteps() const;
+
+	// Authoritative kept runtime/profile entry points.
 	static ETectonicPlanetV6PeriodicSolveMode GetKeptV6PeriodicSolveMode();
 	static int32 GetKeptV6FixedIntervalSteps();
 	static FString DescribeKeptV6RuntimeProfile(
@@ -1286,6 +1288,9 @@ struct AUROUS_API FTectonicPlanetV6
 		const FTectonicPlanetV6KeptRuntimeProfileOptions& Options = FTectonicPlanetV6KeptRuntimeProfileOptions{});
 	void ApplyKeptV6DiagnosticsProfile(
 		const FTectonicPlanetV6KeptDiagnosticsOptions& Options = FTectonicPlanetV6KeptDiagnosticsOptions{});
+
+	// Legacy/reference comparison surface retained for active harnesses. This is not part of the
+	// authoritative kept runtime profile and should not be used by editor/runtime callers.
 	void SetPeriodicSolveModeForTest(
 		ETectonicPlanetV6PeriodicSolveMode InMode,
 		int32 InFixedIntervalSteps = 25);
@@ -1313,10 +1318,6 @@ struct AUROUS_API FTectonicPlanetV6
 		double RatePerStep = 0.004,
 		double BoundaryOrActiveBonusRatePerStep = 0.002);
 	void SetAutomaticRiftingForTest(bool bEnable);
-	void SetPhaseTimingForTest(bool bEnable);
-	void SetDetailedCopiedFrontierAttributionForTest(bool bEnable);
-	void SetPlateCandidatePruningForTest(bool bEnable);
-	void SetCopiedFrontierUnfilteredMeshReuseForTest(bool bEnable);
 	bool ForceLargestEligibleAutomaticRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
 	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
 	void SetUseLinearConvergentMaintenanceInfluenceForTest(bool bEnableLinear);
@@ -1368,6 +1369,10 @@ private:
 	void PerformThesisRemeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisCopiedFrontierSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisPlateSubmeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
+	void SetPhaseTimingEnabled(bool bEnable);
+	void SetDetailedCopiedFrontierAttributionEnabled(bool bEnable);
+	void SetPlateCandidatePruningEnabled(bool bEnable);
+	void SetCopiedFrontierUnfilteredMeshReuseEnabled(bool bEnable);
 	void CaptureCopiedFrontierPreSolveState(
 		TArray<int32>& OutPreSolvePlateIds,
 		TArray<uint8>& OutPreSolveContinentalFlags,

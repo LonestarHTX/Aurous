@@ -406,15 +406,13 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 					.Padding(0.0f, 0.0f, 8.0f, 0.0f)
 					[
 						SNew(SCheckBox)
+						.IsEnabled_Lambda([this]()
+						{
+							return GetSelectedLegacyActor() != nullptr;
+						})
 						.IsChecked_Lambda([this]()
 						{
 							if (const ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
-							{
-								return Actor->GetShowBoundaryTypes()
-									? ECheckBoxState::Checked
-									: ECheckBoxState::Unchecked;
-							}
-							if (const ATectonicPlanetV6PreviewActor* Actor = GetSelectedV6Actor())
 							{
 								return Actor->GetShowBoundaryTypes()
 									? ECheckBoxState::Checked
@@ -429,19 +427,15 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 							{
 								Actor->SetShowBoundaryTypes(NewState == ECheckBoxState::Checked);
 							}
-							else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
-							{
-								V6Actor->SetShowBoundaryTypes(NewState == ECheckBoxState::Checked);
-							}
 						})
 					]
 
 					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.VAlign(VAlign_Center)
+						.AutoWidth()
+						.VAlign(VAlign_Center)
 					[
 						SNew(STextBlock)
-						.Text(LOCTEXT("ShowBoundaryTypes", "Show Boundary Types (R=Div G=Xform C=Conv)"))
+						.Text(LOCTEXT("ShowBoundaryTypes", "Show Boundary Types (Legacy Only; R=Div G=Xform C=Conv)"))
 					]
 				]
 			]
