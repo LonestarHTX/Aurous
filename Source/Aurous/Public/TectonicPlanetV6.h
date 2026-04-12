@@ -323,6 +323,8 @@ struct AUROUS_API FTectonicPlanetV6PeriodicSolveStats
 	int32 ReusedConvergentEdgeSetCount = 0;
 	int32 SubductionConvergentEdgeCount = 0;
 	int32 SlabPullConvergentEdgeCount = 0;
+	int32 CopiedFrontierRefreshedCanonicalVertexCount = 0;
+	int32 CopiedFrontierRefreshedSyntheticVertexCount = 0;
 	int32 SubductionSeedSampleCount = 0;
 	int32 SubductionInfluencedCount = 0;
 	int32 SlabPullFrontSampleCount = 0;
@@ -335,6 +337,8 @@ struct AUROUS_API FTectonicPlanetV6PeriodicSolveStats
 	double SubductionSeedInitializationMs = 0.0;
 	double SubductionPropagationMs = 0.0;
 	double SubductionFinalizeMs = 0.0;
+	double CopiedFrontierUnfilteredMeshPrepareMs = 0.0;
+	double CopiedFrontierFilteredMeshBuildMs = 0.0;
 	double SlabPullConvergentEdgeBuildMs = 0.0;
 	double SlabPullFrontierBuildMs = 0.0;
 	double SlabPullApplyMs = 0.0;
@@ -413,6 +417,8 @@ struct AUROUS_API FTectonicPlanetV6CopiedFrontierPlateMesh
 	TArray<int32> LocalToCanonicalVertex;
 	TMap<int32, int32> CanonicalToLocalVertex;
 	TArray<FCarriedSample> LocalCarriedSamples;
+	TArray<int32> LocalVertexSourceTriangleIndices;
+	TArray<FVector3d> LocalVertexSourceBarycentrics;
 	TArray<uint8> LocalVertexCopiedFrontierFlags;
 	TArray<UE::Geometry::FIndex3i> LocalTriangles;
 	TArray<int32> GlobalTriangleIndices;
@@ -1280,6 +1286,7 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetPhaseTimingForTest(bool bEnable);
 	void SetDetailedCopiedFrontierAttributionForTest(bool bEnable);
 	void SetPlateCandidatePruningForTest(bool bEnable);
+	void SetCopiedFrontierUnfilteredMeshReuseForTest(bool bEnable);
 	bool ForceLargestEligibleAutomaticRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
 	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
 	void SetUseLinearConvergentMaintenanceInfluenceForTest(bool bEnableLinear);
@@ -1457,6 +1464,7 @@ private:
 	bool bEnablePhaseTimingForTest = false;
 	bool bEnableDetailedCopiedFrontierAttributionForTest = true;
 	bool bUsePlateCandidatePruningForTest = true;
+	bool bUseCopiedFrontierUnfilteredMeshReuseForTest = true;
 	bool bUseLinearConvergentMaintenanceSpeedFactorForTest = true;
 	bool bUseLinearConvergentMaintenanceInfluenceForTest = true;
 	TArray<uint8> CurrentSolveThesisCollisionTerraneComponentMask;

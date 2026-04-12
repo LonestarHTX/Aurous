@@ -8868,6 +8868,8 @@ namespace
 		Mesh.CanonicalToLocalVertex.Add(CanonicalVertexIndex, NewLocalVertexIndex);
 		FCarriedSample& LocalCarriedSample = Mesh.LocalCarriedSamples.AddDefaulted_GetRef();
 		PopulateV6CarriedSampleFromCanonical(Planet, CanonicalVertexIndex, LocalCarriedSample);
+		Mesh.LocalVertexSourceTriangleIndices.Add(INDEX_NONE);
+		Mesh.LocalVertexSourceBarycentrics.Add(FVector3d::ZeroVector);
 		Mesh.LocalVertexCopiedFrontierFlags.Add(false);
 		return NewLocalVertexIndex;
 	}
@@ -8962,6 +8964,7 @@ namespace
 		const FTectonicPlanet& Planet,
 		FTectonicPlanetV6CopiedFrontierPlateMesh& Mesh,
 		const FIntVector& Triangle,
+		const int32 GlobalTriangleIndex,
 		const FVector3d& Barycentric,
 		const bool bMarkCopiedFrontier)
 	{
@@ -8983,6 +8986,8 @@ namespace
 			Triangle,
 			Barycentric,
 			SurfacePosition);
+		Mesh.LocalVertexSourceTriangleIndices.Add(GlobalTriangleIndex);
+		Mesh.LocalVertexSourceBarycentrics.Add(Barycentric);
 		Mesh.LocalVertexCopiedFrontierFlags.Add(0);
 		if (bMarkCopiedFrontier)
 		{
@@ -8995,6 +9000,7 @@ namespace
 		const FTectonicPlanet& Planet,
 		FTectonicPlanetV6CopiedFrontierPlateMesh& Mesh,
 		const FIntVector& Triangle,
+		const int32 GlobalTriangleIndex,
 		const FV6PartitionedCopiedFrontierVertexDesc& VertexDesc,
 		const bool bMarkCopiedFrontier)
 	{
@@ -9013,8 +9019,65 @@ namespace
 			Planet,
 			Mesh,
 			Triangle,
+			GlobalTriangleIndex,
 			VertexDesc.Barycentric,
 			bMarkCopiedFrontier);
+	}
+
+	void RefreshCopiedFrontierMeshCarriedSamples(
+		const FTectonicPlanet& Planet,
+		TArray<FTectonicPlanetV6CopiedFrontierPlateMesh>& Meshes,
+		int32& OutCanonicalRefreshCount,
+		int32& OutSyntheticRefreshCount)
+	{
+		OutCanonicalRefreshCount = 0;
+		OutSyntheticRefreshCount = 0;
+
+		for (FTectonicPlanetV6CopiedFrontierPlateMesh& Mesh : Meshes)
+		{
+			const int32 LocalVertexCount = Mesh.BaseVertices.Num();
+			if (Mesh.LocalCarriedSamples.Num() != LocalVertexCount)
+			{
+				Mesh.LocalCarriedSamples.SetNum(LocalVertexCount);
+			}
+
+			for (int32 LocalVertexIndex = 0; LocalVertexIndex < LocalVertexCount; ++LocalVertexIndex)
+			{
+				const int32 CanonicalVertexIndex =
+					Mesh.LocalToCanonicalVertex.IsValidIndex(LocalVertexIndex)
+						? Mesh.LocalToCanonicalVertex[LocalVertexIndex]
+						: INDEX_NONE;
+				if (CanonicalVertexIndex != INDEX_NONE)
+				{
+					PopulateV6CarriedSampleFromCanonical(
+						Planet,
+						CanonicalVertexIndex,
+						Mesh.LocalCarriedSamples[LocalVertexIndex]);
+					++OutCanonicalRefreshCount;
+					continue;
+				}
+
+				const int32 SourceTriangleIndex =
+					Mesh.LocalVertexSourceTriangleIndices.IsValidIndex(LocalVertexIndex)
+						? Mesh.LocalVertexSourceTriangleIndices[LocalVertexIndex]
+						: INDEX_NONE;
+				if (SourceTriangleIndex == INDEX_NONE ||
+					!Planet.TriangleIndices.IsValidIndex(SourceTriangleIndex) ||
+					!Mesh.LocalVertexSourceBarycentrics.IsValidIndex(LocalVertexIndex) ||
+					!Mesh.BaseVertices.IsValidIndex(LocalVertexIndex))
+				{
+					continue;
+				}
+
+				Mesh.LocalCarriedSamples[LocalVertexIndex] =
+					BuildSyntheticCopiedFrontierCarriedSample(
+						Planet,
+						Planet.TriangleIndices[SourceTriangleIndex],
+						Mesh.LocalVertexSourceBarycentrics[LocalVertexIndex],
+						Mesh.BaseVertices[LocalVertexIndex]);
+				++OutSyntheticRefreshCount;
+			}
+		}
 	}
 
 	void AddCopiedFrontierMeshTriangle(
@@ -9173,6 +9236,7 @@ namespace
 					Planet,
 					Mesh,
 					Triangle,
+					GlobalTriangleIndex,
 					VertexDesc,
 					true));
 			}
@@ -13753,9 +13817,15 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		Planet.CurrentStep > 0;
 	FV6CopiedFrontierDestructiveFilterState DestructiveFilterState;
 	FV6CopiedFrontierDestructiveTrackingUpdateStats DestructiveTrackingStats;
+	double CopiedFrontierUnfilteredMeshPrepareMs = 0.0;
+	double CopiedFrontierFilteredMeshBuildMs = 0.0;
+	int32 CopiedFrontierRefreshedCanonicalVertexCount = 0;
+	int32 CopiedFrontierRefreshedSyntheticVertexCount = 0;
 	TArray<FTectonicPlanetV6CopiedFrontierPlateMesh> FilteredCopiedFrontierMeshes;
 	TArray<FTectonicPlanetV6CopiedFrontierPlateMesh> UnfilteredComparisonCopiedFrontierMeshes;
 	const TArray<FTectonicPlanetV6CopiedFrontierPlateMesh>* ActiveCopiedFrontierMeshes =
+		&ThesisCopiedFrontierMeshes;
+	const TArray<FTectonicPlanetV6CopiedFrontierPlateMesh>* UnfilteredComparisonMeshes =
 		&ThesisCopiedFrontierMeshes;
 	if (bApplyDestructiveFilter)
 	{
@@ -13806,23 +13876,50 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			DestructiveTrackingStats = FV6CopiedFrontierDestructiveTrackingUpdateStats{};
 		}
 		const double CopiedFrontierMeshBuildStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
+		const double UnfilteredMeshPrepareStartTime =
+			bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
+		if (bUseCopiedFrontierUnfilteredMeshReuseForTest)
+		{
+			RefreshCopiedFrontierMeshCarriedSamples(
+				Planet,
+				ThesisCopiedFrontierMeshes,
+				CopiedFrontierRefreshedCanonicalVertexCount,
+				CopiedFrontierRefreshedSyntheticVertexCount);
+			UnfilteredComparisonMeshes = &ThesisCopiedFrontierMeshes;
+		}
+		else
+		{
 			BuildV6CopiedFrontierPlateMeshes(
 				Planet,
 				UnfilteredComparisonCopiedFrontierMeshes,
 				nullptr,
 				FrontierMeshBuildMode,
 				SyntheticCoverageSupportFlags);
+			UnfilteredComparisonMeshes = &UnfilteredComparisonCopiedFrontierMeshes;
+		}
+		if (bRecordPhaseTiming)
+		{
+			CopiedFrontierUnfilteredMeshPrepareMs =
+				(FPlatformTime::Seconds() - UnfilteredMeshPrepareStartTime) * 1000.0;
+		}
 		BuildCopiedFrontierDestructiveFilterState(
 			Planet,
 			CopiedFrontierTrackedDestructiveKinds,
 			CopiedFrontierTrackedPreferredContinuationPlateIds,
 			DestructiveFilterState);
+		const double FilteredMeshBuildStartTime =
+			bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 			BuildV6CopiedFrontierPlateMeshes(
 				Planet,
 				FilteredCopiedFrontierMeshes,
 				&DestructiveFilterState,
 				FrontierMeshBuildMode,
 				SyntheticCoverageSupportFlags);
+		if (bRecordPhaseTiming)
+		{
+			CopiedFrontierFilteredMeshBuildMs =
+				(FPlatformTime::Seconds() - FilteredMeshBuildStartTime) * 1000.0;
+		}
 		if (bRecordPhaseTiming)
 		{
 			AccumulatePhaseTimingMs(PhaseTiming.CopiedFrontierMeshBuildMs, CopiedFrontierMeshBuildStartTime);
@@ -14009,7 +14106,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		const double UnfilteredQueryGeometryBuildStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		BuildV6CopiedFrontierQueryGeometries(
 			Planet,
-			UnfilteredComparisonCopiedFrontierMeshes,
+			*UnfilteredComparisonMeshes,
 			UnfilteredComparisonQueryGeometries);
 		if (bRecordPhaseTiming)
 		{
@@ -16684,6 +16781,10 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	LastSolveStats.CopiedFrontierCarriedSampleCount = CopiedFrontierCarriedSampleCount;
 	LastSolveStats.CopiedFrontierHitCount = CopiedFrontierHitCount.Load();
 	LastSolveStats.InteriorHitCount = InteriorHitCount.Load();
+	LastSolveStats.CopiedFrontierRefreshedCanonicalVertexCount =
+		CopiedFrontierRefreshedCanonicalVertexCount;
+	LastSolveStats.CopiedFrontierRefreshedSyntheticVertexCount =
+		CopiedFrontierRefreshedSyntheticVertexCount;
 	LastSolveStats.SubductionFieldComputeCount = SubductionFieldDiagnostics.SubductionFieldComputeCount;
 	LastSolveStats.SlabPullComputeCount = SlabPullDiagnostics.SlabPullComputeCount;
 	LastSolveStats.ConvergentEdgeBuildCount =
@@ -16711,6 +16812,10 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		SubductionFieldDiagnostics.SubductionSeedInitializationMs;
 	LastSolveStats.SubductionPropagationMs = SubductionFieldDiagnostics.SubductionPropagationMs;
 	LastSolveStats.SubductionFinalizeMs = SubductionFieldDiagnostics.SubductionFinalizeMs;
+	LastSolveStats.CopiedFrontierUnfilteredMeshPrepareMs =
+		CopiedFrontierUnfilteredMeshPrepareMs;
+	LastSolveStats.CopiedFrontierFilteredMeshBuildMs =
+		CopiedFrontierFilteredMeshBuildMs;
 	LastSolveStats.SlabPullConvergentEdgeBuildMs =
 		SlabPullDiagnostics.SlabPullConvergentEdgeBuildMs;
 	LastSolveStats.SlabPullFrontierBuildMs = SlabPullDiagnostics.SlabPullFrontierBuildMs;
@@ -20138,6 +20243,11 @@ void FTectonicPlanetV6::SetDetailedCopiedFrontierAttributionForTest(const bool b
 void FTectonicPlanetV6::SetPlateCandidatePruningForTest(const bool bEnable)
 {
 	bUsePlateCandidatePruningForTest = bEnable;
+}
+
+void FTectonicPlanetV6::SetCopiedFrontierUnfilteredMeshReuseForTest(const bool bEnable)
+{
+	bUseCopiedFrontierUnfilteredMeshReuseForTest = bEnable;
 }
 
 void FTectonicPlanetV6::SetV9Phase1AuthorityForTest(const bool bEnable, const int32 InActiveBoundaryRingCount)
