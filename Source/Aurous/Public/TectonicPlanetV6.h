@@ -1272,6 +1272,10 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetV9PaperSurrogateOwnershipForTest(bool bEnable);
 	void SetV9PaperSurrogateFieldModeForTest(ETectonicPlanetV6PaperSurrogateFieldMode InMode);
 	void SetSubmergedContinentalRelaxationForTest(bool bEnable, double RatePerStep = 0.005);
+	void SetV9SubmergedContinentalFringeRelaxationForTest(
+		bool bEnable,
+		double RatePerStep = 0.004,
+		double BoundaryOrActiveBonusRatePerStep = 0.002);
 	void SetAutomaticRiftingForTest(bool bEnable);
 	void SetPhaseTimingForTest(bool bEnable);
 	void SetDetailedCopiedFrontierAttributionForTest(bool bEnable);
@@ -1323,9 +1327,11 @@ struct AUROUS_API FTectonicPlanetV6
 
 private:
 	bool HandlePendingAutomaticRiftAfterAdvance();
+	void ApplySubmergedContinentalFringeRelaxationAfterStep();
 	void PerformThesisRemeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisCopiedFrontierSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisPlateSubmeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
+	void RebuildSubmergedContinentalFringeRelaxationMask();
 	void RebuildThesisCopiedFrontierMeshes();
 	void RebuildThesisPlateSubmeshMeshes();
 
@@ -1406,6 +1412,9 @@ private:
 	TArray<uint8> CurrentSolveCollisionShadowQualifiedFlags;
 	TArray<uint8> CurrentSolveCollisionShadowPersistenceMask;
 	FTectonicPlanetV6CollisionShadowDiagnostic CurrentSolveCollisionShadowDiagnostic;
+	TArray<uint8> CurrentSolveSubmergedContinentalFringeFlags;
+	TArray<uint8> CurrentSolveSubmergedContinentalFringeBoundaryOrActiveFlags;
+	TArray<float> CurrentSolveSubmergedContinentalFringeOceanicNeighborFractions;
 	TArray<uint8> CurrentSolveCollisionExecutionMask;
 	TArray<uint8> CurrentSolveCollisionTransferMask;
 	TArray<uint8> CumulativeCollisionExecutionMask;
@@ -1439,8 +1448,11 @@ private:
 	bool bEnableV9QuietInteriorContinentalRetentionForTest = false;
 	bool bEnableV9ContinentalBreadthPreservationForTest = false;
 	bool bEnableV9PaperSurrogateOwnershipForTest = false;
+	bool bEnableV9SubmergedContinentalFringeRelaxationForTest = false;
 	ETectonicPlanetV6PaperSurrogateFieldMode V9PaperSurrogateFieldModeForTest =
 		ETectonicPlanetV6PaperSurrogateFieldMode::FullState;
+	double V9SubmergedContinentalFringeRelaxationRatePerStepForTest = 0.004;
+	double V9SubmergedContinentalFringeBoundaryOrActiveBonusRatePerStepForTest = 0.002;
 	bool bEnableAutomaticRiftingForTest = false;
 	bool bEnablePhaseTimingForTest = false;
 	bool bEnableDetailedCopiedFrontierAttributionForTest = true;

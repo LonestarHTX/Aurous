@@ -58,6 +58,7 @@ namespace
 	constexpr double ContinentalBreadthModerateNeighborhoodFraction = 0.58;
 	constexpr double ContinentalBreadthStrongSubaerialNeighborhoodFraction = 0.40;
 	constexpr float ContinentalBreadthMinQuietElevationKm = -0.25f;
+	constexpr float SubmergedContinentalFringeMaxDepthKm = -2.0f;
 	constexpr float PaperSurrogateSelectiveElevationLowKm = 1.5f;
 	constexpr float PaperSurrogateSelectiveElevationHighKm = 4.0f;
 	constexpr float PaperSurrogateSelectiveElevationHighBlend = 0.60f;
@@ -12833,6 +12834,8 @@ void FTectonicPlanetV6::AdvanceStep()
 		return;
 	}
 
+	ApplySubmergedContinentalFringeRelaxationAfterStep();
+
 	if (UsesIntervalDestructivePropagationForSolveMode(PeriodicSolveMode) &&
 		Planet.CurrentStep > 0)
 	{
@@ -12869,6 +12872,55 @@ void FTectonicPlanetV6::AdvanceStep()
 	if (Planet.CurrentStep > 0 && Interval > 0 && (Planet.CurrentStep % Interval) == 0)
 	{
 		PerformAuthoritativePeriodicSolve(ETectonicPlanetV6SolveTrigger::Periodic);
+	}
+}
+
+void FTectonicPlanetV6::ApplySubmergedContinentalFringeRelaxationAfterStep()
+{
+	if (!bEnableV9SubmergedContinentalFringeRelaxationForTest)
+	{
+		return;
+	}
+
+	const int32 SampleCount = Planet.Samples.Num();
+	if (CurrentSolveSubmergedContinentalFringeFlags.Num() != SampleCount ||
+		CurrentSolveSubmergedContinentalFringeBoundaryOrActiveFlags.Num() != SampleCount ||
+		CurrentSolveSubmergedContinentalFringeOceanicNeighborFractions.Num() != SampleCount)
+	{
+		return;
+	}
+
+	for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	{
+		if (CurrentSolveSubmergedContinentalFringeFlags[SampleIndex] == 0)
+		{
+			continue;
+		}
+
+		FSample& Sample = Planet.Samples[SampleIndex];
+		if (Sample.ContinentalWeight < 0.5f ||
+			Sample.Elevation > 0.0f ||
+			Sample.Elevation <= SubmergedContinentalFringeMaxDepthKm ||
+			Sample.OrogenyType != EOrogenyType::None)
+		{
+			continue;
+		}
+
+		const double OceanicNeighborFraction = FMath::Clamp(
+			static_cast<double>(CurrentSolveSubmergedContinentalFringeOceanicNeighborFractions[SampleIndex]),
+			0.0,
+			1.0);
+		double RelaxationRate =
+			V9SubmergedContinentalFringeRelaxationRatePerStepForTest *
+			FMath::Lerp(0.5, 1.0, OceanicNeighborFraction);
+		if (CurrentSolveSubmergedContinentalFringeBoundaryOrActiveFlags[SampleIndex] != 0)
+		{
+			RelaxationRate += V9SubmergedContinentalFringeBoundaryOrActiveBonusRatePerStepForTest;
+		}
+
+		Sample.ContinentalWeight = FMath::Max(
+			0.0f,
+			Sample.ContinentalWeight - static_cast<float>(RelaxationRate));
 	}
 }
 
@@ -17441,18 +17493,21 @@ void FTectonicPlanetV6::PerformAuthoritativePeriodicSolve(const ETectonicPlanetV
 	if (PeriodicSolveMode == ETectonicPlanetV6PeriodicSolveMode::ThesisPlateSubmeshSpike)
 	{
 		PerformThesisPlateSubmeshSpikeSolve(Trigger);
+		RebuildSubmergedContinentalFringeRelaxationMask();
 		return;
 	}
 
 	if (IsCopiedFrontierLikeSolveMode(PeriodicSolveMode))
 	{
 		PerformThesisCopiedFrontierSpikeSolve(Trigger);
+		RebuildSubmergedContinentalFringeRelaxationMask();
 		return;
 	}
 
 	if (PeriodicSolveMode == ETectonicPlanetV6PeriodicSolveMode::ThesisRemeshSpike)
 	{
 		PerformThesisRemeshSpikeSolve(Trigger);
+		RebuildSubmergedContinentalFringeRelaxationMask();
 		return;
 	}
 
@@ -18053,6 +18108,66 @@ void FTectonicPlanetV6::PerformAuthoritativePeriodicSolve(const ETectonicPlanetV
 			OutcomeStats->OceanicCreationCount,
 			OutcomeStats->DefaultTransferCount,
 			OutcomeStats->ContinentalWeightThresholdMismatchCount);
+	}
+
+	RebuildSubmergedContinentalFringeRelaxationMask();
+}
+
+void FTectonicPlanetV6::RebuildSubmergedContinentalFringeRelaxationMask()
+{
+	const int32 SampleCount = Planet.Samples.Num();
+	CurrentSolveSubmergedContinentalFringeFlags.Init(0, SampleCount);
+	CurrentSolveSubmergedContinentalFringeBoundaryOrActiveFlags.Init(0, SampleCount);
+	CurrentSolveSubmergedContinentalFringeOceanicNeighborFractions.Init(0.0f, SampleCount);
+
+	if (!bEnableV9SubmergedContinentalFringeRelaxationForTest)
+	{
+		return;
+	}
+
+	const bool bHasActiveZoneFlags = CurrentSolveActiveZoneFlags.Num() == SampleCount;
+	for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	{
+		const FSample& Sample = Planet.Samples[SampleIndex];
+		if (Sample.ContinentalWeight < 0.5f)
+		{
+			continue;
+		}
+
+		if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex) || Planet.SampleAdjacency[SampleIndex].IsEmpty())
+		{
+			continue;
+		}
+
+		int32 ValidNeighborCount = 0;
+		int32 OceanicNeighborCount = 0;
+		for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+		{
+			if (!Planet.Samples.IsValidIndex(NeighborIndex))
+			{
+				continue;
+			}
+
+			++ValidNeighborCount;
+			if (Planet.Samples[NeighborIndex].ContinentalWeight < 0.5f)
+			{
+				++OceanicNeighborCount;
+			}
+		}
+
+		if (ValidNeighborCount == 0 || OceanicNeighborCount == 0)
+		{
+			continue;
+		}
+
+		CurrentSolveSubmergedContinentalFringeFlags[SampleIndex] = 1;
+		CurrentSolveSubmergedContinentalFringeOceanicNeighborFractions[SampleIndex] =
+			static_cast<float>(OceanicNeighborCount) / static_cast<float>(ValidNeighborCount);
+		const bool bBoundaryOrActive =
+			Sample.bIsBoundary ||
+			(bHasActiveZoneFlags && CurrentSolveActiveZoneFlags[SampleIndex] != 0);
+		CurrentSolveSubmergedContinentalFringeBoundaryOrActiveFlags[SampleIndex] =
+			bBoundaryOrActive ? 1 : 0;
 	}
 }
 
@@ -20190,6 +20305,18 @@ void FTectonicPlanetV6::SetSubmergedContinentalRelaxationForTest(const bool bEna
 {
 	Planet.bEnableSubmergedContinentalRelaxation = bEnable;
 	Planet.SubmergedContinentalRelaxationRatePerStep = RatePerStep;
+}
+
+void FTectonicPlanetV6::SetV9SubmergedContinentalFringeRelaxationForTest(
+	const bool bEnable,
+	const double RatePerStep,
+	const double BoundaryOrActiveBonusRatePerStep)
+{
+	bEnableV9SubmergedContinentalFringeRelaxationForTest = bEnable;
+	V9SubmergedContinentalFringeRelaxationRatePerStepForTest = FMath::Max(0.0, RatePerStep);
+	V9SubmergedContinentalFringeBoundaryOrActiveBonusRatePerStepForTest =
+		FMath::Max(0.0, BoundaryOrActiveBonusRatePerStep);
+	RebuildSubmergedContinentalFringeRelaxationMask();
 }
 
 void FTectonicPlanetV6::SetAutomaticRiftingForTest(const bool bEnable)
