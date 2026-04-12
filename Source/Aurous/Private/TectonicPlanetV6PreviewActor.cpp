@@ -13,9 +13,32 @@ using namespace RealtimeMesh;
 
 namespace
 {
+	constexpr float EnhancedOceanDisplaySeaLevelKm = 0.0f;
+	constexpr int32 EnhancedOceanDisplaySmoothingPasses = 2;
+
 	FString BuildV6PreviewRunId(const int32 RandomSeed, const int32 SampleCount, const int32 PlateCount)
 	{
 		return FString::Printf(TEXT("V6Preview_S%d_N%d_P%d"), RandomSeed, SampleCount, PlateCount);
+	}
+
+	FTectonicPlanetV6KeptDiagnosticsOptions BuildV6PreviewKeptDiagnosticsOptions()
+	{
+		FTectonicPlanetV6KeptDiagnosticsOptions Options;
+		Options.bEnableDetailedCopiedFrontierAttribution = false;
+		return Options;
+	}
+
+	FString DescribeV6PreviewKeptProfile(const bool bEnableAutomaticRifting)
+	{
+		const FTectonicPlanetV6KeptDiagnosticsOptions DiagnosticsOptions =
+			BuildV6PreviewKeptDiagnosticsOptions();
+		return FString::Printf(
+			TEXT("%s diagnostics=lean phase_timing=%s detailed_copied_frontier_attribution=%s"),
+			*FTectonicPlanetV6::DescribeKeptV6RuntimeProfile(
+				bEnableAutomaticRifting,
+				true),
+			DiagnosticsOptions.bEnablePhaseTiming ? TEXT("ON") : TEXT("OFF"),
+			DiagnosticsOptions.bEnableDetailedCopiedFrontierAttribution ? TEXT("ON") : TEXT("OFF"));
 	}
 
 	UMaterialInterface* ResolvePlanetMaterialV6(UMaterialInterface* PreferredMaterial)
@@ -30,7 +53,79 @@ namespace
 			TEXT("/Engine/EngineDebugMaterials/VertexColorMaterial.VertexColorMaterial"));
 	}
 
-	FColor GetV6VisualizationColor(const FSample& Sample, const ETectonicMapExportMode Mode)
+	bool ShouldSmoothOceanDisplaySample(const FSample& Sample)
+	{
+		return Sample.ContinentalWeight < 0.5f && Sample.Elevation <= EnhancedOceanDisplaySeaLevelKm;
+	}
+
+	float ComputeOceanDisplayBlendAlpha(const float RawElevationKm)
+	{
+		const float DepthKm = FMath::Max(-RawElevationKm, 0.0f);
+		return FMath::Clamp(0.35f + 0.10f * DepthKm, 0.35f, 0.80f);
+	}
+
+	void BuildEnhancedPreviewDisplayElevations(const FTectonicPlanet& Planet, TArray<float>& OutDisplayElevations)
+	{
+		const int32 SampleCount = Planet.Samples.Num();
+		OutDisplayElevations.SetNum(SampleCount);
+		for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+		{
+			OutDisplayElevations[SampleIndex] = Planet.Samples[SampleIndex].Elevation;
+		}
+
+		if (SampleCount == 0 || Planet.SampleAdjacency.Num() != SampleCount)
+		{
+			return;
+		}
+
+		TArray<float> PreviousElevations = OutDisplayElevations;
+		for (int32 PassIndex = 0; PassIndex < EnhancedOceanDisplaySmoothingPasses; ++PassIndex)
+		{
+			for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+			{
+				const FSample& Sample = Planet.Samples[SampleIndex];
+				if (!ShouldSmoothOceanDisplaySample(Sample))
+				{
+					OutDisplayElevations[SampleIndex] = Sample.Elevation;
+					continue;
+				}
+
+				float WeightedSum = PreviousElevations[SampleIndex] * 4.0f;
+				float WeightSum = 4.0f;
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (!Planet.Samples.IsValidIndex(NeighborIndex))
+					{
+						continue;
+					}
+
+					const FSample& Neighbor = Planet.Samples[NeighborIndex];
+					if (!ShouldSmoothOceanDisplaySample(Neighbor))
+					{
+						continue;
+					}
+
+					WeightedSum += PreviousElevations[NeighborIndex];
+					WeightSum += 1.0f;
+				}
+
+				const float SmoothedElevation = WeightSum > UE_SMALL_NUMBER
+					? WeightedSum / WeightSum
+					: PreviousElevations[SampleIndex];
+				const float BlendAlpha = ComputeOceanDisplayBlendAlpha(Sample.Elevation);
+				OutDisplayElevations[SampleIndex] =
+					FMath::Lerp(PreviousElevations[SampleIndex], SmoothedElevation, BlendAlpha);
+			}
+
+			PreviousElevations = OutDisplayElevations;
+		}
+	}
+
+	FColor GetV6VisualizationColor(
+		const FSample& Sample,
+		const ETectonicMapExportMode Mode,
+		const ETectonicElevationPresentationMode ElevationPresentationMode,
+		const float DisplayElevationKm)
 	{
 		switch (Mode)
 		{
@@ -46,16 +141,14 @@ namespace
 			return TectonicPlanetVisualization::GetSubductionDistanceColor(Sample.SubductionDistanceKm);
 		case ETectonicMapExportMode::Elevation:
 		default:
-			return TectonicPlanetVisualization::GetElevationColor(Sample.Elevation);
+			return TectonicPlanetVisualization::GetElevationColor(DisplayElevationKm, ElevationPresentationMode);
 		}
 	}
 }
 
 FString ATectonicPlanetV6PreviewActor::GetRuntimeConfigSummary() const
 {
-	return FString::Printf(
-		TEXT("Solve=ThesisPartitionedFrontierProcessSpike cadence=16 retention=ON submerged_relaxation=ON rifting=%s"),
-		bEnableStochasticRifting ? TEXT("ON") : TEXT("OFF"));
+	return DescribeV6PreviewKeptProfile(bEnableStochasticRifting);
 }
 
 ATectonicPlanetV6PreviewActor::ATectonicPlanetV6PreviewActor()
@@ -83,29 +176,6 @@ void ATectonicPlanetV6PreviewActor::BeginDestroy()
 	Super::BeginDestroy();
 }
 
-void ATectonicPlanetV6PreviewActor::ConfigureKeptCandidateDefaults()
-{
-	PlanetV6.SetPeriodicSolveModeForTest(
-		ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
-		16);
-	PlanetV6.SetSyntheticCoverageRetentionForTest(false);
-	PlanetV6.SetWholeTriangleBoundaryDuplicationForTest(false);
-	PlanetV6.SetExcludeMixedTrianglesForTest(false);
-	PlanetV6.SetV9Phase1AuthorityForTest(true, 1);
-	PlanetV6.SetV9Phase1ActiveZoneClassifierModeForTest(
-		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-	PlanetV6.SetV9Phase1PersistentActivePairHorizonForTest(2);
-	PlanetV6.SetV9CollisionShadowForTest(true);
-	PlanetV6.SetV9CollisionExecutionForTest(true);
-	PlanetV6.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-	PlanetV6.SetV9CollisionExecutionStructuralTransferForTest(true);
-	PlanetV6.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-	PlanetV6.SetV9ThesisShapedCollisionExecutionForTest(true);
-	PlanetV6.SetV9QuietInteriorContinentalRetentionForTest(true);
-	PlanetV6.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-	PlanetV6.SetAutomaticRiftingForTest(bEnableStochasticRifting);
-}
-
 void ATectonicPlanetV6PreviewActor::Generate()
 {
 #if WITH_EDITOR
@@ -120,13 +190,16 @@ void ATectonicPlanetV6PreviewActor::Generate()
 		BoundaryWarpAmplitude,
 		ContinentalFraction,
 		PlanetRadiusKm);
-	ConfigureKeptCandidateDefaults();
+	FTectonicPlanetV6KeptRuntimeProfileOptions RuntimeOptions;
+	RuntimeOptions.bEnableAutomaticRifting = bEnableStochasticRifting;
+	PlanetV6.ApplyKeptV6RuntimeProfile(RuntimeOptions);
+	PlanetV6.ApplyKeptV6DiagnosticsProfile(BuildV6PreviewKeptDiagnosticsOptions());
 	bInitialized = true;
 
 	UE_LOG(LogTemp, Log,
-		TEXT("TectonicPlanetV6Preview: Generated. samples=%d plates=%d seed=%d solve_mode=ThesisPartitionedFrontierProcess cadence=16 retention=ON rifting=%s"),
+		TEXT("TectonicPlanetV6Preview: Generated. samples=%d plates=%d seed=%d %s"),
 		SampleCount, PlateCount, RandomSeed,
-		bEnableStochasticRifting ? TEXT("ON") : TEXT("OFF"));
+		*GetRuntimeConfigSummary());
 
 	UpdateStatusReadout();
 	BuildMesh();
@@ -217,6 +290,19 @@ void ATectonicPlanetV6PreviewActor::AdvanceSteps(const int32 StepCount)
 
 void ATectonicPlanetV6PreviewActor::ShowElevation()
 {
+	ShowElevationRaw();
+}
+
+void ATectonicPlanetV6PreviewActor::ShowElevationRaw()
+{
+	ElevationPresentationMode = ETectonicElevationPresentationMode::Raw;
+	VisualizationMode = ETectonicMapExportMode::Elevation;
+	if (bInitialized) { BuildMesh(); }
+}
+
+void ATectonicPlanetV6PreviewActor::ShowElevationEnhanced()
+{
+	ElevationPresentationMode = ETectonicElevationPresentationMode::Enhanced;
 	VisualizationMode = ETectonicMapExportMode::Elevation;
 	if (bInitialized) { BuildMesh(); }
 }
@@ -258,11 +344,6 @@ void ATectonicPlanetV6PreviewActor::SetShowPlateBoundaries(const bool bShow)
 {
 	bShowPlateBoundaries = bShow;
 	RefreshDebugOverlays();
-}
-
-void ATectonicPlanetV6PreviewActor::SetShowBoundaryTypes(const bool /*bShow*/)
-{
-	// Boundary-type debug visualization is not implemented on the V6 preview actor yet.
 }
 
 bool ATectonicPlanetV6PreviewActor::ExportCurrentMaps(
@@ -462,6 +543,16 @@ void ATectonicPlanetV6PreviewActor::BuildMesh()
 		return;
 	}
 
+	TArray<float> DisplayElevations;
+	const bool bNeedEnhancedDisplayElevations =
+		ElevationPresentationMode == ETectonicElevationPresentationMode::Enhanced &&
+		(VisualizationMode == ETectonicMapExportMode::Elevation ||
+			(bDisplaceByElevation && bUseEnhancedElevationForDisplacement));
+	if (bNeedEnhancedDisplayElevations)
+	{
+		BuildEnhancedPreviewDisplayElevations(Planet, DisplayElevations);
+	}
+
 	FRealtimeMeshStreamSet StreamSet;
 	TRealtimeMeshBuilderLocal<uint32, FPackedNormal, FVector2DHalf, 1> Builder(StreamSet);
 	Builder.EnableTangents();
@@ -485,12 +576,26 @@ void ATectonicPlanetV6PreviewActor::BuildMesh()
 		double VertexRadius = RenderRadius;
 		if (bDisplaceByElevation)
 		{
-			VertexRadius += static_cast<double>(Sample.Elevation) * VisualScale * ElevationDisplacementScale;
+			const float DisplacementElevationKm =
+				(bNeedEnhancedDisplayElevations && bUseEnhancedElevationForDisplacement)
+					? DisplayElevations[&Sample - Planet.Samples.GetData()]
+					: Sample.Elevation;
+			VertexRadius += static_cast<double>(DisplacementElevationKm) * VisualScale * ElevationDisplacementScale;
 		}
+
+		const int32 SampleIndex = &Sample - Planet.Samples.GetData();
+		const float DisplayElevationKm =
+			bNeedEnhancedDisplayElevations
+				? DisplayElevations[SampleIndex]
+				: Sample.Elevation;
 
 		Builder.AddVertex(FVector3f(Normal * VertexRadius))
 			.SetNormalAndTangent(FVector3f(Normal), FVector3f(Tangent))
-			.SetColor(GetV6VisualizationColor(Sample, VisualizationMode));
+			.SetColor(GetV6VisualizationColor(
+				Sample,
+				VisualizationMode,
+				ElevationPresentationMode,
+				DisplayElevationKm));
 	}
 
 	for (const FIntVector& Triangle : Planet.TriangleIndices)
