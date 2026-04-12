@@ -59,6 +59,94 @@ namespace
 		Planet.ApplyKeptV6DiagnosticsProfile(DiagnosticsOptions);
 	}
 
+	FTectonicPlanetV6LegacyHarnessConfig MakeLegacyFrontierComparisonConfig(
+		const bool bEnableSyntheticCoverageRetention = false,
+		const bool bEnableWholeTriangleBoundaryDuplication = false,
+		const bool bEnableExcludeMixedTriangles = false,
+		const bool bEnablePerTimestepContainmentSoupRebuild = false)
+	{
+		FTectonicPlanetV6LegacyHarnessConfig Config;
+		Config.bEnableSyntheticCoverageRetention = bEnableSyntheticCoverageRetention;
+		Config.bEnableWholeTriangleBoundaryDuplication = bEnableWholeTriangleBoundaryDuplication;
+		Config.bEnableExcludeMixedTriangles = bEnableExcludeMixedTriangles;
+		Config.bEnablePerTimestepContainmentSoupRebuild = bEnablePerTimestepContainmentSoupRebuild;
+		return Config;
+	}
+
+	FTectonicPlanetV6LegacyHarnessConfig MakeLegacyPhase1ComparisonConfig(
+		const int32 ActiveBoundaryRingCount = 1,
+		const ETectonicPlanetV6ActiveZoneClassifierMode ClassifierMode =
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission,
+		const int32 PersistenceHorizon = 2,
+		const bool bEnableSyntheticCoverageRetention = false,
+		const bool bEnableWholeTriangleBoundaryDuplication = false,
+		const bool bEnableExcludeMixedTriangles = false,
+		const bool bEnablePerTimestepContainmentSoupRebuild = false,
+		const bool bUseLinearConvergentMaintenanceSpeedFactor = true,
+		const bool bUseLinearConvergentMaintenanceInfluence = true)
+	{
+		FTectonicPlanetV6LegacyHarnessConfig Config;
+		Config.bEnableSyntheticCoverageRetention = bEnableSyntheticCoverageRetention;
+		Config.bEnableWholeTriangleBoundaryDuplication = bEnableWholeTriangleBoundaryDuplication;
+		Config.bEnableExcludeMixedTriangles = bEnableExcludeMixedTriangles;
+		Config.bEnablePerTimestepContainmentSoupRebuild = bEnablePerTimestepContainmentSoupRebuild;
+		Config.bEnableV9Phase1Authority = true;
+		Config.V9Phase1ActiveBoundaryRingCount = ActiveBoundaryRingCount;
+		Config.V9Phase1ActiveZoneClassifierMode = ClassifierMode;
+		Config.V9Phase1PersistentActivePairHorizon = PersistenceHorizon;
+		Config.bUseLinearConvergentMaintenanceSpeedFactor =
+			bUseLinearConvergentMaintenanceSpeedFactor;
+		Config.bUseLinearConvergentMaintenanceInfluence =
+			bUseLinearConvergentMaintenanceInfluence;
+		return Config;
+	}
+
+	FTectonicPlanetV6LegacyHarnessConfig MakeLegacyKeptComparisonConfig(
+		const bool bEnableAutomaticRifting = true,
+		const bool bEnablePaperSurrogateOwnership = true,
+		const ETectonicPlanetV6PaperSurrogateFieldMode FieldMode =
+			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation,
+		const bool bEnableShoulderFix = false,
+		const bool bEnableV9CollisionShadow = true,
+		const bool bEnableV9CollisionExecution = true,
+		const bool bEnableV9CollisionExecutionEnhancedConsequences = true,
+		const bool bEnableV9CollisionExecutionStructuralTransfer = true,
+		const bool bEnableV9CollisionExecutionRefinedStructuralTransfer = true,
+		const bool bEnableV9ThesisShapedCollisionExecution = true,
+		const bool bEnableV9ThesisShapedCollisionRidgeSurge = false,
+		const bool bEnableV9QuietInteriorContinentalRetention = true,
+		const bool bEnableV9ContinentalBreadthPreservation = false,
+		const bool bEnableSubmergedContinentalRelaxation = true,
+		const double SubmergedContinentalRelaxationRatePerStep = 0.005)
+	{
+		FTectonicPlanetV6LegacyHarnessConfig Config = MakeLegacyPhase1ComparisonConfig();
+		Config.bEnableV9CollisionShadow = bEnableV9CollisionShadow;
+		Config.bEnableV9CollisionExecution = bEnableV9CollisionExecution;
+		Config.bEnableV9CollisionExecutionEnhancedConsequences =
+			bEnableV9CollisionExecutionEnhancedConsequences;
+		Config.bEnableV9CollisionExecutionStructuralTransfer =
+			bEnableV9CollisionExecutionStructuralTransfer;
+		Config.bEnableV9CollisionExecutionRefinedStructuralTransfer =
+			bEnableV9CollisionExecutionRefinedStructuralTransfer;
+		Config.bEnableV9ThesisShapedCollisionExecution =
+			bEnableV9ThesisShapedCollisionExecution;
+		Config.bEnableV9ThesisShapedCollisionRidgeSurge =
+			bEnableV9ThesisShapedCollisionRidgeSurge;
+		Config.bEnableV9QuietInteriorContinentalRetention =
+			bEnableV9QuietInteriorContinentalRetention;
+		Config.bEnableV9ContinentalBreadthPreservation =
+			bEnableV9ContinentalBreadthPreservation;
+		Config.bEnableSubmergedContinentalRelaxation =
+			bEnableSubmergedContinentalRelaxation;
+		Config.SubmergedContinentalRelaxationRatePerStep =
+			SubmergedContinentalRelaxationRatePerStep;
+		Config.bEnableV9SubmergedContinentalFringeRelaxation = bEnableShoulderFix;
+		Config.bEnableAutomaticRifting = bEnableAutomaticRifting;
+		Config.bEnableV9PaperSurrogateOwnership = bEnablePaperSurrogateOwnership;
+		Config.V9PaperSurrogateFieldMode = FieldMode;
+		return Config;
+	}
+
 	struct FV6CheckpointSnapshot
 	{
 		int32 Step = 0;
@@ -3709,28 +3797,28 @@ namespace
 		FTectonicPlanetV6& Planet,
 		const bool bUseThesisScaleRelief)
 	{
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+		Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyPhase1ComparisonConfig(
+				1,
+				ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission,
+				2,
+				false,
+				false,
+				false,
+				false,
+				bUseThesisScaleRelief,
+				bUseThesisScaleRelief));
 
 		FTectonicPlanet& LegacyPlanet = Planet.GetPlanetMutable();
 		if (bUseThesisScaleRelief)
 		{
 			LegacyPlanet.SubductionBaseUpliftKmPerMyForTest = -1.0;
 			LegacyPlanet.bDisableSubductionElevationTransferForTest = false;
-			Planet.SetUseLinearConvergentMaintenanceSpeedFactorForTest(true);
-			Planet.SetUseLinearConvergentMaintenanceInfluenceForTest(true);
 		}
 		else
 		{
 			LegacyPlanet.SubductionBaseUpliftKmPerMyForTest = 0.0006;
 			LegacyPlanet.bDisableSubductionElevationTransferForTest = true;
-			Planet.SetUseLinearConvergentMaintenanceSpeedFactorForTest(false);
-			Planet.SetUseLinearConvergentMaintenanceInfluenceForTest(false);
 		}
 	}
 
@@ -4488,12 +4576,11 @@ bool FTectonicPlanetV6V9Phase1dTightFreshAdmissionClassifierTest::RunTest(const 
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Variant.Planet.SetSyntheticCoverageRetentionForTest(false);
-		Variant.Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Variant.Planet.SetExcludeMixedTrianglesForTest(false);
-		Variant.Planet.SetV9Phase1AuthorityForTest(true, ActiveBoundaryRingCount);
-		Variant.Planet.SetV9Phase1ActiveZoneClassifierModeForTest(ClassifierMode);
-		Variant.Planet.SetV9Phase1PersistentActivePairHorizonForTest(PersistenceHorizon);
+		Variant.Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyPhase1ComparisonConfig(
+				ActiveBoundaryRingCount,
+				ClassifierMode,
+				PersistenceHorizon));
 
 		Variant.ExportRoot = FPaths::Combine(
 			FPaths::ProjectSavedDir(),
@@ -6771,7 +6858,8 @@ bool FTectonicPlanetV6PartitionedFrontierProcessSyntheticCoverageRetentionExperi
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
 			FixedIntervalSteps);
-		Planet.SetSyntheticCoverageRetentionForTest(bEnableRetention);
+		Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyFrontierComparisonConfig(bEnableRetention));
 
 		const FString SummaryTag = FString::Printf(
 			TEXT("[V6SyntheticRetention mode=%s cadence=%d]"),
@@ -6844,7 +6932,8 @@ bool FTectonicPlanetV6PartitionedFrontierProcessSyntheticCoverageRetentionValida
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
 			FixedIntervalSteps);
-		Planet.SetSyntheticCoverageRetentionForTest(bEnableRetention);
+		Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyFrontierComparisonConfig(bEnableRetention));
 
 		Result.ExportRoot = FPaths::Combine(
 			FPaths::ProjectSavedDir(),
@@ -6975,8 +7064,8 @@ bool FTectonicPlanetV6ThesisRegimeFalsification60kProcessTest::RunTest(const FSt
 			SampleCount,
 			PlateCount,
 			RandomSeed);
-		Variant.Planet.SetSyntheticCoverageRetentionForTest(false);
-		Variant.Planet.SetWholeTriangleBoundaryDuplicationForTest(true);
+		Variant.Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyFrontierComparisonConfig(false, true));
 
 		Variant.ExportRoot = FPaths::Combine(
 			FPaths::ProjectSavedDir(),
@@ -7153,8 +7242,8 @@ bool FTectonicPlanetV6ThesisRegimeFalsification250k40SpotCheckTest::RunTest(cons
 		SampleCount,
 		PlateCount,
 		TestRandomSeed);
-	Planet.SetSyntheticCoverageRetentionForTest(false);
-	Planet.SetWholeTriangleBoundaryDuplicationForTest(true);
+	Planet.ApplyLegacyHarnessConfigForTest(
+		MakeLegacyFrontierComparisonConfig(false, true));
 
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 	TestTrue(TEXT("250k/40 export root created"), PlatformFile.CreateDirectoryTree(*ExportRoot));
@@ -7287,8 +7376,10 @@ bool FTectonicPlanetV6BoundaryTriangleOwnershipArchitectureABTest::RunTest(const
 		Variant.Planet = CreateInitializedPlanetV6(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
 			FixedIntervalSteps);
-		Variant.Planet.SetSyntheticCoverageRetentionForTest(true);
-		Variant.Planet.SetWholeTriangleBoundaryDuplicationForTest(bWholeTriangleDuplication);
+		Variant.Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyFrontierComparisonConfig(
+				true,
+				bWholeTriangleDuplication));
 		Variant.ExportRoot = FPaths::Combine(
 			FPaths::ProjectSavedDir(),
 			TEXT("MapExports"),
@@ -7603,9 +7694,11 @@ bool FTectonicPlanetV6ThesisRegimeABCMixedTriangleTest::RunTest(const FString& P
 			SampleCount,
 			PlateCount,
 			RandomSeed);
-		Variant.Planet.SetSyntheticCoverageRetentionForTest(false);
-		Variant.Planet.SetWholeTriangleBoundaryDuplicationForTest(bWholeTriangleDuplication);
-		Variant.Planet.SetExcludeMixedTrianglesForTest(bExcludeMixed);
+		Variant.Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyFrontierComparisonConfig(
+				false,
+				bWholeTriangleDuplication,
+				bExcludeMixed));
 
 		Variant.ExportRoot = FPaths::Combine(
 			FPaths::ProjectSavedDir(),
@@ -7719,7 +7812,8 @@ bool FTectonicPlanetV6ThesisRegime250k40SpotTest::RunTest(const FString& Paramet
 		250000,
 		40,
 		TestRandomSeed);
-	Planet.SetSyntheticCoverageRetentionForTest(false);
+	Planet.ApplyLegacyHarnessConfigForTest(
+		MakeLegacyFrontierComparisonConfig(false));
 
 	Planet.AdvanceSteps(25);
 
@@ -7764,10 +7858,12 @@ bool FTectonicPlanetV6ThesisImplementationFaithfulnessAuditTest::RunTest(const F
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Variant.Planet.SetSyntheticCoverageRetentionForTest(false);
-		Variant.Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Variant.Planet.SetExcludeMixedTrianglesForTest(false);
-		Variant.Planet.SetPerTimestepContainmentSoupRebuildForTest(bPerStepBVHRebuild);
+		Variant.Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyFrontierComparisonConfig(
+				false,
+				false,
+				false,
+				bPerStepBVHRebuild));
 		return Variant;
 	};
 
@@ -7856,9 +7952,8 @@ bool FTectonicPlanetV6ThesisImplementationFaithfulnessAuditTest::RunTest(const F
 		100,
 		3,
 		TestRandomSeed);
-	SmallPlanet.SetSyntheticCoverageRetentionForTest(false);
-	SmallPlanet.SetWholeTriangleBoundaryDuplicationForTest(false);
-	SmallPlanet.SetExcludeMixedTrianglesForTest(false);
+	SmallPlanet.ApplyLegacyHarnessConfigForTest(
+		MakeLegacyFrontierComparisonConfig(false, false, false));
 	SmallPlanet.AdvanceSteps(25);
 	SmallPlanet.GetPlanetMutable().BuildContainmentSoups();
 	const FV6CheckpointSnapshot SmallStep25Snapshot = BuildV6CheckpointSnapshot(SmallPlanet);
@@ -7911,10 +8006,11 @@ bool FTectonicPlanetV6V9Phase1AuthorityClassifierTest::RunTest(const FString& Pa
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Variant.Planet.SetSyntheticCoverageRetentionForTest(false);
-		Variant.Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Variant.Planet.SetExcludeMixedTrianglesForTest(false);
-		Variant.Planet.SetV9Phase1AuthorityForTest(bEnablePhase1, ActiveBoundaryRingCount);
+		FTectonicPlanetV6LegacyHarnessConfig Config =
+			MakeLegacyFrontierComparisonConfig(false, false, false);
+		Config.bEnableV9Phase1Authority = bEnablePhase1;
+		Config.V9Phase1ActiveBoundaryRingCount = ActiveBoundaryRingCount;
+		Variant.Planet.ApplyLegacyHarnessConfigForTest(Config);
 
 		Variant.ExportRoot = FPaths::Combine(
 			FPaths::ProjectSavedDir(),
@@ -8103,11 +8199,10 @@ bool FTectonicPlanetV6V9Phase1bNarrowClassifierTest::RunTest(const FString& Para
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Variant.Planet.SetSyntheticCoverageRetentionForTest(false);
-		Variant.Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Variant.Planet.SetExcludeMixedTrianglesForTest(false);
-		Variant.Planet.SetV9Phase1AuthorityForTest(true, ActiveBoundaryRingCount);
-		Variant.Planet.SetV9Phase1ActiveZoneClassifierModeForTest(ClassifierMode);
+		Variant.Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyPhase1ComparisonConfig(
+				ActiveBoundaryRingCount,
+				ClassifierMode));
 
 		Variant.ExportRoot = FPaths::Combine(
 			FPaths::ProjectSavedDir(),
@@ -8314,12 +8409,11 @@ bool FTectonicPlanetV6V9Phase1cPersistentClassifierTest::RunTest(const FString& 
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Variant.Planet.SetSyntheticCoverageRetentionForTest(false);
-		Variant.Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Variant.Planet.SetExcludeMixedTrianglesForTest(false);
-		Variant.Planet.SetV9Phase1AuthorityForTest(true, ActiveBoundaryRingCount);
-		Variant.Planet.SetV9Phase1ActiveZoneClassifierModeForTest(ClassifierMode);
-		Variant.Planet.SetV9Phase1PersistentActivePairHorizonForTest(PersistenceHorizon);
+		Variant.Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyPhase1ComparisonConfig(
+				ActiveBoundaryRingCount,
+				ClassifierMode,
+				PersistenceHorizon));
 
 		Variant.ExportRoot = FPaths::Combine(
 			FPaths::ProjectSavedDir(),
@@ -8623,13 +8717,8 @@ bool FTectonicPlanetV6V9Phase1dStep200ValidationTest::RunTest(const FString& Par
 		SampleCount,
 		PlateCount,
 		TestRandomSeed);
-	Planet.SetSyntheticCoverageRetentionForTest(false);
-	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-	Planet.SetExcludeMixedTrianglesForTest(false);
-	Planet.SetV9Phase1AuthorityForTest(true, 1);
-	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+	Planet.ApplyLegacyHarnessConfigForTest(
+		MakeLegacyPhase1ComparisonConfig());
 
 	const FString ExportRoot = FPaths::Combine(
 		FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
@@ -8682,13 +8771,8 @@ bool FTectonicPlanetV6V9ElevationBudgetAlignmentStep100Test::RunTest(const FStri
 		SampleCount,
 		PlateCount,
 		TestRandomSeed);
-	Planet.SetSyntheticCoverageRetentionForTest(false);
-	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-	Planet.SetExcludeMixedTrianglesForTest(false);
-	Planet.SetV9Phase1AuthorityForTest(true, 1);
-	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+	Planet.ApplyLegacyHarnessConfigForTest(
+		MakeLegacyPhase1ComparisonConfig());
 
 	Planet.AdvanceSteps(100);
 
@@ -9066,14 +9150,11 @@ bool FTectonicPlanetV6V9Phase1dCollisionShadowValidationTest::RunTest(const FStr
 		SampleCount,
 		PlateCount,
 		TestRandomSeed);
-	Planet.SetSyntheticCoverageRetentionForTest(false);
-	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-	Planet.SetExcludeMixedTrianglesForTest(false);
-	Planet.SetV9Phase1AuthorityForTest(true, 1);
-	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-	Planet.SetV9CollisionShadowForTest(true);
+	{
+		FTectonicPlanetV6LegacyHarnessConfig Config = MakeLegacyPhase1ComparisonConfig();
+		Config.bEnableV9CollisionShadow = true;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
+	}
 
 	const FString ExportRoot = FPaths::Combine(
 		FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
@@ -9133,15 +9214,12 @@ bool FTectonicPlanetV6V9Phase1dCollisionExecutionValidationTest::RunTest(const F
 		SampleCount,
 		PlateCount,
 		TestRandomSeed);
-	Planet.SetSyntheticCoverageRetentionForTest(false);
-	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-	Planet.SetExcludeMixedTrianglesForTest(false);
-	Planet.SetV9Phase1AuthorityForTest(true, 1);
-	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-	Planet.SetV9CollisionShadowForTest(true);
-	Planet.SetV9CollisionExecutionForTest(true);
+	{
+		FTectonicPlanetV6LegacyHarnessConfig Config = MakeLegacyPhase1ComparisonConfig();
+		Config.bEnableV9CollisionShadow = true;
+		Config.bEnableV9CollisionExecution = true;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
+	}
 
 	const FString ExportRoot = FPaths::Combine(
 		FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
@@ -9193,7 +9271,7 @@ bool FTectonicPlanetV6V9Phase1dCollisionConsequenceFidelityValidationTest::RunTe
 	constexpr int32 PlateCount = 40;
 	const FString RunId = TEXT("V9Phase1dCollisionConsequenceFidelityValidation");
 
-	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	const auto InitializePlanet = [&](const bool bEnableEnhancedConsequences) -> FTectonicPlanetV6
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
@@ -9202,23 +9280,16 @@ bool FTectonicPlanetV6V9Phase1dCollisionConsequenceFidelityValidationTest::RunTe
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
+		FTectonicPlanetV6LegacyHarnessConfig Config = MakeLegacyPhase1ComparisonConfig();
+		Config.bEnableV9CollisionShadow = true;
+		Config.bEnableV9CollisionExecution = true;
+		Config.bEnableV9CollisionExecutionEnhancedConsequences = bEnableEnhancedConsequences;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
 		return Planet;
 	};
 
-	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
-	BaselinePlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(false);
-
-	FTectonicPlanetV6 FidelityPlanet = InitializePlanet();
-	FidelityPlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet(false);
+	FTectonicPlanetV6 FidelityPlanet = InitializePlanet(true);
 
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 	const FString ExportRoot = FPaths::Combine(
@@ -9348,7 +9419,7 @@ bool FTectonicPlanetV6V9Phase1dCollisionFidelityTuningHarnessTest::RunTest(const
 	constexpr int32 PlateCount = 40;
 	const FString RunId = TEXT("V9Phase1dCollisionFidelityTuningHarness");
 
-	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	const auto InitializePlanet = [&](const bool bEnableEnhancedConsequences) -> FTectonicPlanetV6
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
@@ -9357,23 +9428,16 @@ bool FTectonicPlanetV6V9Phase1dCollisionFidelityTuningHarnessTest::RunTest(const
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
+		FTectonicPlanetV6LegacyHarnessConfig Config = MakeLegacyPhase1ComparisonConfig();
+		Config.bEnableV9CollisionShadow = true;
+		Config.bEnableV9CollisionExecution = true;
+		Config.bEnableV9CollisionExecutionEnhancedConsequences = bEnableEnhancedConsequences;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
 		return Planet;
 	};
 
-	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
-	BaselinePlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(false);
-
-	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
-	CandidatePlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet(false);
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet(true);
 
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 	const FString ExportRoot = FPaths::Combine(
@@ -9537,7 +9601,7 @@ bool FTectonicPlanetV6V9Phase1dCollisionStructuralTransferTuningHarnessTest::Run
 	constexpr int32 PlateCount = 40;
 	const FString RunId = TEXT("V9Phase1dCollisionStructuralTransferTuningHarness");
 
-	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	const auto InitializePlanet = [&](const bool bEnableStructuralTransfer) -> FTectonicPlanetV6
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
@@ -9546,24 +9610,17 @@ bool FTectonicPlanetV6V9Phase1dCollisionStructuralTransferTuningHarnessTest::Run
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(false);
+		FTectonicPlanetV6LegacyHarnessConfig Config = MakeLegacyPhase1ComparisonConfig();
+		Config.bEnableV9CollisionShadow = true;
+		Config.bEnableV9CollisionExecution = true;
+		Config.bEnableV9CollisionExecutionEnhancedConsequences = false;
+		Config.bEnableV9CollisionExecutionStructuralTransfer = bEnableStructuralTransfer;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
 		return Planet;
 	};
 
-	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
-	BaselinePlanet.SetV9CollisionExecutionStructuralTransferForTest(false);
-
-	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
-	CandidatePlanet.SetV9CollisionExecutionStructuralTransferForTest(true);
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet(false);
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet(true);
 
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 	const FString ExportRoot = FPaths::Combine(
@@ -9751,7 +9808,7 @@ bool FTectonicPlanetV6V9Phase1dTerraneCaptureRefinementTuningHarnessTest::RunTes
 	constexpr int32 PlateCount = 40;
 	const FString RunId = TEXT("V9Phase1dTerraneCaptureRefinementTuningHarness");
 
-	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	const auto InitializePlanet = [&](const bool bEnableRefinedStructuralTransfer) -> FTectonicPlanetV6
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
@@ -9760,25 +9817,19 @@ bool FTectonicPlanetV6V9Phase1dTerraneCaptureRefinementTuningHarnessTest::RunTes
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(false);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
+		FTectonicPlanetV6LegacyHarnessConfig Config = MakeLegacyPhase1ComparisonConfig();
+		Config.bEnableV9CollisionShadow = true;
+		Config.bEnableV9CollisionExecution = true;
+		Config.bEnableV9CollisionExecutionEnhancedConsequences = false;
+		Config.bEnableV9CollisionExecutionStructuralTransfer = true;
+		Config.bEnableV9CollisionExecutionRefinedStructuralTransfer =
+			bEnableRefinedStructuralTransfer;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
 		return Planet;
 	};
 
-	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
-	BaselinePlanet.SetV9CollisionExecutionRefinedStructuralTransferForTest(false);
-
-	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
-	CandidatePlanet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet(false);
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet(true);
 
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 	const FString ExportRoot = FPaths::Combine(
@@ -9970,7 +10021,7 @@ bool FTectonicPlanetV6V9HighReliefCollisionRidgeSurgeHarnessTest::RunTest(
 	constexpr int32 PlateCount = 40;
 	const FString RunId = TEXT("V9HighReliefCollisionRidgeSurgeHarness");
 
-	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	const auto InitializePlanet = [&](const bool bEnableRidgeSurge) -> FTectonicPlanetV6
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
@@ -9979,30 +10030,20 @@ bool FTectonicPlanetV6V9HighReliefCollisionRidgeSurgeHarnessTest::RunTest(
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
+		FTectonicPlanetV6LegacyHarnessConfig Config = MakeLegacyPhase1ComparisonConfig();
+		Config.bEnableV9CollisionShadow = true;
+		Config.bEnableV9CollisionExecution = true;
+		Config.bEnableV9CollisionExecutionEnhancedConsequences = true;
+		Config.bEnableV9CollisionExecutionStructuralTransfer = true;
+		Config.bEnableV9CollisionExecutionRefinedStructuralTransfer = true;
+		Config.bEnableV9ThesisShapedCollisionExecution = true;
+		Config.bEnableV9ThesisShapedCollisionRidgeSurge = bEnableRidgeSurge;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
 		return Planet;
 	};
 
-	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
-	BaselinePlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-	BaselinePlanet.SetV9CollisionExecutionStructuralTransferForTest(true);
-	BaselinePlanet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-	BaselinePlanet.SetV9ThesisShapedCollisionExecutionForTest(true);
-
-	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
-	CandidatePlanet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-	CandidatePlanet.SetV9CollisionExecutionStructuralTransferForTest(true);
-	CandidatePlanet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-	CandidatePlanet.SetV9ThesisShapedCollisionExecutionForTest(true);
-	CandidatePlanet.SetV9ThesisShapedCollisionRidgeSurgeForTest(true);
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet(false);
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet(true);
 
 	const FString ExportRoot = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
 	const FString BaselineExportRoot = FPaths::Combine(ExportRoot, TEXT("baseline_current_thesis"));
@@ -10285,19 +10326,20 @@ bool FTectonicPlanetV6V9Step200ThesisSurgeValidationTest::RunTest(const FString&
 		SampleCount,
 		PlateCount,
 		TestRandomSeed);
-	Planet.SetSyntheticCoverageRetentionForTest(false);
-	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-	Planet.SetExcludeMixedTrianglesForTest(false);
-	Planet.SetV9Phase1AuthorityForTest(true, 1);
-	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-	Planet.SetV9CollisionShadowForTest(true);
-	Planet.SetV9CollisionExecutionForTest(true);
-	Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-	Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-	Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-	Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
+	Planet.ApplyLegacyHarnessConfigForTest(
+		MakeLegacyKeptComparisonConfig(
+			false,
+			false,
+			ETectonicPlanetV6PaperSurrogateFieldMode::FullState,
+			false,
+			true,
+			true,
+			true,
+			true,
+			false,
+			false,
+			false,
+			false));
 	// Ridge surge OFF — paper-faithful radial biweight kernel (default)
 
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
@@ -10645,20 +10687,14 @@ bool FTectonicPlanetV6V9RiftingIntegrationHarnessTest::RunTest(const FString& Pa
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetAutomaticRiftingForTest(bEnableAutomaticRifting);
+		FTectonicPlanetV6LegacyHarnessConfig Config =
+			MakeLegacyKeptComparisonConfig(
+				bEnableAutomaticRifting,
+				false,
+				ETectonicPlanetV6PaperSurrogateFieldMode::FullState);
+		Config.bEnableV9QuietInteriorContinentalRetention = false;
+		Config.bEnableSubmergedContinentalRelaxation = false;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
 		return Planet;
 	};
 
@@ -11057,20 +11093,14 @@ bool FTectonicPlanetV6V9ForcedRiftValidationHarnessTest::RunTest(const FString& 
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetAutomaticRiftingForTest(false);
+		FTectonicPlanetV6LegacyHarnessConfig Config =
+			MakeLegacyKeptComparisonConfig(
+				false,
+				false,
+				ETectonicPlanetV6PaperSurrogateFieldMode::FullState);
+		Config.bEnableV9QuietInteriorContinentalRetention = false;
+		Config.bEnableSubmergedContinentalRelaxation = false;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
 		return Planet;
 	};
 
@@ -11335,7 +11365,7 @@ bool FTectonicPlanetV6V9ContinentalMassAuditTest::RunTest(const FString& Paramet
 	constexpr int32 ForcedRiftSeed = 17017;
 	const FString RunId = TEXT("V9ContinentalMassAudit");
 
-	const auto InitializePlanet = [&]() -> FTectonicPlanetV6
+	const auto InitializePlanet = [&](const bool bEnableQuietInteriorRetention) -> FTectonicPlanetV6
 	{
 		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
 			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
@@ -11344,26 +11374,19 @@ bool FTectonicPlanetV6V9ContinentalMassAuditTest::RunTest(const FString& Paramet
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetAutomaticRiftingForTest(false);
+		FTectonicPlanetV6LegacyHarnessConfig Config =
+			MakeLegacyKeptComparisonConfig(
+				false,
+				false,
+				ETectonicPlanetV6PaperSurrogateFieldMode::FullState);
+		Config.bEnableV9QuietInteriorContinentalRetention = bEnableQuietInteriorRetention;
+		Config.bEnableSubmergedContinentalRelaxation = false;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
 		return Planet;
 	};
 
-	FTectonicPlanetV6 BaselinePlanet = InitializePlanet();
-	FTectonicPlanetV6 CandidatePlanet = InitializePlanet();
-	CandidatePlanet.SetV9QuietInteriorContinentalRetentionForTest(true);
+	FTectonicPlanetV6 BaselinePlanet = InitializePlanet(false);
+	FTectonicPlanetV6 CandidatePlanet = InitializePlanet(true);
 
 	const FString ExportRoot = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
 	const FString BaselineExportRoot = FPaths::Combine(ExportRoot, TEXT("baseline"));
@@ -11591,23 +11614,13 @@ bool FTectonicPlanetV6V9ContinentalBreadthPreservationTest::RunTest(const FStrin
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(bEnableBreadthPreservation);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetAutomaticRiftingForTest(true);
+		FTectonicPlanetV6LegacyHarnessConfig Config =
+			MakeLegacyKeptComparisonConfig(
+				true,
+				false,
+				ETectonicPlanetV6PaperSurrogateFieldMode::FullState);
+		Config.bEnableV9ContinentalBreadthPreservation = bEnableBreadthPreservation;
+		Planet.ApplyLegacyHarnessConfigForTest(Config);
 		return Planet;
 	};
 
@@ -11977,22 +11990,11 @@ bool FTectonicPlanetV6V9LongRunValidationTest::RunTest(const FString& Parameters
 		SampleCount,
 		PlateCount,
 		TestRandomSeed);
-	Planet.SetSyntheticCoverageRetentionForTest(false);
-	Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-	Planet.SetExcludeMixedTrianglesForTest(false);
-	Planet.SetV9Phase1AuthorityForTest(true, 1);
-	Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-		ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-	Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-	Planet.SetV9CollisionShadowForTest(true);
-	Planet.SetV9CollisionExecutionForTest(true);
-	Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-	Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-	Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-	Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-	Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-	Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-	Planet.SetAutomaticRiftingForTest(true);
+	Planet.ApplyLegacyHarnessConfigForTest(
+		MakeLegacyKeptComparisonConfig(
+			true,
+			false,
+			ETectonicPlanetV6PaperSurrogateFieldMode::FullState));
 
 	const FString ExportRoot = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
@@ -12174,24 +12176,11 @@ bool FTectonicPlanetV6V9PaperSurrogateOwnershipTest::RunTest(const FString& Para
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(bEnablePaperSurrogate);
+		Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyKeptComparisonConfig(
+				true,
+				bEnablePaperSurrogate,
+				ETectonicPlanetV6PaperSurrogateFieldMode::FullState));
 		return Planet;
 	};
 
@@ -12745,25 +12734,11 @@ bool FTectonicPlanetV6V9PaperSurrogateFieldBundleRefinementTest::RunTest(const F
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(Config.bEnablePaperSurrogate);
-		Planet.SetV9PaperSurrogateFieldModeForTest(Config.FieldMode);
+		Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyKeptComparisonConfig(
+				true,
+				Config.bEnablePaperSurrogate,
+				Config.FieldMode));
 		return Planet;
 	};
 
@@ -13370,25 +13345,11 @@ bool FTectonicPlanetV6V9PaperSurrogateSelectiveElevationRefinementTest::RunTest(
 			SampleCount,
 			PlateCount,
 			TestRandomSeed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(Config.bEnablePaperSurrogate);
-		Planet.SetV9PaperSurrogateFieldModeForTest(Config.FieldMode);
+		Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyKeptComparisonConfig(
+				true,
+				Config.bEnablePaperSurrogate,
+				Config.FieldMode));
 		return Planet;
 	};
 
@@ -13911,25 +13872,11 @@ bool FTectonicPlanetV6V9PaperSelectiveElevationConfirmationAndRobustnessTest::Ru
 			SampleCount,
 			PlateCount,
 			Seed);
-		Planet.SetSyntheticCoverageRetentionForTest(false);
-		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
-		Planet.SetExcludeMixedTrianglesForTest(false);
-		Planet.SetV9Phase1AuthorityForTest(true, 1);
-		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
-			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
-		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
-		Planet.SetV9CollisionShadowForTest(true);
-		Planet.SetV9CollisionExecutionForTest(true);
-		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
-		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
-		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
-		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
-		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
-		Planet.SetV9ContinentalBreadthPreservationForTest(false);
-		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
-		Planet.SetAutomaticRiftingForTest(true);
-		Planet.SetV9PaperSurrogateOwnershipForTest(bEnablePaperSurrogate);
-		Planet.SetV9PaperSurrogateFieldModeForTest(FieldMode);
+		Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyKeptComparisonConfig(
+				true,
+				bEnablePaperSurrogate,
+				FieldMode));
 		Planet.ApplyKeptV6DiagnosticsProfile(MakeKeptV6DiagnosticsOptions(false, false));
 		return Planet;
 	};

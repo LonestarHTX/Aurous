@@ -124,6 +124,39 @@ struct AUROUS_API FTectonicPlanetV6KeptDiagnosticsOptions
 	bool bEnableDetailedCopiedFrontierAttribution = true;
 };
 
+struct AUROUS_API FTectonicPlanetV6LegacyHarnessConfig
+{
+	bool bEnableSyntheticCoverageRetention = false;
+	bool bEnableWholeTriangleBoundaryDuplication = false;
+	bool bEnableExcludeMixedTriangles = false;
+	bool bEnablePerTimestepContainmentSoupRebuild = false;
+	bool bEnableV9Phase1Authority = false;
+	int32 V9Phase1ActiveBoundaryRingCount = 1;
+	ETectonicPlanetV6ActiveZoneClassifierMode V9Phase1ActiveZoneClassifierMode =
+		ETectonicPlanetV6ActiveZoneClassifierMode::BroadBoundaryBand;
+	int32 V9Phase1PersistentActivePairHorizon = 2;
+	bool bEnableV9CollisionShadow = false;
+	bool bEnableV9CollisionExecution = false;
+	bool bEnableV9CollisionExecutionEnhancedConsequences = false;
+	bool bEnableV9CollisionExecutionStructuralTransfer = false;
+	bool bEnableV9CollisionExecutionRefinedStructuralTransfer = false;
+	bool bEnableV9ThesisShapedCollisionExecution = false;
+	bool bEnableV9ThesisShapedCollisionRidgeSurge = false;
+	bool bEnableV9QuietInteriorContinentalRetention = false;
+	bool bEnableV9ContinentalBreadthPreservation = false;
+	bool bEnableV9PaperSurrogateOwnership = false;
+	ETectonicPlanetV6PaperSurrogateFieldMode V9PaperSurrogateFieldMode =
+		ETectonicPlanetV6PaperSurrogateFieldMode::FullState;
+	bool bEnableSubmergedContinentalRelaxation = false;
+	double SubmergedContinentalRelaxationRatePerStep = 0.005;
+	bool bEnableV9SubmergedContinentalFringeRelaxation = false;
+	double V9SubmergedContinentalFringeRelaxationRatePerStep = 0.004;
+	double V9SubmergedContinentalFringeBoundaryOrActiveBonusRatePerStep = 0.002;
+	bool bEnableAutomaticRifting = false;
+	bool bUseLinearConvergentMaintenanceSpeedFactor = true;
+	bool bUseLinearConvergentMaintenanceInfluence = true;
+};
+
 struct AUROUS_API FTectonicPlanetV6OwnerCandidate
 {
 	int32 PlateId = INDEX_NONE;
@@ -1291,36 +1324,11 @@ struct AUROUS_API FTectonicPlanetV6
 
 	// Legacy/reference comparison surface retained for active harnesses. This is not part of the
 	// authoritative kept runtime profile and should not be used by editor/runtime callers.
+	void ApplyLegacyHarnessConfigForTest(const FTectonicPlanetV6LegacyHarnessConfig& Config);
 	void SetPeriodicSolveModeForTest(
 		ETectonicPlanetV6PeriodicSolveMode InMode,
 		int32 InFixedIntervalSteps = 25);
-	void SetSyntheticCoverageRetentionForTest(bool bEnable);
-	void SetWholeTriangleBoundaryDuplicationForTest(bool bEnable);
-	void SetExcludeMixedTrianglesForTest(bool bEnable);
-	void SetPerTimestepContainmentSoupRebuildForTest(bool bEnable);
-	void SetV9Phase1AuthorityForTest(bool bEnable, int32 InActiveBoundaryRingCount = 1);
-	void SetV9Phase1ActiveZoneClassifierModeForTest(ETectonicPlanetV6ActiveZoneClassifierMode InMode);
-	void SetV9Phase1PersistentActivePairHorizonForTest(int32 InPersistenceHorizon);
-	void SetV9CollisionShadowForTest(bool bEnable);
-	void SetV9CollisionExecutionForTest(bool bEnable);
-	void SetV9CollisionExecutionEnhancedConsequencesForTest(bool bEnable);
-	void SetV9CollisionExecutionStructuralTransferForTest(bool bEnable);
-	void SetV9CollisionExecutionRefinedStructuralTransferForTest(bool bEnable);
-	void SetV9ThesisShapedCollisionExecutionForTest(bool bEnable);
-	void SetV9ThesisShapedCollisionRidgeSurgeForTest(bool bEnable);
-	void SetV9QuietInteriorContinentalRetentionForTest(bool bEnable);
-	void SetV9ContinentalBreadthPreservationForTest(bool bEnable);
-	void SetV9PaperSurrogateOwnershipForTest(bool bEnable);
-	void SetV9PaperSurrogateFieldModeForTest(ETectonicPlanetV6PaperSurrogateFieldMode InMode);
-	void SetSubmergedContinentalRelaxationForTest(bool bEnable, double RatePerStep = 0.005);
-	void SetV9SubmergedContinentalFringeRelaxationForTest(
-		bool bEnable,
-		double RatePerStep = 0.004,
-		double BoundaryOrActiveBonusRatePerStep = 0.002);
-	void SetAutomaticRiftingForTest(bool bEnable);
 	bool ForceLargestEligibleAutomaticRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
-	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
-	void SetUseLinearConvergentMaintenanceInfluenceForTest(bool bEnableLinear);
 
 	static FTectonicPlanetV6ResolvedSample ResolvePhase1OwnershipForTest(
 		const TArray<FTectonicPlanetV6OwnerCandidate>& OwnerCandidates,
@@ -1373,6 +1381,32 @@ private:
 	void SetDetailedCopiedFrontierAttributionEnabled(bool bEnable);
 	void SetPlateCandidatePruningEnabled(bool bEnable);
 	void SetCopiedFrontierUnfilteredMeshReuseEnabled(bool bEnable);
+	void SetSyntheticCoverageRetentionForTest(bool bEnable);
+	void SetWholeTriangleBoundaryDuplicationForTest(bool bEnable);
+	void SetExcludeMixedTrianglesForTest(bool bEnable);
+	void SetPerTimestepContainmentSoupRebuildForTest(bool bEnable);
+	void SetV9Phase1AuthorityForTest(bool bEnable, int32 InActiveBoundaryRingCount = 1);
+	void SetV9Phase1ActiveZoneClassifierModeForTest(ETectonicPlanetV6ActiveZoneClassifierMode InMode);
+	void SetV9Phase1PersistentActivePairHorizonForTest(int32 InPersistenceHorizon);
+	void SetV9CollisionShadowForTest(bool bEnable);
+	void SetV9CollisionExecutionForTest(bool bEnable);
+	void SetV9CollisionExecutionEnhancedConsequencesForTest(bool bEnable);
+	void SetV9CollisionExecutionStructuralTransferForTest(bool bEnable);
+	void SetV9CollisionExecutionRefinedStructuralTransferForTest(bool bEnable);
+	void SetV9ThesisShapedCollisionExecutionForTest(bool bEnable);
+	void SetV9ThesisShapedCollisionRidgeSurgeForTest(bool bEnable);
+	void SetV9QuietInteriorContinentalRetentionForTest(bool bEnable);
+	void SetV9ContinentalBreadthPreservationForTest(bool bEnable);
+	void SetV9PaperSurrogateOwnershipForTest(bool bEnable);
+	void SetV9PaperSurrogateFieldModeForTest(ETectonicPlanetV6PaperSurrogateFieldMode InMode);
+	void SetSubmergedContinentalRelaxationForTest(bool bEnable, double RatePerStep = 0.005);
+	void SetV9SubmergedContinentalFringeRelaxationForTest(
+		bool bEnable,
+		double RatePerStep = 0.004,
+		double BoundaryOrActiveBonusRatePerStep = 0.002);
+	void SetAutomaticRiftingForTest(bool bEnable);
+	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
+	void SetUseLinearConvergentMaintenanceInfluenceForTest(bool bEnableLinear);
 	void CaptureCopiedFrontierPreSolveState(
 		TArray<int32>& OutPreSolvePlateIds,
 		TArray<uint8>& OutPreSolveContinentalFlags,

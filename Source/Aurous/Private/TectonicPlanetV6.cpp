@@ -21127,6 +21127,48 @@ void FTectonicPlanetV6::ApplyKeptV6DiagnosticsProfile(
 	SetDetailedCopiedFrontierAttributionEnabled(Options.bEnableDetailedCopiedFrontierAttribution);
 }
 
+void FTectonicPlanetV6::ApplyLegacyHarnessConfigForTest(
+	const FTectonicPlanetV6LegacyHarnessConfig& Config)
+{
+	SetSyntheticCoverageRetentionForTest(Config.bEnableSyntheticCoverageRetention);
+	SetWholeTriangleBoundaryDuplicationForTest(Config.bEnableWholeTriangleBoundaryDuplication);
+	SetExcludeMixedTrianglesForTest(Config.bEnableExcludeMixedTriangles);
+	SetPerTimestepContainmentSoupRebuildForTest(Config.bEnablePerTimestepContainmentSoupRebuild);
+	SetV9Phase1AuthorityForTest(
+		Config.bEnableV9Phase1Authority,
+		Config.V9Phase1ActiveBoundaryRingCount);
+	SetV9Phase1ActiveZoneClassifierModeForTest(Config.V9Phase1ActiveZoneClassifierMode);
+	SetV9Phase1PersistentActivePairHorizonForTest(Config.V9Phase1PersistentActivePairHorizon);
+	SetV9CollisionShadowForTest(Config.bEnableV9CollisionShadow);
+	SetV9CollisionExecutionForTest(Config.bEnableV9CollisionExecution);
+	SetV9CollisionExecutionEnhancedConsequencesForTest(
+		Config.bEnableV9CollisionExecutionEnhancedConsequences);
+	SetV9CollisionExecutionStructuralTransferForTest(
+		Config.bEnableV9CollisionExecutionStructuralTransfer);
+	SetV9CollisionExecutionRefinedStructuralTransferForTest(
+		Config.bEnableV9CollisionExecutionRefinedStructuralTransfer);
+	SetV9ThesisShapedCollisionExecutionForTest(Config.bEnableV9ThesisShapedCollisionExecution);
+	SetV9ThesisShapedCollisionRidgeSurgeForTest(Config.bEnableV9ThesisShapedCollisionRidgeSurge);
+	SetV9QuietInteriorContinentalRetentionForTest(
+		Config.bEnableV9QuietInteriorContinentalRetention);
+	SetV9ContinentalBreadthPreservationForTest(
+		Config.bEnableV9ContinentalBreadthPreservation);
+	SetV9PaperSurrogateOwnershipForTest(Config.bEnableV9PaperSurrogateOwnership);
+	SetV9PaperSurrogateFieldModeForTest(Config.V9PaperSurrogateFieldMode);
+	SetSubmergedContinentalRelaxationForTest(
+		Config.bEnableSubmergedContinentalRelaxation,
+		Config.SubmergedContinentalRelaxationRatePerStep);
+	SetV9SubmergedContinentalFringeRelaxationForTest(
+		Config.bEnableV9SubmergedContinentalFringeRelaxation,
+		Config.V9SubmergedContinentalFringeRelaxationRatePerStep,
+		Config.V9SubmergedContinentalFringeBoundaryOrActiveBonusRatePerStep);
+	SetAutomaticRiftingForTest(Config.bEnableAutomaticRifting);
+	SetUseLinearConvergentMaintenanceSpeedFactorForTest(
+		Config.bUseLinearConvergentMaintenanceSpeedFactor);
+	SetUseLinearConvergentMaintenanceInfluenceForTest(
+		Config.bUseLinearConvergentMaintenanceInfluence);
+}
+
 void FTectonicPlanetV6::SetPeriodicSolveModeForTest(
 	const ETectonicPlanetV6PeriodicSolveMode InMode,
 	const int32 InFixedIntervalSteps)
