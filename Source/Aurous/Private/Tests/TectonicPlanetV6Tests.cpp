@@ -14868,3 +14868,684 @@ bool FTectonicPlanetV6V9PerformancePhaseTimingTest::RunTest(const FString& Param
 
 	return true;
 }
+
+// ============================================================================
+// V9 Performance Budget Test
+// Builds an additive wall-clock budget for ordinary steps and periodic solves
+// on the kept selective-elevation candidate. Nested worker timings remain as
+// secondary diagnostics only and are not treated as additive budget numbers.
+// ============================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9PerformanceBudgetTest,
+	"Aurous.TectonicPlanet.V6V9PerformanceBudgetTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9PerformanceBudgetTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 PlateCount = 40;
+	constexpr int32 CanonicalSeed = TestRandomSeed;
+	const TArray<int32> SampleCounts = { 60000, 100000 };
+	const TArray<int32> TimingSolveSteps = { 16, 160 };
+	const TArray<int32> CheckpointSteps = { 100, 200 };
+
+	struct FRunState
+	{
+		int32 SampleCount = 0;
+		FString Label;
+		FTectonicPlanetV6 Planet;
+		TMap<int32, FTectonicPlanetStepBudget> StepBudgets;
+		TMap<int32, FTectonicPlanetV6PeriodicSolveStats> SolveBudgets;
+		TMap<int32, FV6CheckpointSnapshot> Snapshots;
+		TMap<int32, FV9ContinentalMassDiagnostic> MassDiagnostics;
+		TMap<int32, FV9ContinentalElevationStats> ElevationDiagnostics;
+		TMap<int32, FV9SeededContinentalSurvivalDiagnostic> SurvivalDiagnostics;
+		TArray<uint8> Step0ContinentalFlags;
+		TArray<uint8> Step0BroadInteriorFlags;
+		TArray<uint8> Step0CoastAdjacentFlags;
+	};
+
+	struct FStepBudgetAverage
+	{
+		int32 StepCount = 0;
+		double PlateCount = 0.0;
+		double SampleCount = 0.0;
+		double CarriedSampleCount = 0.0;
+		double SubductionSampleCount = 0.0;
+		double AndeanSampleCount = 0.0;
+		double PlateKinematicsMs = 0.0;
+		double SubductionUpliftMs = 0.0;
+		double ContinentalAdjustmentMs = 0.0;
+		double ErosionElevationUpdateMs = 0.0;
+		double CollisionStepMs = 0.0;
+		double CanonicalSyncMs = 0.0;
+		double AutomaticRiftCheckMs = 0.0;
+		double InStepResamplingMs = 0.0;
+		double PendingCollisionFollowupMs = 0.0;
+		double TotalMs = 0.0;
+	};
+
+	struct FPaperBudgetRow
+	{
+		FString PaperBucket;
+		FString AurousBucket;
+		FString PhaseComposition;
+		double PaperSeconds60k = 0.0;
+		double PaperSeconds100k = 0.0;
+		double AurousSeconds60k = 0.0;
+		double AurousSeconds100k = 0.0;
+		FString Caveat;
+	};
+
+	const auto InitializePlanet = [=](const int32 SampleCount)
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+			FixedIntervalSteps,
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			CanonicalSeed);
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+		Planet.SetV9CollisionShadowForTest(true);
+		Planet.SetV9CollisionExecutionForTest(true);
+		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
+		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
+		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
+		Planet.SetV9ContinentalBreadthPreservationForTest(false);
+		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
+		Planet.SetAutomaticRiftingForTest(true);
+		Planet.SetV9PaperSurrogateOwnershipForTest(true);
+		Planet.SetV9PaperSurrogateFieldModeForTest(
+			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation);
+		Planet.SetPhaseTimingForTest(true);
+		Planet.SetDetailedCopiedFrontierAttributionForTest(false);
+		Planet.SetPlateCandidatePruningForTest(true);
+		Planet.GetPlanetMutable().bUseCachedSubductionAdjacencyEdgeDistancesForTest = true;
+		return Planet;
+	};
+
+	const auto BuildSeedFlags = [](
+		const FV9ContinentalMassDiagnostic& Step0Mass,
+		TArray<uint8>& OutStep0ContinentalFlags,
+		TArray<uint8>& OutStep0BroadInteriorFlags,
+		TArray<uint8>& OutStep0CoastAdjacentFlags)
+	{
+		const int32 SampleNum = Step0Mass.SampleCoastDistHops.Num();
+		OutStep0ContinentalFlags.Init(0, SampleNum);
+		OutStep0BroadInteriorFlags.Init(0, SampleNum);
+		OutStep0CoastAdjacentFlags.Init(0, SampleNum);
+		for (int32 SampleIndex = 0; SampleIndex < SampleNum; ++SampleIndex)
+		{
+			if (!Step0Mass.SampleComponentId.IsValidIndex(SampleIndex) ||
+				!Step0Mass.SampleCoastDistHops.IsValidIndex(SampleIndex) ||
+				Step0Mass.SampleComponentId[SampleIndex] < 0)
+			{
+				continue;
+			}
+
+			OutStep0ContinentalFlags[SampleIndex] = 1;
+			const int32 CoastDepth = Step0Mass.SampleCoastDistHops[SampleIndex];
+			if (CoastDepth >= 2)
+			{
+				OutStep0BroadInteriorFlags[SampleIndex] = 1;
+			}
+			else if (CoastDepth == 1)
+			{
+				OutStep0CoastAdjacentFlags[SampleIndex] = 1;
+			}
+		}
+	};
+
+	const auto CaptureCheckpoint = [this](
+		FRunState& Run,
+		const int32 Step)
+	{
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Run.Planet);
+		const FV9ContinentalMassDiagnostic MassDiag = ComputeContinentalMassDiagnostic(Run.Planet);
+		const FV9ContinentalElevationStats ElevDiag = ComputeContinentalElevationStats(Run.Planet);
+		const FV9SeededContinentalSurvivalDiagnostic SurvivalDiag =
+			ComputeSeededContinentalSurvivalDiagnostic(
+				Run.Planet.GetPlanet(),
+				Run.Step0ContinentalFlags,
+				Run.Step0BroadInteriorFlags,
+				Run.Step0CoastAdjacentFlags);
+		Run.Snapshots.Add(Step, Snapshot);
+		Run.MassDiagnostics.Add(Step, MassDiag);
+		Run.ElevationDiagnostics.Add(Step, ElevDiag);
+		Run.SurvivalDiagnostics.Add(Step, SurvivalDiag);
+		AddInfo(FString::Printf(
+			TEXT("[V9BudgetBehavior %s step=%d] coast_mean=%.2f largest_subaerial=%d broad_seed=%.4f submerged=%.4f coherence=%.4f leakage=%.4f churn=%.4f p95=%.4f above5=%d"),
+			*Run.Label,
+			Step,
+			MassDiag.SubaerialMeanCoastDistHops,
+			MassDiag.LargestSubaerialComponentSize,
+			SurvivalDiag.Step0BroadInteriorRemainingFraction,
+			MassDiag.SubmergedContinentalFraction,
+			Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+			Snapshot.OwnershipChurn.ChurnFraction,
+			ElevDiag.P95ElevationKm,
+			ElevDiag.SamplesAbove5Km));
+	};
+
+	const auto CaptureSolveBudget = [this](FRunState& Run, const int32 SolveStep)
+	{
+		if (Run.SolveBudgets.Contains(SolveStep))
+		{
+			return;
+		}
+
+		const FTectonicPlanetV6PeriodicSolveStats SolveStats = Run.Planet.GetLastSolveStats();
+		Run.SolveBudgets.Add(SolveStep, SolveStats);
+		const FTectonicPlanetV6PhaseTiming& Phase = SolveStats.PhaseTiming;
+		const double AdditiveSolveBudgetMs =
+			Phase.PreSolveCaptureMs +
+			Phase.SampleAdjacencyBuildMs +
+			Phase.ActiveZoneMaskMs +
+			Phase.CopiedFrontierMeshBuildMs +
+			Phase.QueryGeometryBuildMs +
+			Phase.FrontierPointSetBuildMs +
+			Phase.ResolveTransferLoopMs +
+			Phase.AttributionMs +
+			Phase.RepartitionMembershipMs +
+			Phase.SubductionDistanceFieldMs +
+			Phase.PlateScoresMs +
+			Phase.SlabPullMs +
+			Phase.TerraneDetectionMs +
+			Phase.ComponentAuditMs +
+			Phase.RebuildCopiedFrontierMeshesMs +
+			Phase.CollisionShadowMs +
+			Phase.CollisionExecutionMs;
+		const double BudgetResidualMs = SolveStats.SolveMilliseconds - AdditiveSolveBudgetMs;
+		const double HitSearchAverageCandidateCount =
+			Run.Planet.GetPlanet().Samples.Num() > 0
+				? static_cast<double>(SolveStats.HitSearchPlateCandidateCountTotal) /
+					static_cast<double>(Run.Planet.GetPlanet().Samples.Num())
+				: 0.0;
+		const double RecoveryGatherAverageCandidateCount =
+			SolveStats.RecoveryCandidateGatherSampleCount > 0
+				? static_cast<double>(SolveStats.RecoveryCandidatePlateCandidateCountTotal) /
+					static_cast<double>(SolveStats.RecoveryCandidateGatherSampleCount)
+				: 0.0;
+		const double RecoveryMissAverageCandidateCount =
+			SolveStats.RecoveryMissSampleCount > 0
+				? static_cast<double>(SolveStats.RecoveryMissPlateCandidateCountTotal) /
+					static_cast<double>(SolveStats.RecoveryMissSampleCount)
+				: 0.0;
+
+		AddInfo(FString::Printf(
+			TEXT("[V9BudgetSolve %s solve=%d] total_ms=%.3f additive_sum_ms=%.3f residual_ms=%.3f pre_solve_ms=%.3f sample_adjacency_ms=%.3f active_zone_ms=%.3f copied_frontier_mesh_ms=%.3f query_geometry_ms=%.3f frontier_point_sets_ms=%.3f resolve_transfer_loop_ms=%.3f attribution_ms=%.3f repartition_ms=%.3f subduction_field_ms=%.3f plate_scores_ms=%.3f slab_pull_ms=%.3f terrane_ms=%.3f component_audit_ms=%.3f rebuild_meshes_ms=%.3f collision_shadow_ms=%.3f collision_exec_ms=%.3f"),
+			*Run.Label,
+			SolveStep,
+			SolveStats.SolveMilliseconds,
+			AdditiveSolveBudgetMs,
+			BudgetResidualMs,
+			Phase.PreSolveCaptureMs,
+			Phase.SampleAdjacencyBuildMs,
+			Phase.ActiveZoneMaskMs,
+			Phase.CopiedFrontierMeshBuildMs,
+			Phase.QueryGeometryBuildMs,
+			Phase.FrontierPointSetBuildMs,
+			Phase.ResolveTransferLoopMs,
+			Phase.AttributionMs,
+			Phase.RepartitionMembershipMs,
+			Phase.SubductionDistanceFieldMs,
+			Phase.PlateScoresMs,
+			Phase.SlabPullMs,
+			Phase.TerraneDetectionMs,
+			Phase.ComponentAuditMs,
+			Phase.RebuildCopiedFrontierMeshesMs,
+			Phase.CollisionShadowMs,
+			Phase.CollisionExecutionMs));
+		AddInfo(FString::Printf(
+			TEXT("[V9BudgetSolveNested %s solve=%d] hit_search_worker_ms=%.3f zero_hit_recovery_worker_ms=%.3f direct_hit_transfer_worker_ms=%.3f fallback_transfer_worker_ms=%.3f quiet_interior_preserve_worker_ms=%.3f"),
+			*Run.Label,
+			SolveStep,
+			Phase.HitSearchMs,
+			Phase.ZeroHitRecoveryMs,
+			Phase.DirectHitTransferMs,
+			Phase.FallbackTransferMs,
+			Phase.QuietInteriorPreservationMs));
+		AddInfo(FString::Printf(
+			TEXT("[V9BudgetQoL %s solve=%d] copied_frontier_triangles=%d plate_local_triangles=%d direct_hit_transfer_count=%d zero_hit_recovery_count=%d recovery_miss_count=%d nearest_member_fallback_count=%d quiet_interior_touched=%d subduction_edges=%d subduction_seeds=%d influenced_samples=%d hit_search_avg_candidates=%.3f hit_search_max=%d recovery_gather_avg_candidates=%.3f recovery_gather_max=%d recovery_miss_avg_candidates=%.3f recovery_miss_max=%d"),
+			*Run.Label,
+			SolveStep,
+			SolveStats.CopiedFrontierTriangleCount,
+			SolveStats.PlateLocalTriangleCount,
+			SolveStats.DirectHitTriangleTransferCount,
+			SolveStats.ZeroCandidateCount,
+			SolveStats.RecoveryMissSampleCount,
+			SolveStats.NearestMemberFallbackTransferCount,
+			SolveStats.PaperSurrogateOwnershipOverrideCount,
+			SolveStats.SubductionConvergentEdgeCount,
+			SolveStats.SubductionSeedSampleCount,
+			SolveStats.SubductionInfluencedCount,
+			HitSearchAverageCandidateCount,
+			SolveStats.HitSearchPlateCandidateCountMax,
+			RecoveryGatherAverageCandidateCount,
+			SolveStats.RecoveryCandidatePlateCandidateCountMax,
+			RecoveryMissAverageCandidateCount,
+			SolveStats.RecoveryMissPlateCandidateCountMax));
+	};
+
+	const auto CaptureStepBudget = [](FRunState& Run)
+	{
+		const FTectonicPlanet& Planet = Run.Planet.GetPlanet();
+		Run.StepBudgets.Add(Planet.CurrentStep, Planet.LastStepBudget);
+	};
+
+	const auto AdvanceToStep = [&](
+		FRunState& Run,
+		const int32 TargetStep)
+	{
+		while (Run.Planet.GetPlanet().CurrentStep < TargetStep)
+		{
+			const int32 PreviousSolveCount = Run.Planet.GetPeriodicSolveCount();
+			Run.Planet.AdvanceStep();
+			CaptureStepBudget(Run);
+			if (Run.Planet.GetPeriodicSolveCount() > PreviousSolveCount)
+			{
+				const int32 SolveStep = Run.Planet.GetLastSolveStats().Step;
+				if (TimingSolveSteps.Contains(SolveStep))
+				{
+					CaptureSolveBudget(Run, SolveStep);
+				}
+			}
+		}
+	};
+
+	const auto AverageStepBudgetRange = [](
+		const TMap<int32, FTectonicPlanetStepBudget>& StepBudgets,
+		const int32 InclusiveStartStep,
+		const int32 InclusiveEndStep)
+	{
+		FStepBudgetAverage Average;
+		for (int32 Step = InclusiveStartStep; Step <= InclusiveEndStep; ++Step)
+		{
+			const FTectonicPlanetStepBudget* Budget = StepBudgets.Find(Step);
+			if (Budget == nullptr)
+			{
+				continue;
+			}
+
+			++Average.StepCount;
+			Average.PlateCount += static_cast<double>(Budget->PlateCount);
+			Average.SampleCount += static_cast<double>(Budget->SampleCount);
+			Average.CarriedSampleCount += static_cast<double>(Budget->CarriedSampleCount);
+			Average.SubductionSampleCount += static_cast<double>(Budget->SubductionSampleCount);
+			Average.AndeanSampleCount += static_cast<double>(Budget->AndeanSampleCount);
+			Average.PlateKinematicsMs += Budget->PlateKinematicsMs;
+			Average.SubductionUpliftMs += Budget->SubductionUpliftMs;
+			Average.ContinentalAdjustmentMs += Budget->ContinentalAdjustmentMs;
+			Average.ErosionElevationUpdateMs += Budget->ErosionElevationUpdateMs;
+			Average.CollisionStepMs += Budget->CollisionStepMs;
+			Average.CanonicalSyncMs += Budget->CanonicalSyncMs;
+			Average.AutomaticRiftCheckMs += Budget->AutomaticRiftCheckMs;
+			Average.InStepResamplingMs += Budget->InStepResamplingMs;
+			Average.PendingCollisionFollowupMs += Budget->PendingCollisionFollowupMs;
+			Average.TotalMs += Budget->TotalMs;
+		}
+
+		if (Average.StepCount <= 0)
+		{
+			return Average;
+		}
+
+		const double Divisor = static_cast<double>(Average.StepCount);
+		Average.PlateCount /= Divisor;
+		Average.SampleCount /= Divisor;
+		Average.CarriedSampleCount /= Divisor;
+		Average.SubductionSampleCount /= Divisor;
+		Average.AndeanSampleCount /= Divisor;
+		Average.PlateKinematicsMs /= Divisor;
+		Average.SubductionUpliftMs /= Divisor;
+		Average.ContinentalAdjustmentMs /= Divisor;
+		Average.ErosionElevationUpdateMs /= Divisor;
+		Average.CollisionStepMs /= Divisor;
+		Average.CanonicalSyncMs /= Divisor;
+		Average.AutomaticRiftCheckMs /= Divisor;
+		Average.InStepResamplingMs /= Divisor;
+		Average.PendingCollisionFollowupMs /= Divisor;
+		Average.TotalMs /= Divisor;
+		return Average;
+	};
+
+	const auto EmitStepBudget = [this](
+		const FString& Label,
+		const FString& BudgetLabel,
+		const int32 StartStep,
+		const int32 EndStep,
+		const FStepBudgetAverage& Average)
+	{
+		AddInfo(FString::Printf(
+			TEXT("[V9BudgetStep %s %s steps=%d-%d samples=%d] total_ms=%.3f plate_kinematics_ms=%.3f subduction_uplift_ms=%.3f continental_adjust_ms=%.3f erosion_elevation_ms=%.3f collision_step_ms=%.3f canonical_sync_ms=%.3f automatic_rift_ms=%.3f in_step_resampling_ms=%.3f pending_collision_followup_ms=%.3f plate_count=%.1f sample_count=%.1f carried_sample_count=%.1f subduction_sample_count=%.1f andean_count=%.1f"),
+			*Label,
+			*BudgetLabel,
+			StartStep,
+			EndStep,
+			Average.StepCount,
+			Average.TotalMs,
+			Average.PlateKinematicsMs,
+			Average.SubductionUpliftMs,
+			Average.ContinentalAdjustmentMs,
+			Average.ErosionElevationUpdateMs,
+			Average.CollisionStepMs,
+			Average.CanonicalSyncMs,
+			Average.AutomaticRiftCheckMs,
+			Average.InStepResamplingMs,
+			Average.PendingCollisionFollowupMs,
+			Average.PlateCount,
+			Average.SampleCount,
+			Average.CarriedSampleCount,
+			Average.SubductionSampleCount,
+			Average.AndeanSampleCount));
+	};
+
+	const auto EmitIntervalBudget = [this](
+		const FString& Label,
+		const FString& BudgetLabel,
+		const FStepBudgetAverage& StepAverage,
+		const FTectonicPlanetV6PeriodicSolveStats& SolveStats)
+	{
+		const double CadenceIntervalMs =
+			(static_cast<double>(FixedIntervalSteps) * StepAverage.TotalMs) + SolveStats.SolveMilliseconds;
+		const double AmortizedPerStepMs =
+			CadenceIntervalMs / static_cast<double>(FixedIntervalSteps);
+		AddInfo(FString::Printf(
+			TEXT("[V9BudgetInterval %s %s cadence=%d] step_avg_ms=%.3f solve_ms=%.3f cadence_interval_ms=%.3f amortized_per_step_ms=%.3f"),
+			*Label,
+			*BudgetLabel,
+			FixedIntervalSteps,
+			StepAverage.TotalMs,
+			SolveStats.SolveMilliseconds,
+			CadenceIntervalMs,
+			AmortizedPerStepMs));
+	};
+
+	const auto IsBehaviorHealthy = [](const FRunState& Run, const int32 Step)
+	{
+		const FV6CheckpointSnapshot& Snapshot = Run.Snapshots.FindChecked(Step);
+		const FV9ContinentalMassDiagnostic& MassDiag = Run.MassDiagnostics.FindChecked(Step);
+		const FV9ContinentalElevationStats& ElevDiag = Run.ElevationDiagnostics.FindChecked(Step);
+		const FV9SeededContinentalSurvivalDiagnostic& SurvivalDiag =
+			Run.SurvivalDiagnostics.FindChecked(Step);
+		return
+			MassDiag.SubaerialMeanCoastDistHops >= (Step == 100 ? 4.5 : 4.0) &&
+			MassDiag.LargestSubaerialComponentSize >= (Step == 100 ? 2500 : 4000) &&
+			SurvivalDiag.Step0BroadInteriorRemainingFraction >= (Step == 100 ? 0.75 : 0.60) &&
+			MassDiag.SubmergedContinentalFraction <= (Step == 100 ? 0.07 : 0.08) &&
+			Snapshot.BoundaryCoherence.BoundaryCoherenceScore >= 0.93 &&
+			Snapshot.BoundaryCoherence.InteriorLeakageFraction < 0.18 &&
+			Snapshot.OwnershipChurn.ChurnFraction < 0.05 &&
+			ElevDiag.P95ElevationKm <= (Step == 100 ? 5.5 : 6.0) &&
+			ElevDiag.SamplesAbove5Km <= (Step == 100 ? 1000 : 1500);
+	};
+
+	TMap<int32, FRunState> RunsBySampleCount;
+	for (const int32 SampleCount : SampleCounts)
+	{
+		FRunState Run;
+		Run.SampleCount = SampleCount;
+		Run.Label = FString::Printf(TEXT("%dk"), SampleCount / 1000);
+		Run.Planet = InitializePlanet(SampleCount);
+
+		const FV9ContinentalMassDiagnostic Step0Mass = ComputeContinentalMassDiagnostic(Run.Planet);
+		BuildSeedFlags(
+			Step0Mass,
+			Run.Step0ContinentalFlags,
+			Run.Step0BroadInteriorFlags,
+			Run.Step0CoastAdjacentFlags);
+
+		AdvanceToStep(Run, 100);
+		CaptureCheckpoint(Run, 100);
+		AdvanceToStep(Run, 200);
+		CaptureCheckpoint(Run, 200);
+
+		for (const int32 SolveStep : TimingSolveSteps)
+		{
+			TestTrue(
+				*FString::Printf(TEXT("%s captured solve budget at %d"), *Run.Label, SolveStep),
+				Run.SolveBudgets.Contains(SolveStep));
+		}
+		for (const int32 Step : CheckpointSteps)
+		{
+			TestTrue(
+				*FString::Printf(TEXT("%s behavior healthy at step %d"), *Run.Label, Step),
+				IsBehaviorHealthy(Run, Step));
+		}
+
+		const FStepBudgetAverage EarlyStepAverage =
+			AverageStepBudgetRange(Run.StepBudgets, 1, FixedIntervalSteps);
+		const FStepBudgetAverage LateStepAverage =
+			AverageStepBudgetRange(
+				Run.StepBudgets,
+				TimingSolveSteps.Last() - FixedIntervalSteps + 1,
+				TimingSolveSteps.Last());
+		EmitStepBudget(Run.Label, TEXT("early"), 1, FixedIntervalSteps, EarlyStepAverage);
+		EmitStepBudget(
+			Run.Label,
+			TEXT("late"),
+			TimingSolveSteps.Last() - FixedIntervalSteps + 1,
+			TimingSolveSteps.Last(),
+			LateStepAverage);
+		EmitIntervalBudget(
+			Run.Label,
+			TEXT("early"),
+			EarlyStepAverage,
+			Run.SolveBudgets.FindChecked(TimingSolveSteps[0]));
+		EmitIntervalBudget(
+			Run.Label,
+			TEXT("late"),
+			LateStepAverage,
+			Run.SolveBudgets.FindChecked(TimingSolveSteps.Last()));
+		RunsBySampleCount.Add(SampleCount, MoveTemp(Run));
+	}
+
+	const FRunState& Run60k = RunsBySampleCount.FindChecked(60000);
+	const FRunState& Run100k = RunsBySampleCount.FindChecked(100000);
+	const FStepBudgetAverage Step60kLate =
+		AverageStepBudgetRange(Run60k.StepBudgets, TimingSolveSteps.Last() - FixedIntervalSteps + 1, TimingSolveSteps.Last());
+	const FStepBudgetAverage Step100kLate =
+		AverageStepBudgetRange(Run100k.StepBudgets, TimingSolveSteps.Last() - FixedIntervalSteps + 1, TimingSolveSteps.Last());
+	const FTectonicPlanetV6PeriodicSolveStats& Solve60kLate =
+		Run60k.SolveBudgets.FindChecked(TimingSolveSteps.Last());
+	const FTectonicPlanetV6PeriodicSolveStats& Solve100kLate =
+		Run100k.SolveBudgets.FindChecked(TimingSolveSteps.Last());
+
+	const auto BuildPaperBudgetRows = [&]()
+	{
+		TArray<FPaperBudgetRow> Rows;
+
+		auto AddRow = [&Rows](
+			const FString& PaperBucket,
+			const FString& AurousBucket,
+			const FString& PhaseComposition,
+			const double PaperSeconds60k,
+			const double PaperSeconds100k,
+			const double AurousSeconds60k,
+			const double AurousSeconds100k,
+			const FString& Caveat)
+		{
+			FPaperBudgetRow& Row = Rows.AddDefaulted_GetRef();
+			Row.PaperBucket = PaperBucket;
+			Row.AurousBucket = AurousBucket;
+			Row.PhaseComposition = PhaseComposition;
+			Row.PaperSeconds60k = PaperSeconds60k;
+			Row.PaperSeconds100k = PaperSeconds100k;
+			Row.AurousSeconds60k = AurousSeconds60k;
+			Row.AurousSeconds100k = AurousSeconds100k;
+			Row.Caveat = Caveat;
+		};
+
+		const double Subduction60kSeconds =
+			(Step60kLate.SubductionUpliftMs +
+				(Solve60kLate.PhaseTiming.SubductionDistanceFieldMs + Solve60kLate.PhaseTiming.SlabPullMs) /
+					static_cast<double>(FixedIntervalSteps)) /
+			1000.0;
+		const double Subduction100kSeconds =
+			(Step100kLate.SubductionUpliftMs +
+				(Solve100kLate.PhaseTiming.SubductionDistanceFieldMs + Solve100kLate.PhaseTiming.SlabPullMs) /
+					static_cast<double>(FixedIntervalSteps)) /
+			1000.0;
+		AddRow(
+			TEXT("Subduction"),
+			TEXT("Per-step uplift + cadence-amortized subduction field"),
+			TEXT("step_subduction_uplift + solve_subduction_field + solve_slab_pull"),
+			0.08,
+			0.14,
+			Subduction60kSeconds,
+			Subduction100kSeconds,
+			TEXT("Aurous splits per-step uplift from cadence-16 global field recompute."));
+
+		const double Collision60kSeconds =
+			(Step60kLate.CollisionStepMs +
+				(Solve60kLate.PhaseTiming.CollisionShadowMs +
+					Solve60kLate.PhaseTiming.CollisionExecutionMs +
+					Solve60kLate.PhaseTiming.TerraneDetectionMs +
+					Solve60kLate.PhaseTiming.ComponentAuditMs) /
+					static_cast<double>(FixedIntervalSteps)) /
+			1000.0;
+		const double Collision100kSeconds =
+			(Step100kLate.CollisionStepMs +
+				(Solve100kLate.PhaseTiming.CollisionShadowMs +
+					Solve100kLate.PhaseTiming.CollisionExecutionMs +
+					Solve100kLate.PhaseTiming.TerraneDetectionMs +
+					Solve100kLate.PhaseTiming.ComponentAuditMs) /
+					static_cast<double>(FixedIntervalSteps)) /
+			1000.0;
+		AddRow(
+			TEXT("Continental collision"),
+			TEXT("Cadence-amortized collision shadow/execution"),
+			TEXT("step_collision + solve_collision_shadow + solve_collision_exec + solve_terrane + solve_component_audit"),
+			0.02,
+			0.04,
+			Collision60kSeconds,
+			Collision100kSeconds,
+			TEXT("Kept path executes collision qualification/execution inside the cadence solve, not every step."));
+
+		const double Elevation60kSeconds =
+			(Step60kLate.ContinentalAdjustmentMs +
+				Step60kLate.ErosionElevationUpdateMs +
+				Step60kLate.CanonicalSyncMs) /
+			1000.0;
+		const double Elevation100kSeconds =
+			(Step100kLate.ContinentalAdjustmentMs +
+				Step100kLate.ErosionElevationUpdateMs +
+				Step100kLate.CanonicalSyncMs) /
+			1000.0;
+		AddRow(
+			TEXT("Elevation"),
+			TEXT("Per-step continental adjustment + erosion/elevation update"),
+			TEXT("step_continental_adjust + step_erosion_elevation + step_canonical_sync"),
+			0.09,
+			0.10,
+			Elevation60kSeconds,
+			Elevation100kSeconds,
+			TEXT("Aurous elevation work is entirely per-step in the kept path; quiet-interior preserve remains inside periodic remesh."));
+
+		const double OceanicCrust60kSeconds =
+			(Solve60kLate.PhaseTiming.PreSolveCaptureMs +
+				Solve60kLate.PhaseTiming.SampleAdjacencyBuildMs +
+				Solve60kLate.PhaseTiming.ActiveZoneMaskMs +
+				Solve60kLate.PhaseTiming.CopiedFrontierMeshBuildMs +
+				Solve60kLate.PhaseTiming.QueryGeometryBuildMs +
+				Solve60kLate.PhaseTiming.FrontierPointSetBuildMs +
+				Solve60kLate.PhaseTiming.ResolveTransferLoopMs +
+				Solve60kLate.PhaseTiming.AttributionMs +
+				Solve60kLate.PhaseTiming.RepartitionMembershipMs +
+				Solve60kLate.PhaseTiming.PlateScoresMs +
+				Solve60kLate.PhaseTiming.RebuildCopiedFrontierMeshesMs) /
+			static_cast<double>(FixedIntervalSteps) /
+			1000.0;
+		const double OceanicCrust100kSeconds =
+			(Solve100kLate.PhaseTiming.PreSolveCaptureMs +
+				Solve100kLate.PhaseTiming.SampleAdjacencyBuildMs +
+				Solve100kLate.PhaseTiming.ActiveZoneMaskMs +
+				Solve100kLate.PhaseTiming.CopiedFrontierMeshBuildMs +
+				Solve100kLate.PhaseTiming.QueryGeometryBuildMs +
+				Solve100kLate.PhaseTiming.FrontierPointSetBuildMs +
+				Solve100kLate.PhaseTiming.ResolveTransferLoopMs +
+				Solve100kLate.PhaseTiming.AttributionMs +
+				Solve100kLate.PhaseTiming.RepartitionMembershipMs +
+				Solve100kLate.PhaseTiming.PlateScoresMs +
+				Solve100kLate.PhaseTiming.RebuildCopiedFrontierMeshesMs) /
+			static_cast<double>(FixedIntervalSteps) /
+			1000.0;
+		AddRow(
+			TEXT("Oceanic crust"),
+			TEXT("Cadence-amortized copied-frontier remesh/transfer"),
+			TEXT("solve_pre_solve + solve_sample_adjacency + solve_active_zone + solve_mesh_build + solve_query_geometry + solve_frontier_points + solve_resolve_transfer_loop + solve_attribution + solve_repartition + solve_plate_scores + solve_rebuild_meshes"),
+			0.58,
+			1.22,
+			OceanicCrust60kSeconds,
+			OceanicCrust100kSeconds,
+			TEXT("Closest defensible mapping only: the kept copied-frontier remesh combines ownership, transfer, and preservation work in one cadence solve."));
+
+		const double PlateRifting60kSeconds =
+			(Step60kLate.AutomaticRiftCheckMs +
+				Step60kLate.InStepResamplingMs +
+				Step60kLate.PendingCollisionFollowupMs) /
+			1000.0;
+		const double PlateRifting100kSeconds =
+			(Step100kLate.AutomaticRiftCheckMs +
+				Step100kLate.InStepResamplingMs +
+				Step100kLate.PendingCollisionFollowupMs) /
+			1000.0;
+		AddRow(
+			TEXT("Plate rifting"),
+			TEXT("Per-step automatic-rift trigger/follow-up overhead"),
+			TEXT("step_automatic_rift + step_in_step_resampling + step_pending_collision_followup"),
+			0.23,
+			0.21,
+			PlateRifting60kSeconds,
+			PlateRifting100kSeconds,
+			TEXT("Canonical kept runs did not fire a rift event; this measures readiness/trigger overhead, not an executed rift cost."));
+
+		const double Total60kSeconds =
+			((static_cast<double>(FixedIntervalSteps) * Step60kLate.TotalMs) + Solve60kLate.SolveMilliseconds) /
+			static_cast<double>(FixedIntervalSteps) /
+			1000.0;
+		const double Total100kSeconds =
+			((static_cast<double>(FixedIntervalSteps) * Step100kLate.TotalMs) + Solve100kLate.SolveMilliseconds) /
+			static_cast<double>(FixedIntervalSteps) /
+			1000.0;
+		AddRow(
+			TEXT("Total"),
+			TEXT("Cadence-amortized kept-step + periodic solve"),
+			TEXT("16*step_total + solve_total, amortized back to per-step"),
+			0.19,
+			0.28,
+			Total60kSeconds,
+			Total100kSeconds,
+			TEXT("Paper values are from a different implementation/hardware; this is the closest additive Aurous comparison."));
+
+		return Rows;
+	};
+
+	const TArray<FPaperBudgetRow> PaperRows = BuildPaperBudgetRows();
+	for (const FPaperBudgetRow& Row : PaperRows)
+	{
+		AddInfo(FString::Printf(
+			TEXT("[V9BudgetPaper bucket=%s] aurous_bucket=%s phases=%s paper_60k_s=%.3f paper_100k_s=%.3f aurous_60k_s=%.3f aurous_100k_s=%.3f caveat=%s"),
+			*Row.PaperBucket,
+			*Row.AurousBucket,
+			*Row.PhaseComposition,
+			Row.PaperSeconds60k,
+			Row.PaperSeconds100k,
+			Row.AurousSeconds60k,
+			Row.AurousSeconds100k,
+			*Row.Caveat));
+	}
+
+	return true;
+}

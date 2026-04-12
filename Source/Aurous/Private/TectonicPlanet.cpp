@@ -6115,6 +6115,14 @@ void FTectonicPlanet::ComputePlateScores()
 void FTectonicPlanet::AdvanceStep()
 {
 	const double StepStartTime = FPlatformTime::Seconds();
+	const auto AccumulateCyclesToMilliseconds = [](double& InOutMilliseconds, const uint64 StartCycles)
+	{
+		InOutMilliseconds += FPlatformTime::ToMilliseconds64(
+			static_cast<uint64>(FPlatformTime::Cycles64() - StartCycles));
+	};
+	FTectonicPlanetStepBudget StepBudget;
+	StepBudget.PlateCount = Plates.Num();
+	StepBudget.SampleCount = Samples.Num();
 	const double SlabPullPerturbation =
 		(!Samples.IsEmpty() && !Plates.IsEmpty())
 			? (SlabPullEpsilon * static_cast<double>(Plates.Num()) / static_cast<double>(Samples.Num()))
@@ -6122,6 +6130,8 @@ void FTectonicPlanet::AdvanceStep()
 
 	for (FPlate& Plate : Plates)
 	{
+		StepBudget.CarriedSampleCount += Plate.CarriedSamples.Num();
+		const uint64 PlateKinematicsStartCycles = FPlatformTime::Cycles64();
 		if (bEnableSlabPull && !Plate.SlabPullCorrectionAxis.IsNearlyZero())
 		{
 			FVector3d AxisDelta = Plate.SlabPullCorrectionAxis * (SlabPullPerturbation * DeltaTimeMyears);
@@ -6143,10 +6153,16 @@ void FTectonicPlanet::AdvanceStep()
 			const FQuat4d DeltaRotation(Plate.RotationAxis.GetSafeNormal(), Plate.AngularSpeed);
 			Plate.CumulativeRotation = (DeltaRotation * Plate.CumulativeRotation).GetNormalized();
 		}
+		AccumulateCyclesToMilliseconds(StepBudget.PlateKinematicsMs, PlateKinematicsStartCycles);
 
 		for (FCarriedSample& CarriedSample : Plate.CarriedSamples)
 		{
 			CarriedSample.Age += static_cast<float>(DeltaTimeMyears);
+			if (CarriedSample.SubductionDistanceKm >= 0.0f)
+			{
+				++StepBudget.SubductionSampleCount;
+			}
+			const uint64 SubductionUpliftStartCycles = FPlatformTime::Cycles64();
 			if (CarriedSample.SubductionDistanceKm >= 0.0f)
 			{
 				const double BaseUpliftKmPerMy =
@@ -6180,7 +6196,9 @@ void FTectonicPlanet::AdvanceStep()
 					CarriedSample.OrogenyType = EOrogenyType::Andean;
 				}
 			}
+			AccumulateCyclesToMilliseconds(StepBudget.SubductionUpliftMs, SubductionUpliftStartCycles);
 
+			const uint64 ContinentalAdjustmentStartCycles = FPlatformTime::Cycles64();
 			if (bEnableAndeanContinentalConversion &&
 				CarriedSample.OrogenyType == EOrogenyType::Andean &&
 				CarriedSample.Elevation > 0.0f &&
@@ -6206,7 +6224,11 @@ void FTectonicPlanet::AdvanceStep()
 					CarriedSample.ContinentalWeight -
 						static_cast<float>(SubmergedContinentalRelaxationRatePerStep));
 			}
+			AccumulateCyclesToMilliseconds(
+				StepBudget.ContinentalAdjustmentMs,
+				ContinentalAdjustmentStartCycles);
 
+			const uint64 ErosionElevationUpdateStartCycles = FPlatformTime::Cycles64();
 			if (CarriedSample.ContinentalWeight >= 0.5f)
 			{
 				CarriedSample.Elevation -= static_cast<float>((CarriedSample.Elevation / ElevationCeilingKm) * ErosionRateKmPerStep);
@@ -6223,10 +6245,15 @@ void FTectonicPlanet::AdvanceStep()
 			}
 
 			CarriedSample.Elevation = FMath::Clamp(CarriedSample.Elevation, static_cast<float>(TrenchElevationKm), static_cast<float>(ElevationCeilingKm));
+			AccumulateCyclesToMilliseconds(
+				StepBudget.ErosionElevationUpdateMs,
+				ErosionElevationUpdateStartCycles);
 		}
 	}
 
+	const uint64 CanonicalSyncStartCycles = FPlatformTime::Cycles64();
 	SyncCanonicalAttributesFromCarried(*this);
+	AccumulateCyclesToMilliseconds(StepBudget.CanonicalSyncMs, CanonicalSyncStartCycles);
 	++CurrentStep;
 
 	const int32 ResampleInterval = ComputeResampleInterval();
@@ -6235,7 +6262,9 @@ void FTectonicPlanet::AdvanceStep()
 	bool bTriggeredAutomaticRift = false;
 	if (!bResampleLimitReached && bEnableAutomaticRifting)
 	{
+		const uint64 AutomaticRiftCheckStartCycles = FPlatformTime::Cycles64();
 		bTriggeredAutomaticRift = TryTriggerAutomaticRift();
+		AccumulateCyclesToMilliseconds(StepBudget.AutomaticRiftCheckMs, AutomaticRiftCheckStartCycles);
 	}
 	if (!bResampleLimitReached && !bTriggeredAutomaticRift)
 	{
@@ -6245,7 +6274,9 @@ void FTectonicPlanet::AdvanceStep()
 		case EResamplingPolicy::PeriodicGlobalAuthoritativeSpike:
 			if (CurrentStep > 0 && ResampleInterval > 0 && (CurrentStep % ResampleInterval) == 0)
 			{
+				const uint64 InStepResamplingStartCycles = FPlatformTime::Cycles64();
 				PerformResampling(EResampleOwnershipMode::FullResolution, EResampleTriggerReason::Periodic);
+				AccumulateCyclesToMilliseconds(StepBudget.InStepResamplingMs, InStepResamplingStartCycles);
 			}
 			break;
 
@@ -6255,7 +6286,9 @@ void FTectonicPlanet::AdvanceStep()
 			const int32 StepsSinceLastResample = CurrentStep - LastResampleStep;
 			if (MaxStepsWithoutResampling != INDEX_NONE && StepsSinceLastResample >= MaxStepsWithoutResampling)
 			{
+				const uint64 InStepResamplingStartCycles = FPlatformTime::Cycles64();
 				TriggerEventResampling(EResampleTriggerReason::SafetyValve);
+				AccumulateCyclesToMilliseconds(StepBudget.InStepResamplingMs, InStepResamplingStartCycles);
 			}
 			break;
 		}
@@ -6263,14 +6296,18 @@ void FTectonicPlanet::AdvanceStep()
 		case EResamplingPolicy::HybridStablePeriodic:
 			if (CurrentStep > 0 && ResampleInterval > 0 && (CurrentStep % ResampleInterval) == 0)
 			{
+				const uint64 InStepResamplingStartCycles = FPlatformTime::Cycles64();
 				PerformResampling(EResampleOwnershipMode::StableOverlaps, EResampleTriggerReason::Periodic);
+				AccumulateCyclesToMilliseconds(StepBudget.InStepResamplingMs, InStepResamplingStartCycles);
 			}
 			break;
 
 		case EResamplingPolicy::PreserveOwnershipPeriodic:
 			if (CurrentStep > 0 && ResampleInterval > 0 && (CurrentStep % ResampleInterval) == 0)
 			{
+				const uint64 InStepResamplingStartCycles = FPlatformTime::Cycles64();
 				PerformResampling(EResampleOwnershipMode::PreserveOwnership, EResampleTriggerReason::Periodic);
+				AccumulateCyclesToMilliseconds(StepBudget.InStepResamplingMs, InStepResamplingStartCycles);
 			}
 			break;
 		}
@@ -6281,11 +6318,19 @@ void FTectonicPlanet::AdvanceStep()
 		bPendingFullResolutionResample = false;
 		if (!(MaxResampleCount != INDEX_NONE && ResamplingSteps.Num() >= MaxResampleCount))
 		{
+			const uint64 PendingCollisionFollowupStartCycles = FPlatformTime::Cycles64();
 			PerformResampling(EResampleOwnershipMode::FullResolution, EResampleTriggerReason::CollisionFollowup);
+			AccumulateCyclesToMilliseconds(
+				StepBudget.PendingCollisionFollowupMs,
+				PendingCollisionFollowupStartCycles);
 		}
 	}
 
+	StepBudget.Step = CurrentStep;
+	StepBudget.AndeanSampleCount = CountAndeanSamples(*this);
 	const double StepDurationMs = (FPlatformTime::Seconds() - StepStartTime) * 1000.0;
+	StepBudget.TotalMs = StepDurationMs;
+	LastStepBudget = StepBudget;
 	UE_LOG(
 		LogTemp,
 		Log,

@@ -228,6 +228,26 @@ struct FSubductionComputationDiagnostics
 	double SlabPullMs = 0.0;
 };
 
+struct FTectonicPlanetStepBudget
+{
+	int32 Step = 0;
+	int32 PlateCount = 0;
+	int32 SampleCount = 0;
+	int32 CarriedSampleCount = 0;
+	int32 SubductionSampleCount = 0;
+	int32 AndeanSampleCount = 0;
+	double PlateKinematicsMs = 0.0;
+	double SubductionUpliftMs = 0.0;
+	double ContinentalAdjustmentMs = 0.0;
+	double ErosionElevationUpdateMs = 0.0;
+	double CollisionStepMs = 0.0;
+	double CanonicalSyncMs = 0.0;
+	double AutomaticRiftCheckMs = 0.0;
+	double InStepResamplingMs = 0.0;
+	double PendingCollisionFollowupMs = 0.0;
+	double TotalMs = 0.0;
+};
+
 struct FResamplingStats
 {
 	EResampleTriggerReason TriggerReason = EResampleTriggerReason::None;
@@ -811,6 +831,7 @@ struct AUROUS_API FTectonicPlanet
 	FPendingGeometricCollisionEvent PendingGeometricCollisionEvent;
 	FPendingRiftEvent PendingRiftEvent;
 	FSubductionComputationDiagnostics LastSubductionDiagnostics;
+	FTectonicPlanetStepBudget LastStepBudget;
 	int32 ResamplingExecutionOrdinal = 0;
 
 	void Initialize(int32 InSampleCount, double InPlanetRadiusKm);
