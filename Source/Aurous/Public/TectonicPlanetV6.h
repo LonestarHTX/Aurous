@@ -240,6 +240,32 @@ struct AUROUS_API FTectonicPlanetV6ResolvedSample
 	FTectonicPlanetV6TransferDebugInfo TransferDebug;
 };
 
+struct AUROUS_API FTectonicPlanetV6PhaseTiming
+{
+	double PreSolveCaptureMs = 0.0;
+	double SampleAdjacencyBuildMs = 0.0;
+	double ActiveZoneMaskMs = 0.0;
+	double CopiedFrontierMeshBuildMs = 0.0;
+	double QueryGeometryBuildMs = 0.0;
+	double FrontierPointSetBuildMs = 0.0;
+	double ResolveTransferLoopMs = 0.0;
+	double HitSearchMs = 0.0;
+	double ZeroHitRecoveryMs = 0.0;
+	double DirectHitTransferMs = 0.0;
+	double FallbackTransferMs = 0.0;
+	double QuietInteriorPreservationMs = 0.0;
+	double AttributionMs = 0.0;
+	double RepartitionMembershipMs = 0.0;
+	double PlateScoresMs = 0.0;
+	double SubductionDistanceFieldMs = 0.0;
+	double SlabPullMs = 0.0;
+	double TerraneDetectionMs = 0.0;
+	double ComponentAuditMs = 0.0;
+	double RebuildCopiedFrontierMeshesMs = 0.0;
+	double CollisionShadowMs = 0.0;
+	double CollisionExecutionMs = 0.0;
+};
+
 struct AUROUS_API FTectonicPlanetV6PeriodicSolveStats
 {
 	ETectonicPlanetV6SolveTrigger Trigger = ETectonicPlanetV6SolveTrigger::None;
@@ -275,6 +301,8 @@ struct AUROUS_API FTectonicPlanetV6PeriodicSolveStats
 	int32 OceanicCreationCount = 0;
 	int32 DefaultTransferCount = 0;
 	int32 TransferFallbackCount = 0;
+	int32 NearestMemberFallbackTransferCount = 0;
+	int32 ExplicitFallbackTransferCount = 0;
 	int32 PlateLocalVertexCount = 0;
 	int32 PlateLocalTriangleCount = 0;
 	int32 CopiedFrontierVertexCount = 0;
@@ -338,6 +366,7 @@ struct AUROUS_API FTectonicPlanetV6PeriodicSolveStats
 	double PaperSurrogateQuietInteriorDirectHitPostTransferThicknessSum = 0.0;
 	double PaperSurrogateQuietInteriorDirectHitFinalThicknessSum = 0.0;
 	bool bDestructiveTriangleExclusionApplied = false;
+	FTectonicPlanetV6PhaseTiming PhaseTiming;
 	FTectonicPlanetV6TransferResolutionCounts TriangleTransferCountsByResolution;
 	FTectonicPlanetV6TransferResolutionCounts SingleSourceTransferCountsByResolution;
 	FTectonicPlanetV6TransferResolutionCounts ContinentalWeightThresholdMismatchCountsByResolution;
@@ -1213,6 +1242,8 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetV9PaperSurrogateFieldModeForTest(ETectonicPlanetV6PaperSurrogateFieldMode InMode);
 	void SetSubmergedContinentalRelaxationForTest(bool bEnable, double RatePerStep = 0.005);
 	void SetAutomaticRiftingForTest(bool bEnable);
+	void SetPhaseTimingForTest(bool bEnable);
+	void SetDetailedCopiedFrontierAttributionForTest(bool bEnable);
 	bool ForceLargestEligibleAutomaticRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
 	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
 	void SetUseLinearConvergentMaintenanceInfluenceForTest(bool bEnableLinear);
@@ -1379,6 +1410,8 @@ private:
 	ETectonicPlanetV6PaperSurrogateFieldMode V9PaperSurrogateFieldModeForTest =
 		ETectonicPlanetV6PaperSurrogateFieldMode::FullState;
 	bool bEnableAutomaticRiftingForTest = false;
+	bool bEnablePhaseTimingForTest = false;
+	bool bEnableDetailedCopiedFrontierAttributionForTest = true;
 	bool bUseLinearConvergentMaintenanceSpeedFactorForTest = true;
 	bool bUseLinearConvergentMaintenanceInfluenceForTest = true;
 	TArray<uint8> CurrentSolveThesisCollisionTerraneComponentMask;

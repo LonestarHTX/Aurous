@@ -98,6 +98,27 @@ namespace
 		return FMath::Lerp(1.0f, PaperSurrogateSelectiveElevationHighBlend, Alpha);
 	}
 
+	double GetPhaseTimingSeconds()
+	{
+		return FPlatformTime::Seconds();
+	}
+
+	void AccumulatePhaseTimingMs(double& InOutPhaseTimingMs, const double PhaseStartTimeSeconds)
+	{
+		InOutPhaseTimingMs += (FPlatformTime::Seconds() - PhaseStartTimeSeconds) * 1000.0;
+	}
+
+	void AccumulatePhaseTimingMicroseconds(TAtomic<int64>& InOutMicroseconds, const double PhaseStartTimeSeconds)
+	{
+		InOutMicroseconds += static_cast<int64>(
+			FMath::RoundToInt64((FPlatformTime::Seconds() - PhaseStartTimeSeconds) * 1000000.0));
+	}
+
+	double ConvertPhaseTimingMicrosecondsToMilliseconds(const TAtomic<int64>& Microseconds)
+	{
+		return static_cast<double>(Microseconds.Load()) / 1000.0;
+	}
+
 	struct FV6ContinentalBreadthPreservationSupport
 	{
 		TArray<uint8> StrongInteriorFlags;
@@ -13073,6 +13094,8 @@ void FTectonicPlanetV6::PerformThesisPlateSubmeshSpikeSolve(const ETectonicPlane
 	TAtomic<int32> MultiHitCount(0);
 	TAtomic<int32> DirectHitTriangleTransferCount(0);
 	TAtomic<int32> TransferFallbackCount(0);
+	TAtomic<int32> NearestMemberFallbackTransferCount(0);
+	TAtomic<int32> ExplicitFallbackTransferCount(0);
 	TAtomic<int32> PlateSubmeshFrontierHitCount(0);
 	TAtomic<int32> InteriorHitCount(0);
 
@@ -13454,6 +13477,8 @@ void FTectonicPlanetV6::PerformThesisPlateSubmeshSpikeSolve(const ETectonicPlane
 void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPlanetV6SolveTrigger Trigger)
 {
 	const double SolveStartTime = FPlatformTime::Seconds();
+	const bool bRecordPhaseTiming = bEnablePhaseTimingForTest;
+	FTectonicPlanetV6PhaseTiming PhaseTiming;
 	const TArray<FTerrane> PreviousTerranes = Planet.Terranes;
 	const int32 Interval = ComputePeriodicSolveInterval();
 	const bool bEnableTectonicMaintenance =
@@ -13483,7 +13508,14 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	LastCopiedFrontierSolveAttribution = FTectonicPlanetV6CopiedFrontierSolveAttribution{};
 	if (ThesisCopiedFrontierMeshes.Num() != Planet.Plates.Num())
 	{
+		const double RebuildCopiedFrontierMeshesStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		RebuildThesisCopiedFrontierMeshes();
+		if (bRecordPhaseTiming)
+		{
+			AccumulatePhaseTimingMs(
+				PhaseTiming.RebuildCopiedFrontierMeshesMs,
+				RebuildCopiedFrontierMeshesStartTime);
+		}
 	}
 
 	const bool bApplyDestructiveFilter =
@@ -13543,6 +13575,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		{
 			DestructiveTrackingStats = FV6CopiedFrontierDestructiveTrackingUpdateStats{};
 		}
+		const double CopiedFrontierMeshBuildStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 			BuildV6CopiedFrontierPlateMeshes(
 				Planet,
 				UnfilteredComparisonCopiedFrontierMeshes,
@@ -13560,11 +13593,16 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				&DestructiveFilterState,
 				FrontierMeshBuildMode,
 				SyntheticCoverageSupportFlags);
+		if (bRecordPhaseTiming)
+		{
+			AccumulatePhaseTimingMs(PhaseTiming.CopiedFrontierMeshBuildMs, CopiedFrontierMeshBuildStartTime);
+		}
 		ActiveCopiedFrontierMeshes = &FilteredCopiedFrontierMeshes;
 	}
 	const TArray<FTectonicPlanetV6CopiedFrontierPlateMesh>& SolveCopiedFrontierMeshes =
 		*ActiveCopiedFrontierMeshes;
 
+	const double PreSolveCaptureStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		TArray<int32> PreSolvePlateIds;
 		PreSolvePlateIds.Reserve(Planet.Samples.Num());
 		TArray<uint8> PreSolveContinentalFlags;
@@ -13647,11 +13685,21 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		CurrentSolveFreshPairAdmittedRiftCount = 0;
 		CurrentSolveOutsideActiveZoneQueryMissFlags.Init(0, Planet.Samples.Num());
 		CurrentSolveOutsideActiveZoneCoverageDeficitFlags.Init(0, Planet.Samples.Num());
+	if (bRecordPhaseTiming)
+	{
+		AccumulatePhaseTimingMs(PhaseTiming.PreSolveCaptureMs, PreSolveCaptureStartTime);
+	}
 
 	TArray<TArray<int32>> SampleToAdjacentTriangles;
+	const double SampleAdjacencyBuildStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 	BuildSampleToAdjacentTriangles(Planet, SampleToAdjacentTriangles);
+	if (bRecordPhaseTiming)
+	{
+		AccumulatePhaseTimingMs(PhaseTiming.SampleAdjacencyBuildMs, SampleAdjacencyBuildStartTime);
+	}
 	if (bEnableV9Phase1Authority)
 	{
+		const double ActiveZoneMaskStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		BuildPhase1ActiveZoneMask(
 			Planet,
 			PreSolvePlateIds,
@@ -13680,6 +13728,10 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			CurrentSolveFreshPairAdmittedConvergentSubductionCount,
 			CurrentSolveFreshPairAdmittedCollisionContactCount,
 			CurrentSolveFreshPairAdmittedRiftCount);
+		if (bRecordPhaseTiming)
+		{
+			AccumulatePhaseTimingMs(PhaseTiming.ActiveZoneMaskMs, ActiveZoneMaskStartTime);
+		}
 	}
 
 	int32 PlateLocalVertexCount = 0;
@@ -13697,27 +13749,42 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	}
 
 	TArray<FV6PlateQueryGeometry> QueryGeometries;
+	const double QueryGeometryBuildStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 	BuildV6CopiedFrontierQueryGeometries(
 		Planet,
 		SolveCopiedFrontierMeshes,
 		QueryGeometries,
 		bApplyDestructiveFilter ? &DestructiveFilterState : nullptr);
+	if (bRecordPhaseTiming)
+	{
+		AccumulatePhaseTimingMs(PhaseTiming.QueryGeometryBuildMs, QueryGeometryBuildStartTime);
+	}
 	TArray<FV6PlateFrontierPointSet> FrontierPointSets;
 	if (bEnableStructuredGapFill)
 	{
+		const double FrontierPointSetBuildStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		BuildV6CopiedFrontierFrontierPointSets(
 			Planet,
 			SolveCopiedFrontierMeshes,
 			QueryGeometries,
 			FrontierPointSets);
+		if (bRecordPhaseTiming)
+		{
+			AccumulatePhaseTimingMs(PhaseTiming.FrontierPointSetBuildMs, FrontierPointSetBuildStartTime);
+		}
 	}
 	TArray<FV6PlateQueryGeometry> UnfilteredComparisonQueryGeometries;
 	if (bApplyDestructiveFilter)
 	{
+		const double UnfilteredQueryGeometryBuildStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		BuildV6CopiedFrontierQueryGeometries(
 			Planet,
 			UnfilteredComparisonCopiedFrontierMeshes,
 			UnfilteredComparisonQueryGeometries);
+		if (bRecordPhaseTiming)
+		{
+			AccumulatePhaseTimingMs(PhaseTiming.QueryGeometryBuildMs, UnfilteredQueryGeometryBuildStartTime);
+		}
 	}
 
 	LastResolvedSamples.SetNum(Planet.Samples.Num());
@@ -13733,6 +13800,8 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	TAtomic<int32> MultiHitCount(0);
 	TAtomic<int32> DirectHitTriangleTransferCount(0);
 	TAtomic<int32> TransferFallbackCount(0);
+	TAtomic<int32> NearestMemberFallbackTransferCount(0);
+	TAtomic<int32> ExplicitFallbackTransferCount(0);
 	TAtomic<int32> CopiedFrontierHitCount(0);
 	TAtomic<int32> InteriorHitCount(0);
 	TAtomic<int32> DestructiveTriangleRejectedCount(0);
@@ -13765,8 +13834,14 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	TAtomic<int32> ActiveBandPreviousOwnerCompatibleRecoveryCount(0);
 	TAtomic<int32> ActiveBandSyntheticLoopBreakCount(0);
 	TAtomic<int32> ActiveBandSyntheticSingleSourceRecoveryCount(0);
+	TAtomic<int64> HitSearchMicroseconds(0);
+	TAtomic<int64> ZeroHitRecoveryMicroseconds(0);
+	TAtomic<int64> DirectHitTransferMicroseconds(0);
+	TAtomic<int64> FallbackTransferMicroseconds(0);
+	TAtomic<int64> QuietInteriorPreservationMicroseconds(0);
 
-		ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &QueryGeometries, &FrontierPointSets, &UnfilteredComparisonQueryGeometries, &DestructiveFilterState, &SampleToAdjacentTriangles, &PreSolvePlateIds, &NewPlateIds, &UnfilteredExactCandidateCounts, &UnfilteredDestructiveCandidateCounts, &MultiHitTrackedCandidateFlags, &MultiHitPlateMixValues, &MultiHitGeometryMixValues, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &HitCount, &MissCount, &MultiHitCount, &CopiedFrontierHitCount, &InteriorHitCount, &DestructiveTriangleRejectedCount, &OverlapCoherenceSupportPrunedSampleCount, &OverlapCoherencePreviousPlateStabilizedSampleCount, &OverlapCoherenceSuppressedCandidateCount, &ActiveBandPreviousOwnerCompatibleRecoveryCount, &ActiveBandSyntheticLoopBreakCount, bApplyDestructiveFilter, bEnableStructuredGapFill, bEnableV9Phase1Authority](const int32 SampleIndex)
+		const double ResolveTransferLoopStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
+		ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &QueryGeometries, &FrontierPointSets, &UnfilteredComparisonQueryGeometries, &DestructiveFilterState, &SampleToAdjacentTriangles, &PreSolvePlateIds, &NewPlateIds, &UnfilteredExactCandidateCounts, &UnfilteredDestructiveCandidateCounts, &MultiHitTrackedCandidateFlags, &MultiHitPlateMixValues, &MultiHitGeometryMixValues, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &HitCount, &MissCount, &MultiHitCount, &CopiedFrontierHitCount, &InteriorHitCount, &DestructiveTriangleRejectedCount, &OverlapCoherenceSupportPrunedSampleCount, &OverlapCoherencePreviousPlateStabilizedSampleCount, &OverlapCoherenceSuppressedCandidateCount, &ActiveBandPreviousOwnerCompatibleRecoveryCount, &ActiveBandSyntheticLoopBreakCount, &HitSearchMicroseconds, &ZeroHitRecoveryMicroseconds, &DirectHitTransferMicroseconds, &FallbackTransferMicroseconds, &QuietInteriorPreservationMicroseconds, bApplyDestructiveFilter, bEnableStructuredGapFill, bEnableV9Phase1Authority, bRecordPhaseTiming](const int32 SampleIndex)
 		{
 			const FVector3d QueryPoint = Planet.Samples[SampleIndex].Position;
 			const int32 PreviousPlateId = Planet.Samples[SampleIndex].PlateId;
@@ -13774,6 +13849,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		TArray<FV6ThesisRemeshRayHit> HitCandidates;
 		TArray<FV6ThesisRemeshRayHit> UnfilteredHitCandidates;
 		int32 LocalRejectedDestructiveHitCount = 0;
+		const double HitSearchStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		CollectThesisRemeshRayHitCandidates(
 			QueryGeometries,
 			QueryPoint,
@@ -13793,6 +13869,10 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 					IsCopiedFrontierTriangleDestructive(&DestructiveFilterState, Hit.GlobalTriangleIndex) ? 1 : 0;
 			}
 			UnfilteredDestructiveCandidateCounts[SampleIndex] = LocalDestructiveCandidateCount;
+		}
+		if (bRecordPhaseTiming)
+		{
+			AccumulatePhaseTimingMicroseconds(HitSearchMicroseconds, HitSearchStartTime);
 		}
 		if (LocalRejectedDestructiveHitCount > 0)
 		{
@@ -14092,6 +14172,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		}
 		else
 		{
+			const double ZeroHitRecoveryStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 			if (!bNeedsRecoveryCandidates)
 			{
 				CollectThesisRemeshMissRecoveryCandidates(QueryGeometries, QueryPoint, RecoveryCandidates);
@@ -14313,6 +14394,10 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 					}
 				}
 			}
+			if (bRecordPhaseTiming)
+			{
+				AccumulatePhaseTimingMicroseconds(ZeroHitRecoveryMicroseconds, ZeroHitRecoveryStartTime);
+			}
 		}
 
 		LastResolvedSamples[SampleIndex] = Resolved;
@@ -14357,7 +14442,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				PreSolveElevations)
 			: FV6ContinentalBreadthPreservationSupport{};
 
-	ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &PreSolveContinentalWeights, &PreSolveElevations, &PreSolveThicknesses, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &SubductionDistances, &SubductionSpeeds, &DirectHitTriangleTransferCount, &TransferFallbackCount, &ActiveBandTriangleFieldContinuityClampCount, &ActiveBandSyntheticFieldPreserveCount, &ActiveBandOceanicFieldPreserveCount, &ActiveBandSyntheticSingleSourceRecoveryCount, &QuietInteriorContinentalRetentionCount, &QuietInteriorContinentalRetentionTriangleCount, &QuietInteriorContinentalRetentionSingleSourceCount, &ContinentalBreadthSupport, &ContinentalBreadthPreservationCount, &ContinentalBreadthPreservationStrongInteriorCount, &ContinentalBreadthPreservationModerateInteriorCount, &PaperSurrogateOwnershipOverrideCount, &PaperSurrogateOwnershipOverrideSubaerialCount, &PaperSurrogateOwnershipOverrideSubmergedCount, &PaperSurrogateOwnershipOverrideTriangleCount, &PaperSurrogateOwnershipOverrideSingleSourceCount, &PaperSurrogateOwnershipOverrideStrongInteriorCount, &PaperSurrogateOwnershipOverrideModerateInteriorCount, &PaperSurrogateOwnershipOverrideLowElevationBandCount, &PaperSurrogateOwnershipOverrideModerateElevationBandCount, &PaperSurrogateOwnershipOverrideHighElevationBandCount, &PaperSurrogateQuietInteriorDirectHitEligibleCount, &PaperSurrogateQuietInteriorDirectHitPreSolveContinentalWeightScaledSum, &PaperSurrogateQuietInteriorDirectHitPostTransferContinentalWeightScaledSum, &PaperSurrogateQuietInteriorDirectHitFinalContinentalWeightScaledSum, &PaperSurrogateQuietInteriorDirectHitPreSolveElevationScaledSum, &PaperSurrogateQuietInteriorDirectHitPostTransferElevationScaledSum, &PaperSurrogateQuietInteriorDirectHitFinalElevationScaledSum, &PaperSurrogateQuietInteriorDirectHitPreSolveThicknessScaledSum, &PaperSurrogateQuietInteriorDirectHitPostTransferThicknessScaledSum, &PaperSurrogateQuietInteriorDirectHitFinalThicknessScaledSum](const int32 SampleIndex)
+	ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &PreSolveContinentalWeights, &PreSolveElevations, &PreSolveThicknesses, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &SubductionDistances, &SubductionSpeeds, &DirectHitTriangleTransferCount, &TransferFallbackCount, &NearestMemberFallbackTransferCount, &ExplicitFallbackTransferCount, &ActiveBandTriangleFieldContinuityClampCount, &ActiveBandSyntheticFieldPreserveCount, &ActiveBandOceanicFieldPreserveCount, &ActiveBandSyntheticSingleSourceRecoveryCount, &QuietInteriorContinentalRetentionCount, &QuietInteriorContinentalRetentionTriangleCount, &QuietInteriorContinentalRetentionSingleSourceCount, &ContinentalBreadthSupport, &ContinentalBreadthPreservationCount, &ContinentalBreadthPreservationStrongInteriorCount, &ContinentalBreadthPreservationModerateInteriorCount, &PaperSurrogateOwnershipOverrideCount, &PaperSurrogateOwnershipOverrideSubaerialCount, &PaperSurrogateOwnershipOverrideSubmergedCount, &PaperSurrogateOwnershipOverrideTriangleCount, &PaperSurrogateOwnershipOverrideSingleSourceCount, &PaperSurrogateOwnershipOverrideStrongInteriorCount, &PaperSurrogateOwnershipOverrideModerateInteriorCount, &PaperSurrogateOwnershipOverrideLowElevationBandCount, &PaperSurrogateOwnershipOverrideModerateElevationBandCount, &PaperSurrogateOwnershipOverrideHighElevationBandCount, &PaperSurrogateQuietInteriorDirectHitEligibleCount, &PaperSurrogateQuietInteriorDirectHitPreSolveContinentalWeightScaledSum, &PaperSurrogateQuietInteriorDirectHitPostTransferContinentalWeightScaledSum, &PaperSurrogateQuietInteriorDirectHitFinalContinentalWeightScaledSum, &PaperSurrogateQuietInteriorDirectHitPreSolveElevationScaledSum, &PaperSurrogateQuietInteriorDirectHitPostTransferElevationScaledSum, &PaperSurrogateQuietInteriorDirectHitFinalElevationScaledSum, &PaperSurrogateQuietInteriorDirectHitPreSolveThicknessScaledSum, &PaperSurrogateQuietInteriorDirectHitPostTransferThicknessScaledSum, &PaperSurrogateQuietInteriorDirectHitFinalThicknessScaledSum, &DirectHitTransferMicroseconds, &FallbackTransferMicroseconds, &QuietInteriorPreservationMicroseconds, bRecordPhaseTiming](const int32 SampleIndex)
 	{
 		FSample& Sample = Planet.Samples[SampleIndex];
 		const FSample PreviousSample = Sample;
@@ -14366,6 +14451,24 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		Resolved.TransferDebug = FTectonicPlanetV6TransferDebugInfo{};
 
 		bool bTransferred = false;
+		double FallbackTransferStartTime = 0.0;
+		bool bFallbackTransferTimingActive = false;
+		const auto BeginFallbackTransferTiming = [&]()
+		{
+			if (bRecordPhaseTiming && !bFallbackTransferTimingActive)
+			{
+				FallbackTransferStartTime = GetPhaseTimingSeconds();
+				bFallbackTransferTimingActive = true;
+			}
+		};
+		const auto FinishFallbackTransferTiming = [&]()
+		{
+			if (bRecordPhaseTiming && bFallbackTransferTimingActive)
+			{
+				AccumulatePhaseTimingMicroseconds(FallbackTransferMicroseconds, FallbackTransferStartTime);
+				bFallbackTransferTimingActive = false;
+			}
+		};
 		if ((Resolved.ResolutionKind == ETectonicPlanetV6ResolutionKind::ThesisRemeshHit ||
 				Resolved.ResolutionKind == ETectonicPlanetV6ResolutionKind::ThesisRemeshRetainedOutsideActiveZone) &&
 			Resolved.FinalPlateId != INDEX_NONE)
@@ -14394,6 +14497,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 						const FCarriedSample V0 = BuildRotatedLocalCarriedSample(Plate, Mesh.LocalCarriedSamples[LocalTriangle.A]);
 						const FCarriedSample V1 = BuildRotatedLocalCarriedSample(Plate, Mesh.LocalCarriedSamples[LocalTriangle.B]);
 						const FCarriedSample V2 = BuildRotatedLocalCarriedSample(Plate, Mesh.LocalCarriedSamples[LocalTriangle.C]);
+						const double DirectHitTransferStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 						ApplyTransferredAttributesFromTriangle(
 							Sample,
 							V0,
@@ -14408,6 +14512,10 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 							Mesh.LocalTriangleCopiedFrontierFlags.IsValidIndex(LocalTriangleIndex) &&
 							Mesh.LocalTriangleCopiedFrontierFlags[LocalTriangleIndex] != 0;
 						++DirectHitTriangleTransferCount;
+						if (bRecordPhaseTiming)
+						{
+							AccumulatePhaseTimingMicroseconds(DirectHitTransferMicroseconds, DirectHitTransferStartTime);
+						}
 						bTransferred = true;
 					}
 				}
@@ -14419,6 +14527,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			Resolved.FinalPlateId != INDEX_NONE &&
 			Resolved.SourceCanonicalSampleIndex != INDEX_NONE)
 		{
+			BeginFallbackTransferTiming();
 			if (const FCarriedSample* Source =
 					FindCarriedSampleForCanonicalVertex(
 						Planet,
@@ -14440,6 +14549,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			Resolved.FinalPlateId != INDEX_NONE &&
 			Resolved.SourceCanonicalSampleIndex != INDEX_NONE)
 		{
+			BeginFallbackTransferTiming();
 			if (const FCarriedSample* Source =
 					FindCarriedSampleForCanonicalVertex(
 						Planet,
@@ -14459,6 +14569,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		if (!bTransferred &&
 			Resolved.bHasStructuredSyntheticFill)
 		{
+			BeginFallbackTransferTiming();
 			ApplyStructuredSyntheticGapFill(
 				Sample,
 				Resolved.StructuredSyntheticFillSample,
@@ -14497,6 +14608,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 						const FCarriedSample V0 = BuildRotatedLocalCarriedSample(Plate, Mesh.LocalCarriedSamples[LocalTriangle.A]);
 						const FCarriedSample V1 = BuildRotatedLocalCarriedSample(Plate, Mesh.LocalCarriedSamples[LocalTriangle.B]);
 						const FCarriedSample V2 = BuildRotatedLocalCarriedSample(Plate, Mesh.LocalCarriedSamples[LocalTriangle.C]);
+						const double DirectHitTransferStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 						ApplyTransferredAttributesFromTriangle(
 							Sample,
 							V0,
@@ -14510,12 +14622,17 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 						Resolved.TransferDebug.bUsedCopiedFrontierTriangleTransfer =
 							Mesh.LocalTriangleCopiedFrontierFlags.IsValidIndex(LocalTriangleIndex) &&
 							Mesh.LocalTriangleCopiedFrontierFlags[LocalTriangleIndex] != 0;
+						if (bRecordPhaseTiming)
+						{
+							AccumulatePhaseTimingMicroseconds(DirectHitTransferMicroseconds, DirectHitTransferStartTime);
+						}
 						bTransferred = true;
 					}
 				}
 
 				if (!bTransferred && Resolved.SourceCanonicalSampleIndex != INDEX_NONE)
 				{
+					BeginFallbackTransferTiming();
 					if (const FCarriedSample* Source =
 							FindCarriedSampleForCanonicalVertex(
 								Planet,
@@ -14539,6 +14656,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				Resolved.ResolutionKind == ETectonicPlanetV6ResolutionKind::ThesisRemeshMissDestructiveExclusion ||
 				Resolved.ResolutionKind == ETectonicPlanetV6ResolutionKind::ThesisRemeshMissAmbiguous))
 		{
+			BeginFallbackTransferTiming();
 			ApplyOceanicBoundaryCreation(
 				Sample,
 				Planet,
@@ -14551,6 +14669,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 
 		if (!bTransferred && Resolved.FinalPlateId != INDEX_NONE)
 		{
+			BeginFallbackTransferTiming();
 			int32 TransferSourceCanonicalSampleIndex = Resolved.SourceCanonicalSampleIndex;
 			if (TransferSourceCanonicalSampleIndex == INDEX_NONE &&
 				Resolved.SourceTriangleIndex != INDEX_NONE)
@@ -14605,6 +14724,14 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				Resolved.TransferDebug.bUsedNearestMemberFallback = bUsedNearestMemberFallback;
 				Resolved.TransferDebug.bUsedExplicitFallback = bUsedExplicitFallback;
 				Resolved.ResolutionKind = ETectonicPlanetV6ResolutionKind::ThesisRemeshTransferFallback;
+				if (bUsedNearestMemberFallback)
+				{
+					++NearestMemberFallbackTransferCount;
+				}
+				if (bUsedExplicitFallback)
+				{
+					++ExplicitFallbackTransferCount;
+				}
 				if (IsCopiedFrontierConvergentFieldContinuityLocality(
 						ConvergentActiveFieldContinuityFlags,
 						AdjacentToConvergentActiveFieldContinuityFlags,
@@ -14618,7 +14745,9 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				bTransferred = true;
 			}
 		}
+		FinishFallbackTransferTiming();
 
+		const double QuietInteriorPreservationStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		const bool bQuietInteriorPaperSurrogateEligibility =
 			bTransferred &&
 			Resolved.bAuthorityRetainedOutsideActiveZone &&
@@ -14867,8 +14996,19 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			PaperSurrogateQuietInteriorDirectHitFinalElevationScaledSum += FinalElevationScaled;
 			PaperSurrogateQuietInteriorDirectHitFinalThicknessScaledSum += FinalThicknessScaled;
 		}
+		if (bRecordPhaseTiming)
+		{
+			AccumulatePhaseTimingMicroseconds(
+				QuietInteriorPreservationMicroseconds,
+				QuietInteriorPreservationStartTime);
+		}
 	});
 
+	if (bRecordPhaseTiming)
+	{
+		AccumulatePhaseTimingMs(PhaseTiming.ResolveTransferLoopMs, ResolveTransferLoopStartTime);
+	}
+	const double AttributionStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 	FTectonicPlanetV6PeriodicSolveStats TransferStats;
 	for (const FTectonicPlanetV6ResolvedSample& Resolved : LastResolvedSamples)
 	{
@@ -14932,6 +15072,8 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			OverlapCoherencePreviousPlateStabilizedSampleCount.Load();
 		CopiedFrontierAttribution.OverlapCoherenceSuppressedCandidateCount =
 			OverlapCoherenceSuppressedCandidateCount.Load();
+		const bool bBuildDetailedCopiedFrontierAttribution =
+			bEnableDetailedCopiedFrontierAttributionForTest;
 		TArray<uint8> GapAttributionBySample;
 		GapAttributionBySample.Init(
 			static_cast<uint8>(ETectonicPlanetV6CopiedFrontierGapAttribution::None),
@@ -14942,7 +15084,10 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		DestructiveExclusionContinuityMask.Init(0, Planet.Samples.Num());
 
 		TArray<FTectonicPlanetV6CopiedFrontierRepresentativeMiss> RepresentativeMissCandidates;
-		RepresentativeMissCandidates.Reserve(CopiedFrontierAttribution.MissCount);
+		if (bBuildDetailedCopiedFrontierAttribution)
+		{
+			RepresentativeMissCandidates.Reserve(CopiedFrontierAttribution.MissCount);
+		}
 		TArray<FTectonicPlanetV6CopiedFrontierRepresentativeHitLoss> RepresentativeSingleHitLossCandidates;
 		TMap<int32, int32> SingleHitLossCountsByPreviousPlate;
 		TMap<int32, int32> SingleHitLossCountsByFinalPlate;
@@ -14995,8 +15140,192 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			}
 		}
 
-		for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+		if (!bBuildDetailedCopiedFrontierAttribution)
 		{
+			for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+			{
+				if (!Planet.Samples.IsValidIndex(SampleIndex) || !LastResolvedSamples.IsValidIndex(SampleIndex))
+				{
+					continue;
+				}
+
+				const FSample& Sample = Planet.Samples[SampleIndex];
+				const FTectonicPlanetV6ResolvedSample& Resolved = LastResolvedSamples[SampleIndex];
+				const bool bWasContinental =
+					PreSolveContinentalFlags.IsValidIndex(SampleIndex) &&
+					PreSolveContinentalFlags[SampleIndex] != 0;
+				const bool bIsContinental = Sample.ContinentalWeight >= 0.5f;
+
+				CopiedFrontierAttribution.ContinentalSamplesBefore += bWasContinental ? 1 : 0;
+				CopiedFrontierAttribution.ContinentalSamplesAfter += bIsContinental ? 1 : 0;
+				CopiedFrontierAttribution.ContinentalSamplesGained += (!bWasContinental && bIsContinental) ? 1 : 0;
+
+				if (Resolved.ExactCandidateCount > 0)
+				{
+					const bool bCopiedFrontierHit =
+						Resolved.TransferDebug.SourceKind == ETectonicPlanetV6TransferSourceKind::Triangle &&
+						Resolved.TransferDebug.bUsedCopiedFrontierTriangleTransfer;
+					const bool bSamePlateWinner = Resolved.FinalPlateId == Resolved.PreviousPlateId;
+
+					if (Resolved.ExactCandidateCount > 1)
+					{
+						++CopiedFrontierAttribution.MultiHitWinnerCount;
+						CopiedFrontierAttribution.MultiHitWinnerSamePlateCount += bSamePlateWinner ? 1 : 0;
+						CopiedFrontierAttribution.MultiHitWinnerCrossPlateCount += !bSamePlateWinner ? 1 : 0;
+						CopiedFrontierAttribution.MultiHitWinnerCopiedFrontierHitCount += bCopiedFrontierHit ? 1 : 0;
+						CopiedFrontierAttribution.MultiHitWinnerInteriorHitCount += !bCopiedFrontierHit ? 1 : 0;
+					}
+					else
+					{
+						++CopiedFrontierAttribution.SingleHitWinnerCount;
+					}
+
+					if (bCopiedFrontierHit)
+					{
+						++CopiedFrontierAttribution.CopiedFrontierHitCount;
+					}
+					else
+					{
+						++CopiedFrontierAttribution.InteriorHitCount;
+					}
+
+					if (Resolved.TransferDebug.bContinentalWeightWouldCrossThresholdUnderBarycentricBlend)
+					{
+						++CopiedFrontierAttribution.HitCwThresholdMismatchCount;
+						if (bCopiedFrontierHit)
+						{
+							++CopiedFrontierAttribution.CopiedFrontierHitCwThresholdMismatchCount;
+						}
+						else
+						{
+							++CopiedFrontierAttribution.InteriorHitCwThresholdMismatchCount;
+						}
+					}
+
+					if (bApplyDestructiveFilter &&
+						UnfilteredExactCandidateCounts.IsValidIndex(SampleIndex) &&
+						UnfilteredDestructiveCandidateCounts.IsValidIndex(SampleIndex) &&
+						UnfilteredExactCandidateCounts[SampleIndex] > Resolved.ExactCandidateCount &&
+						UnfilteredDestructiveCandidateCounts[SampleIndex] > 0)
+					{
+						++CopiedFrontierAttribution.SamplesWithPartialDestructiveCandidateRemovalCount;
+					}
+				}
+
+				if (bWasContinental && !bIsContinental)
+				{
+					++CopiedFrontierAttribution.ContinentalSamplesLost;
+					switch (Resolved.TransferDebug.SourceKind)
+					{
+					case ETectonicPlanetV6TransferSourceKind::OceanicCreation:
+						++CopiedFrontierAttribution.ContinentalLossFromOceanicCreationCount;
+						break;
+					case ETectonicPlanetV6TransferSourceKind::Triangle:
+						++CopiedFrontierAttribution.ContinentalLossFromHitCount;
+						if (Resolved.TransferDebug.bContinentalWeightWouldCrossThresholdUnderBarycentricBlend)
+						{
+							++CopiedFrontierAttribution.ContinentalLossFromHitCwThresholdMismatchCount;
+						}
+						if (Resolved.ExactCandidateCount > 1)
+						{
+							++CopiedFrontierAttribution.ContinentalLossFromHitMultiWinnerCount;
+						}
+						else if (Resolved.ExactCandidateCount == 1)
+						{
+							++CopiedFrontierAttribution.ContinentalLossFromHitSingleWinnerCount;
+						}
+						break;
+					default:
+						break;
+					}
+
+					if (Resolved.TransferDebug.SourceKind == ETectonicPlanetV6TransferSourceKind::Triangle)
+					{
+						const bool bCopiedFrontierHit =
+							Resolved.TransferDebug.bUsedCopiedFrontierTriangleTransfer;
+						const bool bSamePlateWinner = Resolved.FinalPlateId == Resolved.PreviousPlateId;
+
+						if (Resolved.ExactCandidateCount == 1)
+						{
+							CopiedFrontierAttribution.SingleHitContinentalLossSamePlateCount += bSamePlateWinner ? 1 : 0;
+							CopiedFrontierAttribution.SingleHitContinentalLossCrossPlateCount += !bSamePlateWinner ? 1 : 0;
+							CopiedFrontierAttribution.SingleHitContinentalLossCopiedFrontierHitCount += bCopiedFrontierHit ? 1 : 0;
+							CopiedFrontierAttribution.SingleHitContinentalLossInteriorHitCount += !bCopiedFrontierHit ? 1 : 0;
+						}
+						else if (Resolved.ExactCandidateCount > 1)
+						{
+							CopiedFrontierAttribution.MultiHitContinentalLossSamePlateCount += bSamePlateWinner ? 1 : 0;
+							CopiedFrontierAttribution.MultiHitContinentalLossCrossPlateCount += !bSamePlateWinner ? 1 : 0;
+							CopiedFrontierAttribution.MultiHitContinentalLossCopiedFrontierHitCount += bCopiedFrontierHit ? 1 : 0;
+							CopiedFrontierAttribution.MultiHitContinentalLossInteriorHitCount += !bCopiedFrontierHit ? 1 : 0;
+						}
+					}
+				}
+
+				if (Resolved.ExactCandidateCount != 0)
+				{
+					continue;
+				}
+
+				const ETectonicPlanetV6CopiedFrontierGapAttribution GapAttribution =
+					GapAttributionBySample.IsValidIndex(SampleIndex)
+						? static_cast<ETectonicPlanetV6CopiedFrontierGapAttribution>(GapAttributionBySample[SampleIndex])
+						: ETectonicPlanetV6CopiedFrontierGapAttribution::None;
+				const bool bUsedStructuredSyntheticFill =
+					Resolved.TransferDebug.SourceKind == ETectonicPlanetV6TransferSourceKind::StructuredSynthetic;
+
+				if (bUsedStructuredSyntheticFill)
+				{
+					++CopiedFrontierAttribution.MissFrontierPairStructuredSyntheticCount;
+					++CopiedFrontierAttribution.MissFrontierPairVertexApproximationCount;
+				}
+
+				switch (GapAttribution)
+				{
+				case ETectonicPlanetV6CopiedFrontierGapAttribution::TrueDivergence:
+					++CopiedFrontierAttribution.MissTrueDivergenceGapCount;
+					if (bUsedStructuredSyntheticFill)
+					{
+						++CopiedFrontierAttribution.TrueDivergenceStructuredSyntheticCount;
+					}
+					break;
+				case ETectonicPlanetV6CopiedFrontierGapAttribution::DestructiveExclusion:
+					++CopiedFrontierAttribution.MissDestructiveExclusionGapCount;
+					break;
+				case ETectonicPlanetV6CopiedFrontierGapAttribution::Ambiguous:
+					++CopiedFrontierAttribution.MissAmbiguousGapCount;
+					if (bUsedStructuredSyntheticFill)
+					{
+						++CopiedFrontierAttribution.AmbiguousStructuredSyntheticCount;
+					}
+					break;
+				case ETectonicPlanetV6CopiedFrontierGapAttribution::None:
+				default:
+					break;
+				}
+
+				if (GapAttribution == ETectonicPlanetV6CopiedFrontierGapAttribution::DestructiveExclusion)
+				{
+					if (bUsedStructuredSyntheticFill)
+					{
+						++CopiedFrontierAttribution.DestructiveExclusionStructuredSyntheticCount;
+					}
+					else if (DestructiveExclusionContinuityMask.IsValidIndex(SampleIndex) &&
+						DestructiveExclusionContinuityMask[SampleIndex] != 0)
+					{
+						++CopiedFrontierAttribution.DestructiveExclusionOverrideContinuityCount;
+					}
+					else
+					{
+						++CopiedFrontierAttribution.DestructiveExclusionFallbackOceanicCount;
+					}
+				}
+			}
+		}
+		else
+		{
+			for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+			{
 		if (!Planet.Samples.IsValidIndex(SampleIndex) || !LastResolvedSamples.IsValidIndex(SampleIndex))
 		{
 			continue;
@@ -15568,9 +15897,26 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		RepresentativeMiss.MotionClass = ToCopiedFrontierMotionClass(MotionClass);
 		RepresentativeMiss.GapAttribution = GapAttribution;
 	}
+		}
+	if (bRecordPhaseTiming)
+	{
+		AccumulatePhaseTimingMs(PhaseTiming.AttributionMs, AttributionStartTime);
+	}
 
+	const double RepartitionStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 	Planet.RepartitionMembership(NewPlateIds, &SubductionDistances, &SubductionSpeeds);
+	if (bRecordPhaseTiming)
+	{
+		AccumulatePhaseTimingMs(PhaseTiming.RepartitionMembershipMs, RepartitionStartTime);
+	}
+	const double SubductionDistanceFieldStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 	Planet.ComputeSubductionDistanceField();
+	if (bRecordPhaseTiming)
+	{
+		AccumulatePhaseTimingMs(
+			PhaseTiming.SubductionDistanceFieldMs,
+			SubductionDistanceFieldStartTime);
+	}
 	FV6CopiedFrontierTectonicMaintenanceStats TectonicMaintenanceStats;
 	if (bEnableTectonicMaintenance)
 	{
@@ -15586,11 +15932,27 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			Interval,
 			bUseLinearConvergentMaintenanceSpeedFactorForTest,
 			bUseLinearConvergentMaintenanceInfluenceForTest);
+		const double PlateScoresStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		Planet.ComputePlateScores();
+		if (bRecordPhaseTiming)
+		{
+			AccumulatePhaseTimingMs(PhaseTiming.PlateScoresMs, PlateScoresStartTime);
+		}
 	}
+	const double SlabPullStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 	Planet.ComputeSlabPullCorrections();
+	if (bRecordPhaseTiming)
+	{
+		AccumulatePhaseTimingMs(PhaseTiming.SlabPullMs, SlabPullStartTime);
+	}
+	const double TerraneDetectionStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 	Planet.DetectTerranes(PreviousTerranes);
+	if (bRecordPhaseTiming)
+	{
+		AccumulatePhaseTimingMs(PhaseTiming.TerraneDetectionMs, TerraneDetectionStartTime);
+	}
 
+	const double ComponentAuditStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 	TArray<FV6AssignmentComponent> FinalComponents;
 	BuildAssignmentComponents(Planet, NewPlateIds, FinalComponents);
 	TMap<int32, int32> LargestComponentIndexByPlate;
@@ -15681,35 +16043,41 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		CopiedFrontierAttribution.FragmentedComponentsAdjacentToDestructiveExclusionGapCount +=
 			bAdjacentToDestructiveExclusionGap ? 1 : 0;
 	}
-
-	RepresentativeMissCandidates.Sort([](
-		const FTectonicPlanetV6CopiedFrontierRepresentativeMiss& Left,
-		const FTectonicPlanetV6CopiedFrontierRepresentativeMiss& Right)
+	if (bRecordPhaseTiming)
 	{
-		if (Left.bAdjacentToCopiedFrontierGeometry != Right.bAdjacentToCopiedFrontierGeometry)
+		AccumulatePhaseTimingMs(PhaseTiming.ComponentAuditMs, ComponentAuditStartTime);
+	}
+
+	if (bBuildDetailedCopiedFrontierAttribution)
+	{
+		RepresentativeMissCandidates.Sort([](
+			const FTectonicPlanetV6CopiedFrontierRepresentativeMiss& Left,
+			const FTectonicPlanetV6CopiedFrontierRepresentativeMiss& Right)
 		{
-			return Left.bAdjacentToCopiedFrontierGeometry;
-		}
-		const bool bLeftHasDistance = Left.NearestCopiedFrontierTriangleDistance >= 0.0;
-		const bool bRightHasDistance = Right.NearestCopiedFrontierTriangleDistance >= 0.0;
-		if (bLeftHasDistance != bRightHasDistance)
-		{
-			return bLeftHasDistance;
-		}
-		if (bLeftHasDistance &&
-			!FMath::IsNearlyEqual(
-				Left.NearestCopiedFrontierTriangleDistance,
-				Right.NearestCopiedFrontierTriangleDistance,
-				TriangleEpsilon))
-		{
-			return Left.NearestCopiedFrontierTriangleDistance < Right.NearestCopiedFrontierTriangleDistance;
-		}
-		if (Left.bNearMultiHitRegion != Right.bNearMultiHitRegion)
-		{
-			return Left.bNearMultiHitRegion;
-		}
-		return Left.SampleIndex < Right.SampleIndex;
-	});
+			if (Left.bAdjacentToCopiedFrontierGeometry != Right.bAdjacentToCopiedFrontierGeometry)
+			{
+				return Left.bAdjacentToCopiedFrontierGeometry;
+			}
+			const bool bLeftHasDistance = Left.NearestCopiedFrontierTriangleDistance >= 0.0;
+			const bool bRightHasDistance = Right.NearestCopiedFrontierTriangleDistance >= 0.0;
+			if (bLeftHasDistance != bRightHasDistance)
+			{
+				return bLeftHasDistance;
+			}
+			if (bLeftHasDistance &&
+				!FMath::IsNearlyEqual(
+					Left.NearestCopiedFrontierTriangleDistance,
+					Right.NearestCopiedFrontierTriangleDistance,
+					TriangleEpsilon))
+			{
+				return Left.NearestCopiedFrontierTriangleDistance < Right.NearestCopiedFrontierTriangleDistance;
+			}
+			if (Left.bNearMultiHitRegion != Right.bNearMultiHitRegion)
+			{
+				return Left.bNearMultiHitRegion;
+			}
+			return Left.SampleIndex < Right.SampleIndex;
+		});
 
 		const int32 RepresentativeMissLimit = FMath::Min(RepresentativeMissCandidates.Num(), 8);
 		for (int32 MissIndex = 0; MissIndex < RepresentativeMissLimit; ++MissIndex)
@@ -15776,6 +16144,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			CopiedFrontierAttribution.RepresentativeSingleHitLosses.Add(
 				RepresentativeSingleHitLossCandidates[LossIndex]);
 		}
+	}
 
 		CopiedFrontierAttribution.TectonicMaintenanceAppliedCount = TectonicMaintenanceStats.AppliedCount;
 		CopiedFrontierAttribution.TectonicMaintenanceContinentalRecoveredCount =
@@ -15881,6 +16250,8 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	LastSolveStats.OceanicCreationCount = TransferStats.OceanicCreationCount;
 	LastSolveStats.DefaultTransferCount = TransferStats.DefaultTransferCount;
 	LastSolveStats.TransferFallbackCount = TransferFallbackCount.Load();
+	LastSolveStats.NearestMemberFallbackTransferCount = NearestMemberFallbackTransferCount.Load();
+	LastSolveStats.ExplicitFallbackTransferCount = ExplicitFallbackTransferCount.Load();
 	LastSolveStats.PlateLocalVertexCount = PlateLocalVertexCount;
 	LastSolveStats.PlateLocalTriangleCount = PlateLocalTriangleCount;
 	LastSolveStats.CopiedFrontierVertexCount = CopiedFrontierVertexCount;
@@ -15976,6 +16347,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	LastSolveStats.MaxComponentsPerPlate = ComputeMaxComponentsPerPlate(Planet);
 	if (bEnableV9CollisionShadowForTest && bEnableV9Phase1Authority)
 	{
+		const double CollisionShadowStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		UpdateV9CollisionShadowState(
 			Planet,
 			PreSolvePlateIds,
@@ -15987,6 +16359,10 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			CurrentSolveCollisionShadowQualifiedFlags,
 			CurrentSolveCollisionShadowPersistenceMask,
 			CurrentSolveCollisionShadowDiagnostic);
+		if (bRecordPhaseTiming)
+		{
+			AccumulatePhaseTimingMs(PhaseTiming.CollisionShadowMs, CollisionShadowStartTime);
+		}
 	}
 	else
 	{
@@ -16000,6 +16376,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		bEnableV9CollisionShadowForTest &&
 		bEnableV9Phase1Authority)
 	{
+		const double CollisionExecutionStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
 		if (bEnableV9ThesisShapedCollisionExecutionForTest)
 		{
 			ExecuteV9ThesisShapedCollisionEventRedesign(
@@ -16052,6 +16429,12 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				bEnableV9CollisionExecutionEnhancedConsequencesForTest,
 				bEnableV9CollisionExecutionStructuralTransferForTest,
 				bEnableV9CollisionExecutionRefinedStructuralTransferForTest);
+		}
+		if (bRecordPhaseTiming)
+		{
+			AccumulatePhaseTimingMs(
+				PhaseTiming.CollisionExecutionMs,
+				CollisionExecutionStartTime);
 		}
 	}
 	else
@@ -16106,6 +16489,14 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		}
 		ResetV9CollisionExecutionLegacyStats(Planet);
 	}
+	PhaseTiming.HitSearchMs = ConvertPhaseTimingMicrosecondsToMilliseconds(HitSearchMicroseconds);
+	PhaseTiming.ZeroHitRecoveryMs = ConvertPhaseTimingMicrosecondsToMilliseconds(ZeroHitRecoveryMicroseconds);
+	PhaseTiming.DirectHitTransferMs = ConvertPhaseTimingMicrosecondsToMilliseconds(DirectHitTransferMicroseconds);
+	PhaseTiming.FallbackTransferMs = ConvertPhaseTimingMicrosecondsToMilliseconds(FallbackTransferMicroseconds);
+	PhaseTiming.QuietInteriorPreservationMs =
+		ConvertPhaseTimingMicrosecondsToMilliseconds(QuietInteriorPreservationMicroseconds);
+	LastSolveStats.PhaseTiming = PhaseTiming;
+	LastSolveStats.SolveMilliseconds = (FPlatformTime::Seconds() - SolveStartTime) * 1000.0;
 	const TCHAR* CopiedFrontierModeLabel = GetCopiedFrontierModeLabel(PeriodicSolveMode);
 
 	UE_LOG(
@@ -16184,6 +16575,39 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		LastSolveStats.ContinentalWeightThresholdMismatchCount,
 		LastSolveStats.ContinentalAreaFraction,
 		LastSolveStats.MaxComponentsPerPlate);
+	if (bRecordPhaseTiming)
+	{
+		const FTectonicPlanetV6PhaseTiming& SolvePhaseTiming = LastSolveStats.PhaseTiming;
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[V6PhaseTiming %s Step=%d] total_ms=%.3f pre_solve_ms=%.3f sample_adjacency_ms=%.3f active_zone_ms=%.3f copied_frontier_mesh_ms=%.3f query_geometry_ms=%.3f frontier_point_sets_ms=%.3f resolve_transfer_loop_ms=%.3f hit_search_ms=%.3f zero_hit_recovery_ms=%.3f direct_hit_transfer_ms=%.3f fallback_transfer_ms=%.3f quiet_interior_preserve_ms=%.3f attribution_ms=%.3f repartition_ms=%.3f subduction_field_ms=%.3f plate_scores_ms=%.3f slab_pull_ms=%.3f terrane_ms=%.3f component_audit_ms=%.3f rebuild_meshes_ms=%.3f collision_shadow_ms=%.3f collision_exec_ms=%.3f"),
+			CopiedFrontierModeLabel,
+			Planet.CurrentStep,
+			LastSolveStats.SolveMilliseconds,
+			SolvePhaseTiming.PreSolveCaptureMs,
+			SolvePhaseTiming.SampleAdjacencyBuildMs,
+			SolvePhaseTiming.ActiveZoneMaskMs,
+			SolvePhaseTiming.CopiedFrontierMeshBuildMs,
+			SolvePhaseTiming.QueryGeometryBuildMs,
+			SolvePhaseTiming.FrontierPointSetBuildMs,
+			SolvePhaseTiming.ResolveTransferLoopMs,
+			SolvePhaseTiming.HitSearchMs,
+			SolvePhaseTiming.ZeroHitRecoveryMs,
+			SolvePhaseTiming.DirectHitTransferMs,
+			SolvePhaseTiming.FallbackTransferMs,
+			SolvePhaseTiming.QuietInteriorPreservationMs,
+			SolvePhaseTiming.AttributionMs,
+			SolvePhaseTiming.RepartitionMembershipMs,
+			SolvePhaseTiming.SubductionDistanceFieldMs,
+			SolvePhaseTiming.PlateScoresMs,
+			SolvePhaseTiming.SlabPullMs,
+			SolvePhaseTiming.TerraneDetectionMs,
+			SolvePhaseTiming.ComponentAuditMs,
+			SolvePhaseTiming.RebuildCopiedFrontierMeshesMs,
+			SolvePhaseTiming.CollisionShadowMs,
+			SolvePhaseTiming.CollisionExecutionMs);
+	}
 
 	// --- Update persistent diagnostic state ---
 	// Miss lineage counters
@@ -19170,6 +19594,16 @@ void FTectonicPlanetV6::SetExcludeMixedTrianglesForTest(const bool bEnable)
 void FTectonicPlanetV6::SetPerTimestepContainmentSoupRebuildForTest(const bool bEnable)
 {
 	bForcePerTimestepContainmentSoupRebuildForTest = bEnable;
+}
+
+void FTectonicPlanetV6::SetPhaseTimingForTest(const bool bEnable)
+{
+	bEnablePhaseTimingForTest = bEnable;
+}
+
+void FTectonicPlanetV6::SetDetailedCopiedFrontierAttributionForTest(const bool bEnable)
+{
+	bEnableDetailedCopiedFrontierAttributionForTest = bEnable;
 }
 
 void FTectonicPlanetV6::SetV9Phase1AuthorityForTest(const bool bEnable, const int32 InActiveBoundaryRingCount)
