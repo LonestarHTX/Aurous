@@ -50,6 +50,189 @@ namespace
 	constexpr float ActiveBandSyntheticMaxContinentalWeightDelta = 0.10f;
 	constexpr float ActiveBandSyntheticMaxThicknessDeltaKm = 2.5f;
 	constexpr int32 ActiveBandSyntheticLoopBreakMinNeighborSupport = 2;
+	constexpr float ContinentalBreadthStrongInteriorPreserveFactor = 0.60f;
+	constexpr float ContinentalBreadthModerateInteriorPreserveFactor = 0.32f;
+	constexpr int32 ContinentalBreadthStrongInteriorMinCoastDepth = 2;
+	constexpr int32 ContinentalBreadthModerateInteriorMinCoastDepth = 1;
+	constexpr double ContinentalBreadthStrongNeighborhoodFraction = 0.70;
+	constexpr double ContinentalBreadthModerateNeighborhoodFraction = 0.58;
+	constexpr double ContinentalBreadthStrongSubaerialNeighborhoodFraction = 0.40;
+	constexpr float ContinentalBreadthMinQuietElevationKm = -0.25f;
+	constexpr float PaperSurrogateSelectiveElevationLowKm = 1.5f;
+	constexpr float PaperSurrogateSelectiveElevationHighKm = 4.0f;
+	constexpr float PaperSurrogateSelectiveElevationHighBlend = 0.60f;
+	constexpr double PaperSurrogateDiagnosticScale = 1000000.0;
+
+	enum class EPaperSurrogateElevationBand : uint8
+	{
+		Low,
+		Moderate,
+		High,
+	};
+
+	EPaperSurrogateElevationBand ClassifyPaperSurrogateElevationBand(const float PreSolveElevationKm)
+	{
+		if (PreSolveElevationKm <= PaperSurrogateSelectiveElevationLowKm)
+		{
+			return EPaperSurrogateElevationBand::Low;
+		}
+		if (PreSolveElevationKm <= PaperSurrogateSelectiveElevationHighKm)
+		{
+			return EPaperSurrogateElevationBand::Moderate;
+		}
+		return EPaperSurrogateElevationBand::High;
+	}
+
+	float ComputePaperSurrogateSelectiveElevationBlend(const float PreSolveElevationKm)
+	{
+		if (PreSolveElevationKm <= PaperSurrogateSelectiveElevationLowKm)
+		{
+			return 1.0f;
+		}
+		if (PreSolveElevationKm >= PaperSurrogateSelectiveElevationHighKm)
+		{
+			return PaperSurrogateSelectiveElevationHighBlend;
+		}
+		const float Alpha = (PreSolveElevationKm - PaperSurrogateSelectiveElevationLowKm) /
+			(PaperSurrogateSelectiveElevationHighKm - PaperSurrogateSelectiveElevationLowKm);
+		return FMath::Lerp(1.0f, PaperSurrogateSelectiveElevationHighBlend, Alpha);
+	}
+
+	struct FV6ContinentalBreadthPreservationSupport
+	{
+		TArray<uint8> StrongInteriorFlags;
+		TArray<uint8> ModerateInteriorFlags;
+	};
+
+	FV6ContinentalBreadthPreservationSupport BuildContinentalBreadthPreservationSupport(
+		const FTectonicPlanet& Planet,
+		const TArray<float>& PreSolveContinentalWeights,
+		const TArray<float>& PreSolveElevations)
+	{
+		FV6ContinentalBreadthPreservationSupport Result;
+		const int32 SampleCount = Planet.Samples.Num();
+		Result.StrongInteriorFlags.Init(0, SampleCount);
+		Result.ModerateInteriorFlags.Init(0, SampleCount);
+
+		if (PreSolveContinentalWeights.Num() != SampleCount)
+		{
+			return Result;
+		}
+
+		TArray<uint8> IsContinental;
+		IsContinental.Init(0, SampleCount);
+		TArray<int32> CoastDistance;
+		CoastDistance.Init(INDEX_NONE, SampleCount);
+		TArray<int32> Queue;
+		Queue.Reserve(SampleCount);
+
+		for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+		{
+			if (PreSolveContinentalWeights[SampleIndex] < 0.5f)
+			{
+				continue;
+			}
+
+			IsContinental[SampleIndex] = 1;
+			bool bTouchesOceanicNeighbor = false;
+			if (Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+			{
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (!PreSolveContinentalWeights.IsValidIndex(NeighborIndex) ||
+						PreSolveContinentalWeights[NeighborIndex] < 0.5f)
+					{
+						bTouchesOceanicNeighbor = true;
+						break;
+					}
+				}
+			}
+
+			if (bTouchesOceanicNeighbor)
+			{
+				CoastDistance[SampleIndex] = 0;
+				Queue.Add(SampleIndex);
+			}
+		}
+
+		for (int32 QueueIndex = 0; QueueIndex < Queue.Num(); ++QueueIndex)
+		{
+			const int32 SampleIndex = Queue[QueueIndex];
+			const int32 NextDistance = CoastDistance[SampleIndex] + 1;
+			if (!Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+
+			for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+			{
+				if (!IsContinental.IsValidIndex(NeighborIndex) ||
+					IsContinental[NeighborIndex] == 0 ||
+					CoastDistance[NeighborIndex] != INDEX_NONE)
+				{
+					continue;
+				}
+
+				CoastDistance[NeighborIndex] = NextDistance;
+				Queue.Add(NeighborIndex);
+			}
+		}
+
+		for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+		{
+			if (IsContinental[SampleIndex] == 0)
+			{
+				continue;
+			}
+
+			const int32 CoastDepth = CoastDistance[SampleIndex];
+			const float PreSolveElevationKm =
+				PreSolveElevations.IsValidIndex(SampleIndex) ? PreSolveElevations[SampleIndex] : 0.0f;
+			int32 NeighborhoodCount = 1;
+			int32 ContinentalNeighborhoodCount = 1;
+			int32 SubaerialNeighborhoodCount = PreSolveElevationKm > 0.0f ? 1 : 0;
+			if (Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+			{
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					++NeighborhoodCount;
+					if (IsContinental.IsValidIndex(NeighborIndex) && IsContinental[NeighborIndex] != 0)
+					{
+						++ContinentalNeighborhoodCount;
+						if (PreSolveElevations.IsValidIndex(NeighborIndex) &&
+							PreSolveElevations[NeighborIndex] > 0.0f)
+						{
+							++SubaerialNeighborhoodCount;
+						}
+					}
+				}
+			}
+
+			const double ContinentalNeighborhoodFraction =
+				static_cast<double>(ContinentalNeighborhoodCount) /
+				static_cast<double>(FMath::Max(NeighborhoodCount, 1));
+			const double SubaerialNeighborhoodFraction =
+				static_cast<double>(SubaerialNeighborhoodCount) /
+				static_cast<double>(FMath::Max(NeighborhoodCount, 1));
+			const bool bBroadInteriorQuietCandidate =
+				PreSolveElevationKm > ContinentalBreadthMinQuietElevationKm;
+			const bool bStrongInterior =
+				CoastDepth >= ContinentalBreadthStrongInteriorMinCoastDepth &&
+				ContinentalNeighborhoodFraction >= ContinentalBreadthStrongNeighborhoodFraction &&
+				(PreSolveElevationKm > 0.0f ||
+					SubaerialNeighborhoodFraction >= ContinentalBreadthStrongSubaerialNeighborhoodFraction);
+			const bool bModerateInterior =
+				CoastDepth >= ContinentalBreadthModerateInteriorMinCoastDepth &&
+				ContinentalNeighborhoodFraction >= ContinentalBreadthModerateNeighborhoodFraction &&
+				bBroadInteriorQuietCandidate;
+
+			Result.StrongInteriorFlags[SampleIndex] = bStrongInterior ? 1 : 0;
+			Result.ModerateInteriorFlags[SampleIndex] =
+				(bStrongInterior || bModerateInterior) ? 1 : 0;
+		}
+
+		return Result;
+	}
 
 	FString JoinIntArrayForLog(const TArray<int32>& Values)
 	{
@@ -14143,10 +14326,41 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	TAtomic<int32> QuietInteriorContinentalRetentionCount(0);
 	TAtomic<int32> QuietInteriorContinentalRetentionTriangleCount(0);
 	TAtomic<int32> QuietInteriorContinentalRetentionSingleSourceCount(0);
+	TAtomic<int32> ContinentalBreadthPreservationCount(0);
+	TAtomic<int32> ContinentalBreadthPreservationStrongInteriorCount(0);
+	TAtomic<int32> ContinentalBreadthPreservationModerateInteriorCount(0);
+	TAtomic<int32> PaperSurrogateOwnershipOverrideCount(0);
+	TAtomic<int32> PaperSurrogateOwnershipOverrideSubaerialCount(0);
+	TAtomic<int32> PaperSurrogateOwnershipOverrideSubmergedCount(0);
+	TAtomic<int32> PaperSurrogateOwnershipOverrideTriangleCount(0);
+	TAtomic<int32> PaperSurrogateOwnershipOverrideSingleSourceCount(0);
+	TAtomic<int32> PaperSurrogateOwnershipOverrideStrongInteriorCount(0);
+	TAtomic<int32> PaperSurrogateOwnershipOverrideModerateInteriorCount(0);
+	TAtomic<int32> PaperSurrogateOwnershipOverrideLowElevationBandCount(0);
+	TAtomic<int32> PaperSurrogateOwnershipOverrideModerateElevationBandCount(0);
+	TAtomic<int32> PaperSurrogateOwnershipOverrideHighElevationBandCount(0);
+	TAtomic<int32> PaperSurrogateQuietInteriorDirectHitEligibleCount(0);
+	TAtomic<int64> PaperSurrogateQuietInteriorDirectHitPreSolveContinentalWeightScaledSum(0);
+	TAtomic<int64> PaperSurrogateQuietInteriorDirectHitPostTransferContinentalWeightScaledSum(0);
+	TAtomic<int64> PaperSurrogateQuietInteriorDirectHitFinalContinentalWeightScaledSum(0);
+	TAtomic<int64> PaperSurrogateQuietInteriorDirectHitPreSolveElevationScaledSum(0);
+	TAtomic<int64> PaperSurrogateQuietInteriorDirectHitPostTransferElevationScaledSum(0);
+	TAtomic<int64> PaperSurrogateQuietInteriorDirectHitFinalElevationScaledSum(0);
+	TAtomic<int64> PaperSurrogateQuietInteriorDirectHitPreSolveThicknessScaledSum(0);
+	TAtomic<int64> PaperSurrogateQuietInteriorDirectHitPostTransferThicknessScaledSum(0);
+	TAtomic<int64> PaperSurrogateQuietInteriorDirectHitFinalThicknessScaledSum(0);
+	const FV6ContinentalBreadthPreservationSupport ContinentalBreadthSupport =
+		(bEnableV9ContinentalBreadthPreservationForTest || bEnableV9PaperSurrogateOwnershipForTest)
+			? BuildContinentalBreadthPreservationSupport(
+				Planet,
+				PreSolveContinentalWeights,
+				PreSolveElevations)
+			: FV6ContinentalBreadthPreservationSupport{};
 
-	ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &PreSolveContinentalWeights, &PreSolveElevations, &PreSolveThicknesses, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &SubductionDistances, &SubductionSpeeds, &DirectHitTriangleTransferCount, &TransferFallbackCount, &ActiveBandTriangleFieldContinuityClampCount, &ActiveBandSyntheticFieldPreserveCount, &ActiveBandOceanicFieldPreserveCount, &ActiveBandSyntheticSingleSourceRecoveryCount, &QuietInteriorContinentalRetentionCount, &QuietInteriorContinentalRetentionTriangleCount, &QuietInteriorContinentalRetentionSingleSourceCount](const int32 SampleIndex)
+	ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &PreSolveContinentalWeights, &PreSolveElevations, &PreSolveThicknesses, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &SubductionDistances, &SubductionSpeeds, &DirectHitTriangleTransferCount, &TransferFallbackCount, &ActiveBandTriangleFieldContinuityClampCount, &ActiveBandSyntheticFieldPreserveCount, &ActiveBandOceanicFieldPreserveCount, &ActiveBandSyntheticSingleSourceRecoveryCount, &QuietInteriorContinentalRetentionCount, &QuietInteriorContinentalRetentionTriangleCount, &QuietInteriorContinentalRetentionSingleSourceCount, &ContinentalBreadthSupport, &ContinentalBreadthPreservationCount, &ContinentalBreadthPreservationStrongInteriorCount, &ContinentalBreadthPreservationModerateInteriorCount, &PaperSurrogateOwnershipOverrideCount, &PaperSurrogateOwnershipOverrideSubaerialCount, &PaperSurrogateOwnershipOverrideSubmergedCount, &PaperSurrogateOwnershipOverrideTriangleCount, &PaperSurrogateOwnershipOverrideSingleSourceCount, &PaperSurrogateOwnershipOverrideStrongInteriorCount, &PaperSurrogateOwnershipOverrideModerateInteriorCount, &PaperSurrogateOwnershipOverrideLowElevationBandCount, &PaperSurrogateOwnershipOverrideModerateElevationBandCount, &PaperSurrogateOwnershipOverrideHighElevationBandCount, &PaperSurrogateQuietInteriorDirectHitEligibleCount, &PaperSurrogateQuietInteriorDirectHitPreSolveContinentalWeightScaledSum, &PaperSurrogateQuietInteriorDirectHitPostTransferContinentalWeightScaledSum, &PaperSurrogateQuietInteriorDirectHitFinalContinentalWeightScaledSum, &PaperSurrogateQuietInteriorDirectHitPreSolveElevationScaledSum, &PaperSurrogateQuietInteriorDirectHitPostTransferElevationScaledSum, &PaperSurrogateQuietInteriorDirectHitFinalElevationScaledSum, &PaperSurrogateQuietInteriorDirectHitPreSolveThicknessScaledSum, &PaperSurrogateQuietInteriorDirectHitPostTransferThicknessScaledSum, &PaperSurrogateQuietInteriorDirectHitFinalThicknessScaledSum](const int32 SampleIndex)
 	{
 		FSample& Sample = Planet.Samples[SampleIndex];
+		const FSample PreviousSample = Sample;
 		FTectonicPlanetV6ResolvedSample& Resolved = LastResolvedSamples[SampleIndex];
 		Sample.PlateId = Resolved.FinalPlateId;
 		Resolved.TransferDebug = FTectonicPlanetV6TransferDebugInfo{};
@@ -14405,6 +14619,25 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			}
 		}
 
+		const bool bQuietInteriorPaperSurrogateEligibility =
+			bTransferred &&
+			Resolved.bAuthorityRetainedOutsideActiveZone &&
+			!Resolved.bActiveZoneSample &&
+			Resolved.PreviousPlateId != INDEX_NONE &&
+			Resolved.PreviousPlateId == Resolved.FinalPlateId &&
+			PreSolveContinentalWeights.IsValidIndex(SampleIndex) &&
+			PreSolveContinentalWeights[SampleIndex] >= 0.5f;
+		const bool bQuietInteriorStrongInterior =
+			bQuietInteriorPaperSurrogateEligibility &&
+			ContinentalBreadthSupport.StrongInteriorFlags.IsValidIndex(SampleIndex) &&
+			ContinentalBreadthSupport.StrongInteriorFlags[SampleIndex] != 0;
+		const bool bQuietInteriorModerateInterior =
+			bQuietInteriorPaperSurrogateEligibility &&
+			ContinentalBreadthSupport.ModerateInteriorFlags.IsValidIndex(SampleIndex) &&
+			ContinentalBreadthSupport.ModerateInteriorFlags[SampleIndex] != 0;
+		const bool bQuietInteriorSupportedInterior =
+			bQuietInteriorStrongInterior || bQuietInteriorModerateInterior;
+
 		// Quiet-interior continental retention: prevent retained-owner outside-active-zone
 		// samples from flipping below CW 0.5 when there is no tectonic cause.
 		// Only protect samples that are genuinely elevated continental crust (pre-solve
@@ -14431,6 +14664,145 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			else
 			{
 				++QuietInteriorContinentalRetentionSingleSourceCount;
+			}
+		}
+
+		if (bTransferred &&
+			bEnableV9ContinentalBreadthPreservationForTest &&
+			bQuietInteriorPaperSurrogateEligibility &&
+			PreSolveElevations.IsValidIndex(SampleIndex) &&
+			PreSolveElevations[SampleIndex] > ContinentalBreadthMinQuietElevationKm)
+		{
+			if (bQuietInteriorSupportedInterior)
+			{
+				const float PreSolveContinentalWeight = PreSolveContinentalWeights[SampleIndex];
+				const float PreserveFactor =
+					bQuietInteriorStrongInterior
+						? ContinentalBreadthStrongInteriorPreserveFactor
+						: ContinentalBreadthModerateInteriorPreserveFactor;
+				const float TargetContinentalWeight = FMath::Lerp(
+					0.5f,
+					PreSolveContinentalWeight,
+					PreserveFactor);
+				if (Sample.ContinentalWeight < TargetContinentalWeight)
+				{
+					Sample.ContinentalWeight = TargetContinentalWeight;
+					++ContinentalBreadthPreservationCount;
+					if (bQuietInteriorStrongInterior)
+					{
+						++ContinentalBreadthPreservationStrongInteriorCount;
+					}
+					else
+					{
+						++ContinentalBreadthPreservationModerateInteriorCount;
+					}
+				}
+			}
+		}
+
+		const bool bPaperSurrogateDirectHitQuietInterior =
+			bQuietInteriorSupportedInterior &&
+			Resolved.TransferDebug.SourceKind == ETectonicPlanetV6TransferSourceKind::Triangle;
+		if (bPaperSurrogateDirectHitQuietInterior)
+		{
+			++PaperSurrogateQuietInteriorDirectHitEligibleCount;
+			const int64 PreSolveCWScaled = FMath::RoundToInt64(
+				static_cast<double>(PreSolveContinentalWeights[SampleIndex]) *
+				PaperSurrogateDiagnosticScale);
+			const int64 PostTransferCWScaled = FMath::RoundToInt64(
+				static_cast<double>(Sample.ContinentalWeight) *
+				PaperSurrogateDiagnosticScale);
+			const int64 PreSolveElevationScaled = FMath::RoundToInt64(
+				static_cast<double>(PreviousSample.Elevation) *
+				PaperSurrogateDiagnosticScale);
+			const int64 PostTransferElevationScaled = FMath::RoundToInt64(
+				static_cast<double>(Sample.Elevation) *
+				PaperSurrogateDiagnosticScale);
+			const int64 PreSolveThicknessScaled = FMath::RoundToInt64(
+				static_cast<double>(PreviousSample.Thickness) *
+				PaperSurrogateDiagnosticScale);
+			const int64 PostTransferThicknessScaled = FMath::RoundToInt64(
+				static_cast<double>(Sample.Thickness) *
+				PaperSurrogateDiagnosticScale);
+			PaperSurrogateQuietInteriorDirectHitPreSolveContinentalWeightScaledSum += PreSolveCWScaled;
+			PaperSurrogateQuietInteriorDirectHitPostTransferContinentalWeightScaledSum += PostTransferCWScaled;
+			PaperSurrogateQuietInteriorDirectHitPreSolveElevationScaledSum += PreSolveElevationScaled;
+			PaperSurrogateQuietInteriorDirectHitPostTransferElevationScaledSum += PostTransferElevationScaled;
+			PaperSurrogateQuietInteriorDirectHitPreSolveThicknessScaledSum += PreSolveThicknessScaled;
+			PaperSurrogateQuietInteriorDirectHitPostTransferThicknessScaledSum += PostTransferThicknessScaled;
+		}
+
+		// Paper-surrogate quiet-interior ownership test: if a sample is a broad-interior,
+		// retained-owner, outside-active-zone direct hit on its own plate, skip the entire
+		// triangle field transfer result and keep the previous crust state for this cycle.
+		// This probes whether repeated quiet-interior interpolation is diffusing away
+		// continental identity and morphology even when ownership stays stable.
+		if (bTransferred &&
+			bEnableV9PaperSurrogateOwnershipForTest &&
+			bQuietInteriorPaperSurrogateEligibility &&
+			Resolved.TransferDebug.SourceKind == ETectonicPlanetV6TransferSourceKind::Triangle)
+		{
+			if (bQuietInteriorSupportedInterior)
+			{
+				const EPaperSurrogateElevationBand ElevationBand =
+					ClassifyPaperSurrogateElevationBand(PreviousSample.Elevation);
+				switch (V9PaperSurrogateFieldModeForTest)
+				{
+				case ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightElevationThickness:
+					Sample.ContinentalWeight = PreviousSample.ContinentalWeight;
+					Sample.Elevation = PreviousSample.Elevation;
+					Sample.Thickness = PreviousSample.Thickness;
+					break;
+				case ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThickness:
+					Sample.ContinentalWeight = PreviousSample.ContinentalWeight;
+					Sample.Thickness = PreviousSample.Thickness;
+					break;
+				case ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation:
+				{
+					Sample.ContinentalWeight = PreviousSample.ContinentalWeight;
+					Sample.Thickness = PreviousSample.Thickness;
+					const float ElevationBlend =
+						ComputePaperSurrogateSelectiveElevationBlend(PreviousSample.Elevation);
+					Sample.Elevation = FMath::Lerp(Sample.Elevation, PreviousSample.Elevation, ElevationBlend);
+					break;
+				}
+				case ETectonicPlanetV6PaperSurrogateFieldMode::FullState:
+				default:
+					Sample = PreviousSample;
+					break;
+				}
+				Sample.PlateId = Resolved.FinalPlateId;
+				++PaperSurrogateOwnershipOverrideCount;
+				if (Sample.Elevation > 0.0f)
+				{
+					++PaperSurrogateOwnershipOverrideSubaerialCount;
+				}
+				else
+				{
+					++PaperSurrogateOwnershipOverrideSubmergedCount;
+				}
+				++PaperSurrogateOwnershipOverrideTriangleCount;
+				if (bQuietInteriorStrongInterior)
+				{
+					++PaperSurrogateOwnershipOverrideStrongInteriorCount;
+				}
+				else
+				{
+					++PaperSurrogateOwnershipOverrideModerateInteriorCount;
+				}
+				switch (ElevationBand)
+				{
+				case EPaperSurrogateElevationBand::Low:
+					++PaperSurrogateOwnershipOverrideLowElevationBandCount;
+					break;
+				case EPaperSurrogateElevationBand::Moderate:
+					++PaperSurrogateOwnershipOverrideModerateElevationBandCount;
+					break;
+				case EPaperSurrogateElevationBand::High:
+				default:
+					++PaperSurrogateOwnershipOverrideHighElevationBandCount;
+					break;
+				}
 			}
 		}
 
@@ -14479,6 +14851,21 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 			Resolved.TransferDebug = FTectonicPlanetV6TransferDebugInfo{};
 			Resolved.TransferDebug.SourceKind = ETectonicPlanetV6TransferSourceKind::Defaulted;
 			++TransferFallbackCount;
+		}
+		else if (bPaperSurrogateDirectHitQuietInterior)
+		{
+			const int64 FinalCWScaled = FMath::RoundToInt64(
+				static_cast<double>(Sample.ContinentalWeight) *
+				PaperSurrogateDiagnosticScale);
+			const int64 FinalElevationScaled = FMath::RoundToInt64(
+				static_cast<double>(Sample.Elevation) *
+				PaperSurrogateDiagnosticScale);
+			const int64 FinalThicknessScaled = FMath::RoundToInt64(
+				static_cast<double>(Sample.Thickness) *
+				PaperSurrogateDiagnosticScale);
+			PaperSurrogateQuietInteriorDirectHitFinalContinentalWeightScaledSum += FinalCWScaled;
+			PaperSurrogateQuietInteriorDirectHitFinalElevationScaledSum += FinalElevationScaled;
+			PaperSurrogateQuietInteriorDirectHitFinalThicknessScaledSum += FinalThicknessScaled;
 		}
 	});
 
@@ -15536,6 +15923,55 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	LastSolveStats.QuietInteriorContinentalRetentionCount = QuietInteriorContinentalRetentionCount.Load();
 	LastSolveStats.QuietInteriorContinentalRetentionTriangleCount = QuietInteriorContinentalRetentionTriangleCount.Load();
 	LastSolveStats.QuietInteriorContinentalRetentionSingleSourceCount = QuietInteriorContinentalRetentionSingleSourceCount.Load();
+	LastSolveStats.ContinentalBreadthPreservationCount = ContinentalBreadthPreservationCount.Load();
+	LastSolveStats.ContinentalBreadthPreservationStrongInteriorCount =
+		ContinentalBreadthPreservationStrongInteriorCount.Load();
+	LastSolveStats.ContinentalBreadthPreservationModerateInteriorCount =
+		ContinentalBreadthPreservationModerateInteriorCount.Load();
+	LastSolveStats.PaperSurrogateOwnershipOverrideCount = PaperSurrogateOwnershipOverrideCount.Load();
+	LastSolveStats.PaperSurrogateOwnershipOverrideSubaerialCount = PaperSurrogateOwnershipOverrideSubaerialCount.Load();
+	LastSolveStats.PaperSurrogateOwnershipOverrideSubmergedCount = PaperSurrogateOwnershipOverrideSubmergedCount.Load();
+	LastSolveStats.PaperSurrogateOwnershipOverrideTriangleCount = PaperSurrogateOwnershipOverrideTriangleCount.Load();
+	LastSolveStats.PaperSurrogateOwnershipOverrideSingleSourceCount = PaperSurrogateOwnershipOverrideSingleSourceCount.Load();
+	LastSolveStats.PaperSurrogateOwnershipOverrideStrongInteriorCount =
+		PaperSurrogateOwnershipOverrideStrongInteriorCount.Load();
+	LastSolveStats.PaperSurrogateOwnershipOverrideModerateInteriorCount =
+		PaperSurrogateOwnershipOverrideModerateInteriorCount.Load();
+	LastSolveStats.PaperSurrogateOwnershipOverrideLowElevationBandCount =
+		PaperSurrogateOwnershipOverrideLowElevationBandCount.Load();
+	LastSolveStats.PaperSurrogateOwnershipOverrideModerateElevationBandCount =
+		PaperSurrogateOwnershipOverrideModerateElevationBandCount.Load();
+	LastSolveStats.PaperSurrogateOwnershipOverrideHighElevationBandCount =
+		PaperSurrogateOwnershipOverrideHighElevationBandCount.Load();
+	LastSolveStats.PaperSurrogateQuietInteriorDirectHitEligibleCount =
+		PaperSurrogateQuietInteriorDirectHitEligibleCount.Load();
+	LastSolveStats.PaperSurrogateQuietInteriorDirectHitPreSolveContinentalWeightSum =
+		static_cast<double>(PaperSurrogateQuietInteriorDirectHitPreSolveContinentalWeightScaledSum.Load()) /
+		PaperSurrogateDiagnosticScale;
+	LastSolveStats.PaperSurrogateQuietInteriorDirectHitPostTransferContinentalWeightSum =
+		static_cast<double>(PaperSurrogateQuietInteriorDirectHitPostTransferContinentalWeightScaledSum.Load()) /
+		PaperSurrogateDiagnosticScale;
+	LastSolveStats.PaperSurrogateQuietInteriorDirectHitFinalContinentalWeightSum =
+		static_cast<double>(PaperSurrogateQuietInteriorDirectHitFinalContinentalWeightScaledSum.Load()) /
+		PaperSurrogateDiagnosticScale;
+	LastSolveStats.PaperSurrogateQuietInteriorDirectHitPreSolveElevationSum =
+		static_cast<double>(PaperSurrogateQuietInteriorDirectHitPreSolveElevationScaledSum.Load()) /
+		PaperSurrogateDiagnosticScale;
+	LastSolveStats.PaperSurrogateQuietInteriorDirectHitPostTransferElevationSum =
+		static_cast<double>(PaperSurrogateQuietInteriorDirectHitPostTransferElevationScaledSum.Load()) /
+		PaperSurrogateDiagnosticScale;
+	LastSolveStats.PaperSurrogateQuietInteriorDirectHitFinalElevationSum =
+		static_cast<double>(PaperSurrogateQuietInteriorDirectHitFinalElevationScaledSum.Load()) /
+		PaperSurrogateDiagnosticScale;
+	LastSolveStats.PaperSurrogateQuietInteriorDirectHitPreSolveThicknessSum =
+		static_cast<double>(PaperSurrogateQuietInteriorDirectHitPreSolveThicknessScaledSum.Load()) /
+		PaperSurrogateDiagnosticScale;
+	LastSolveStats.PaperSurrogateQuietInteriorDirectHitPostTransferThicknessSum =
+		static_cast<double>(PaperSurrogateQuietInteriorDirectHitPostTransferThicknessScaledSum.Load()) /
+		PaperSurrogateDiagnosticScale;
+	LastSolveStats.PaperSurrogateQuietInteriorDirectHitFinalThicknessSum =
+		static_cast<double>(PaperSurrogateQuietInteriorDirectHitFinalThicknessScaledSum.Load()) /
+		PaperSurrogateDiagnosticScale;
 	LastSolveStats.MaxComponentsBeforeCoherence = MaxComponentsBeforeRepartition;
 	LastSolveStats.MaxComponentsPerPlate = ComputeMaxComponentsPerPlate(Planet);
 	if (bEnableV9CollisionShadowForTest && bEnableV9Phase1Authority)
@@ -18879,6 +19315,28 @@ void FTectonicPlanetV6::SetV9ThesisShapedCollisionRidgeSurgeForTest(const bool b
 void FTectonicPlanetV6::SetV9QuietInteriorContinentalRetentionForTest(const bool bEnable)
 {
 	bEnableV9QuietInteriorContinentalRetentionForTest = bEnable;
+}
+
+void FTectonicPlanetV6::SetV9ContinentalBreadthPreservationForTest(const bool bEnable)
+{
+	bEnableV9ContinentalBreadthPreservationForTest = bEnable;
+}
+
+void FTectonicPlanetV6::SetV9PaperSurrogateOwnershipForTest(const bool bEnable)
+{
+	bEnableV9PaperSurrogateOwnershipForTest = bEnable;
+}
+
+void FTectonicPlanetV6::SetV9PaperSurrogateFieldModeForTest(
+	const ETectonicPlanetV6PaperSurrogateFieldMode InMode)
+{
+	V9PaperSurrogateFieldModeForTest = InMode;
+}
+
+void FTectonicPlanetV6::SetSubmergedContinentalRelaxationForTest(const bool bEnable, const double RatePerStep)
+{
+	Planet.bEnableSubmergedContinentalRelaxation = bEnable;
+	Planet.SubmergedContinentalRelaxationRatePerStep = RatePerStep;
 }
 
 void FTectonicPlanetV6::SetAutomaticRiftingForTest(const bool bEnable)

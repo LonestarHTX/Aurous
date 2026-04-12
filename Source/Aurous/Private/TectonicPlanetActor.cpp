@@ -2,6 +2,7 @@
 
 #include "Components/SceneCaptureComponent2D.h"
 #include "DrawDebugHelpers.h"
+#include "Editor/TectonicEditorExportHelpers.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/World.h"
 #include "HAL/PlatformFileManager.h"
@@ -14,12 +15,6 @@
 #include "RealtimeMeshSimple.h"
 #include "TectonicMollweideExporter.h"
 #include "TectonicPlanetVisualization.h"
-
-#if WITH_EDITOR
-#include "IImageWrapper.h"
-#include "IImageWrapperModule.h"
-#include "Modules/ModuleManager.h"
-#endif
 
 using namespace RealtimeMesh;
 
@@ -55,52 +50,6 @@ namespace
 			nullptr,
 			TEXT("/Engine/EngineDebugMaterials/VertexColorMaterial.VertexColorMaterial"));
 	}
-
-#if WITH_EDITOR
-	constexpr int32 PlanetScreenshotResolution = 2048;
-	constexpr float PlanetScreenshotFovDegrees = 45.0f;
-	constexpr double PlanetScreenshotFrameFillFraction = 0.8;
-
-	struct FPlanetScreenshotView
-	{
-		const TCHAR* Name = TEXT("");
-		FVector Direction = FVector::ZeroVector;
-		const TCHAR* FileName = TEXT("");
-	};
-
-	bool WritePng(const FString& OutputPath, const TArray<FColor>& Pixels, const int32 Width, const int32 Height, FString& OutError)
-	{
-		IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
-		TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
-		if (!ImageWrapper.IsValid())
-		{
-			OutError = TEXT("Failed to create PNG image wrapper.");
-			return false;
-		}
-
-		if (!ImageWrapper->SetRaw(Pixels.GetData(), Pixels.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
-		{
-			OutError = TEXT("Failed to populate PNG image wrapper.");
-			return false;
-		}
-
-		const TArray64<uint8>& Compressed = ImageWrapper->GetCompressed();
-		if (!FFileHelper::SaveArrayToFile(Compressed, *OutputPath))
-		{
-			OutError = FString::Printf(TEXT("Failed to write PNG file: %s"), *OutputPath);
-			return false;
-		}
-
-		return true;
-	}
-
-	double ComputePlanetCaptureDistance(const double RenderRadius, const float HorizontalFovDegrees)
-	{
-		const double HalfFovRadians = FMath::DegreesToRadians(static_cast<double>(HorizontalFovDegrees) * 0.5);
-		const double DesiredHalfAngle = FMath::Atan(FMath::Tan(HalfFovRadians) * PlanetScreenshotFrameFillFraction);
-		return RenderRadius / FMath::Max(FMath::Sin(DesiredHalfAngle), UE_DOUBLE_SMALL_NUMBER);
-	}
-#endif
 
 	FColor GetVisualizationColor(const FSample& Sample, const ETectonicMapExportMode Mode)
 	{
@@ -651,97 +600,20 @@ void ATectonicPlanetActor::DrawBoundaryTypes()
 #if WITH_EDITOR
 bool ATectonicPlanetActor::EnsureEditorExportCaptureResources(const int32 CaptureResolution, FString& OutError)
 {
-	if (!MeshComponent)
-	{
-		OutError = TEXT("Planet mesh component is not available for 3D export.");
-		return false;
-	}
-
-	UWorld* World = GetWorld();
-	if (!World)
-	{
-		OutError = TEXT("3D export requires a live actor in a world.");
-		return false;
-	}
-
-	if (!EditorExportRenderTarget)
-	{
-		EditorExportRenderTarget = NewObject<UTextureRenderTarget2D>(this, TEXT("PlanetExportRenderTarget"), RF_Transient);
-		if (!EditorExportRenderTarget)
-		{
-			OutError = TEXT("Failed to allocate the 3D export render target.");
-			return false;
-		}
-
-		EditorExportRenderTarget->ClearColor = FLinearColor::Black;
-		EditorExportRenderTarget->AddressX = TA_Clamp;
-		EditorExportRenderTarget->AddressY = TA_Clamp;
-		EditorExportRenderTarget->bAutoGenerateMips = false;
-		EditorExportRenderTarget->RenderTargetFormat = RTF_RGBA8;
-	}
-
-	if (EditorExportRenderTarget->RenderTargetFormat != RTF_RGBA8 ||
-		EditorExportRenderTarget->SizeX != CaptureResolution ||
-		EditorExportRenderTarget->SizeY != CaptureResolution)
-	{
-		EditorExportRenderTarget->RenderTargetFormat = RTF_RGBA8;
-		EditorExportRenderTarget->InitAutoFormat(CaptureResolution, CaptureResolution);
-	}
-	else if (!EditorExportRenderTarget->GetResource())
-	{
-		EditorExportRenderTarget->UpdateResourceImmediate(true);
-	}
-
-	if (!EditorExportCaptureComponent)
-	{
-		EditorExportCaptureComponent = NewObject<USceneCaptureComponent2D>(this, TEXT("PlanetExportCapture"), RF_Transient);
-		if (!EditorExportCaptureComponent)
-		{
-			OutError = TEXT("Failed to allocate the 3D export scene capture component.");
-			return false;
-		}
-
-		EditorExportCaptureComponent->CreationMethod = EComponentCreationMethod::Instance;
-		EditorExportCaptureComponent->SetupAttachment(RootComponent);
-		AddOwnedComponent(EditorExportCaptureComponent);
-		EditorExportCaptureComponent->RegisterComponentWithWorld(World);
-	}
-	else if (!EditorExportCaptureComponent->IsRegistered())
-	{
-		EditorExportCaptureComponent->RegisterComponentWithWorld(World);
-	}
-
-	EditorExportCaptureComponent->TextureTarget = EditorExportRenderTarget;
-	EditorExportCaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
-	EditorExportCaptureComponent->ProjectionType = ECameraProjectionMode::Perspective;
-	EditorExportCaptureComponent->FOVAngle = PlanetScreenshotFovDegrees;
-	EditorExportCaptureComponent->bCaptureEveryFrame = false;
-	EditorExportCaptureComponent->bCaptureOnMovement = false;
-	EditorExportCaptureComponent->bAlwaysPersistRenderingState = false;
-	EditorExportCaptureComponent->bExcludeFromSceneTextureExtents = true;
-	EditorExportCaptureComponent->bUseRayTracingIfEnabled = false;
-	EditorExportCaptureComponent->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
-	EditorExportCaptureComponent->PostProcessBlendWeight = 0.0f;
-	EditorExportCaptureComponent->UnlitViewmode = ESceneCaptureUnlitViewmode::Capture;
-	EditorExportCaptureComponent->ShowFlags.SetLighting(false);
-	EditorExportCaptureComponent->ShowFlags.SetPostProcessing(false);
-	EditorExportCaptureComponent->ClearShowOnlyComponents();
-	EditorExportCaptureComponent->ShowOnlyActors.Reset();
-	EditorExportCaptureComponent->ShowOnlyComponent(MeshComponent);
-
-	return true;
+	return TectonicEditorExportHelpers::EnsureMeshScreenshotCaptureResources(
+		*this,
+		MeshComponent,
+		CaptureResolution,
+		EditorExportCaptureComponent,
+		EditorExportRenderTarget,
+		OutError);
 }
 
 void ATectonicPlanetActor::ReleaseEditorExportCaptureResources()
 {
-	if (EditorExportCaptureComponent)
-	{
-		EditorExportCaptureComponent->TextureTarget = nullptr;
-		EditorExportCaptureComponent->DestroyComponent();
-		EditorExportCaptureComponent = nullptr;
-	}
-
-	EditorExportRenderTarget = nullptr;
+	TectonicEditorExportHelpers::ReleaseMeshScreenshotCaptureResources(
+		EditorExportCaptureComponent,
+		EditorExportRenderTarget);
 }
 
 bool ATectonicPlanetActor::ExportCurrentMeshScreenshots(const FString& OutputDirectory, FString& OutError) const
@@ -752,99 +624,174 @@ bool ATectonicPlanetActor::ExportCurrentMeshScreenshots(const FString& OutputDir
 		return false;
 	}
 
-	ATectonicPlanetActor* MutableThis = const_cast<ATectonicPlanetActor*>(this);
-	if (!MutableThis->EnsureEditorExportCaptureResources(PlanetScreenshotResolution, OutError))
-	{
-		return false;
-	}
-
-	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-	if (!PlatformFile.CreateDirectoryTree(*OutputDirectory))
-	{
-		OutError = FString::Printf(TEXT("Failed to create export directory: %s"), *OutputDirectory);
-		return false;
-	}
-
 	const double RenderRadius = PlanetRadiusKm * FMath::Max(VisualScale, UE_DOUBLE_SMALL_NUMBER);
-	if (RenderRadius <= UE_DOUBLE_SMALL_NUMBER)
-	{
-		OutError = TEXT("Planet render radius must be positive for 3D export.");
-		return false;
-	}
-
-	USceneCaptureComponent2D* CaptureComponent = MutableThis->EditorExportCaptureComponent;
-	UTextureRenderTarget2D* RenderTarget = MutableThis->EditorExportRenderTarget;
-	if (!CaptureComponent || !RenderTarget)
-	{
-		OutError = TEXT("3D export capture resources are unavailable.");
-		return false;
-	}
-
-	FTextureRenderTargetResource* RenderTargetResource = RenderTarget->GameThread_GetRenderTargetResource();
-	if (!RenderTargetResource)
-	{
-		OutError = TEXT("Failed to resolve the 3D export render target resource.");
-		return false;
-	}
-
-	const double CameraDistance = ComputePlanetCaptureDistance(RenderRadius, CaptureComponent->FOVAngle);
-	const FPlanetScreenshotView Views[] = {
-		{ TEXT("Front"), FVector(1.0, 0.0, 0.0), TEXT("3D_Front.png") },
-		{ TEXT("Back"), FVector(-1.0, 0.0, 0.0), TEXT("3D_Back.png") },
-		{ TEXT("Right"), FVector(0.0, 1.0, 0.0), TEXT("3D_Right.png") },
-		{ TEXT("Left"), FVector(0.0, -1.0, 0.0), TEXT("3D_Left.png") },
-		{ TEXT("Top"), FVector(0.0, 0.0, 1.0), TEXT("3D_Top.png") },
-		{ TEXT("Oblique"), FVector(1.0, 1.0, 0.7).GetSafeNormal(), TEXT("3D_Oblique.png") }
-	};
-
-	TArray<FColor> Pixels;
-	for (const FPlanetScreenshotView& View : Views)
-	{
-		const FVector RelativeLocation = View.Direction * static_cast<float>(CameraDistance);
-		CaptureComponent->SetRelativeLocation(RelativeLocation);
-		CaptureComponent->SetRelativeRotation((-View.Direction).Rotation());
-		CaptureComponent->bCameraCutThisFrame = true;
-		CaptureComponent->CaptureScene();
-
-		Pixels.Reset();
-		if (!RenderTargetResource->ReadPixels(Pixels))
-		{
-			OutError = FString::Printf(TEXT("Failed to read pixels for the %s 3D export."), View.Name);
-			return false;
-		}
-
-		if (Pixels.Num() != RenderTarget->SizeX * RenderTarget->SizeY)
-		{
-			OutError = FString::Printf(
-				TEXT("Unexpected pixel count for the %s 3D export. Expected %d, got %d."),
-				View.Name,
-				RenderTarget->SizeX * RenderTarget->SizeY,
-				Pixels.Num());
-			return false;
-		}
-
-		for (FColor& Pixel : Pixels)
-		{
-			Pixel.A = 255;
-		}
-
-		const FString OutputPath = FPaths::Combine(OutputDirectory, View.FileName);
-		if (!WritePng(OutputPath, Pixels, RenderTarget->SizeX, RenderTarget->SizeY, OutError))
-		{
-			OutError = FString::Printf(TEXT("Failed to write the %s 3D export: %s"), View.Name, *OutError);
-			return false;
-		}
-	}
-
-	UE_LOG(
-		LogTemp,
-		Log,
-		TEXT("[Editor Export Step=%d] wrote 3D planet screenshots to %s at %dx%d"),
+	ATectonicPlanetActor* MutableThis = const_cast<ATectonicPlanetActor*>(this);
+	return TectonicEditorExportHelpers::ExportCurrentMeshScreenshots(
+		*MutableThis,
+		MeshComponent,
+		RenderRadius,
+		GetActorLocation(),
 		Planet.CurrentStep,
-		*OutputDirectory,
-		RenderTarget->SizeX,
-		RenderTarget->SizeY);
-	return true;
+		OutputDirectory,
+		MutableThis->EditorExportCaptureComponent,
+		MutableThis->EditorExportRenderTarget,
+		[this, RenderRadius](TArray<TectonicEditorExportHelpers::FMeshScreenshotOverlayLine>& OutLines)
+		{
+			const double SurfaceOffset = RenderRadius * 1.005;
+
+			if (bShowPlateVelocities && !Planet.Plates.IsEmpty() && !Planet.Samples.IsEmpty())
+			{
+				double MaxAngularSpeed = 0.0;
+				for (const FPlate& Plate : Planet.Plates)
+				{
+					MaxAngularSpeed = FMath::Max(MaxAngularSpeed, Plate.AngularSpeed);
+				}
+
+				if (MaxAngularSpeed > UE_DOUBLE_SMALL_NUMBER)
+				{
+					for (const FPlate& Plate : Planet.Plates)
+					{
+						if (Plate.MemberSamples.IsEmpty())
+						{
+							continue;
+						}
+
+						FVector3d Centroid = FVector3d::ZeroVector;
+						for (const int32 SampleIndex : Plate.MemberSamples)
+						{
+							if (Planet.Samples.IsValidIndex(SampleIndex))
+							{
+								Centroid += Planet.Samples[SampleIndex].Position;
+							}
+						}
+
+						Centroid = Centroid.GetSafeNormal();
+						if (Centroid.IsNearlyZero())
+						{
+							continue;
+						}
+
+						const FVector3d AngularVelocity = Plate.RotationAxis * Plate.AngularSpeed;
+						const FVector3d VelocityDirection = (AngularVelocity ^ Centroid).GetSafeNormal();
+						if (VelocityDirection.IsNearlyZero())
+						{
+							continue;
+						}
+
+						double ArrowLength = RenderRadius * 0.15 * (Plate.AngularSpeed / MaxAngularSpeed);
+						ArrowLength = FMath::Clamp(ArrowLength, RenderRadius * 0.03, RenderRadius * 0.25);
+
+						const FVector Start = FVector(Centroid * RenderRadius * 1.01);
+						const FVector End = Start + FVector(VelocityDirection * ArrowLength);
+						const FVector3d ArrowNormal = Centroid;
+						FVector3d ArrowSide = VelocityDirection ^ ArrowNormal;
+						if (ArrowSide.IsNearlyZero())
+						{
+							ArrowSide = ArrowNormal ^ FVector3d(0.0, 0.0, 1.0);
+						}
+						ArrowSide.Normalize();
+						const double HeadLength = ArrowLength * 0.15;
+						const double HeadWidth = ArrowLength * 0.06;
+						const FVector HeadLeft = End - FVector(VelocityDirection * HeadLength) + FVector(ArrowSide * HeadWidth);
+						const FVector HeadRight = End - FVector(VelocityDirection * HeadLength) - FVector(ArrowSide * HeadWidth);
+						const FColor ArrowColor = TectonicPlanetVisualization::GetPlateColor(Plate.Id);
+
+						OutLines.Add({ Start, End, ArrowColor, 2 });
+						OutLines.Add({ End, HeadLeft, ArrowColor, 2 });
+						OutLines.Add({ End, HeadRight, ArrowColor, 2 });
+					}
+				}
+			}
+
+			if (Planet.Samples.IsEmpty() || Planet.SampleAdjacency.IsEmpty())
+			{
+				return;
+			}
+
+			if (bShowBoundaryTypes && !Planet.Plates.IsEmpty())
+			{
+				const FColor DivergentColor = FColor::Red;
+				const FColor ConvergentColor = FColor::Cyan;
+				const FColor TransformColor = FColor::Yellow;
+				constexpr double TransformThreshold = 0.3;
+
+				for (int32 SampleI = 0; SampleI < Planet.SampleAdjacency.Num(); ++SampleI)
+				{
+					const int32 PlateI = Planet.Samples[SampleI].PlateId;
+					if (!Planet.Plates.IsValidIndex(PlateI))
+					{
+						continue;
+					}
+
+					for (const int32 SampleJ : Planet.SampleAdjacency[SampleI])
+					{
+						if (SampleJ <= SampleI)
+						{
+							continue;
+						}
+
+						const int32 PlateJ = Planet.Samples[SampleJ].PlateId;
+						if (PlateJ == PlateI || !Planet.Plates.IsValidIndex(PlateJ))
+						{
+							continue;
+						}
+
+						const FVector3d& PosI = Planet.Samples[SampleI].Position;
+						const FVector3d& PosJ = Planet.Samples[SampleJ].Position;
+						const FVector3d Midpoint = (PosI + PosJ).GetSafeNormal();
+
+						const FVector3d AngVelA = Planet.Plates[PlateI].RotationAxis * Planet.Plates[PlateI].AngularSpeed;
+						const FVector3d AngVelB = Planet.Plates[PlateJ].RotationAxis * Planet.Plates[PlateJ].AngularSpeed;
+						const FVector3d SurfVelA = AngVelA ^ Midpoint;
+						const FVector3d SurfVelB = AngVelB ^ Midpoint;
+						const FVector3d RelVel = SurfVelB - SurfVelA;
+
+						const FVector3d Separation = (PosJ - PosI).GetSafeNormal();
+						const double RelSpeed = RelVel.Size();
+
+						FColor EdgeColor = TransformColor;
+						if (RelSpeed > UE_DOUBLE_SMALL_NUMBER)
+						{
+							const double NormalComponent = FVector3d::DotProduct(RelVel, Separation);
+							const double Ratio = NormalComponent / RelSpeed;
+							if (Ratio > TransformThreshold)
+							{
+								EdgeColor = DivergentColor;
+							}
+							else if (Ratio < -TransformThreshold)
+							{
+								EdgeColor = ConvergentColor;
+							}
+						}
+
+						OutLines.Add({
+							FVector(PosI.GetSafeNormal() * SurfaceOffset),
+							FVector(PosJ.GetSafeNormal() * SurfaceOffset),
+							EdgeColor,
+							2 });
+					}
+				}
+			}
+			else if (bShowPlateBoundaries)
+			{
+				for (int32 SampleI = 0; SampleI < Planet.SampleAdjacency.Num(); ++SampleI)
+				{
+					const int32 PlateI = Planet.Samples[SampleI].PlateId;
+					for (const int32 SampleJ : Planet.SampleAdjacency[SampleI])
+					{
+						if (SampleJ > SampleI && Planet.Samples[SampleJ].PlateId != PlateI)
+						{
+							OutLines.Add({
+								FVector(Planet.Samples[SampleI].Position.GetSafeNormal() * SurfaceOffset),
+								FVector(Planet.Samples[SampleJ].Position.GetSafeNormal() * SurfaceOffset),
+								FColor::White,
+								1 });
+						}
+					}
+				}
+			}
+		},
+		OutError);
 }
 #endif
 

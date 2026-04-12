@@ -8,6 +8,8 @@
 
 class UMaterialInterface;
 class URealtimeMeshComponent;
+class USceneCaptureComponent2D;
+class UTextureRenderTarget2D;
 
 UCLASS(BlueprintType, Blueprintable, meta = (DisplayName = "Tectonic Planet V6 Preview"))
 class AUROUS_API ATectonicPlanetV6PreviewActor : public AActor
@@ -18,6 +20,31 @@ public:
 	ATectonicPlanetV6PreviewActor();
 
 	const FTectonicPlanetV6& GetPlanetV6() const { return PlanetV6; }
+	int32 GetConfiguredSampleCount() const { return SampleCount; }
+	int32 GetConfiguredPlateCount() const { return PlateCount; }
+	int32 GetConfiguredRandomSeed() const { return RandomSeed; }
+	float GetConfiguredBoundaryWarpAmplitude() const { return BoundaryWarpAmplitude; }
+	float GetConfiguredContinentalFraction() const { return ContinentalFraction; }
+	int32 GetConfiguredExportWidth() const { return ExportWidth; }
+	ETectonicMapExportMode GetVisualizationMode() const { return VisualizationMode; }
+	double GetLastAdvanceStepMs() const { return LastAdvanceStepMs; }
+	double GetContinentalAreaFraction() const { return ContinentalAreaFraction; }
+	int32 GetPeriodicSolveCountValue() const { return PeriodicSolveCount; }
+	int32 GetCumulativeCollisionCountValue() const { return CumulativeCollisionCount; }
+	int32 GetCumulativeRiftCountValue() const { return CumulativeRiftCount; }
+	bool GetShowPlateVelocities() const { return bShowPlateVelocities; }
+	bool GetShowPlateBoundaries() const { return bShowPlateBoundaries; }
+	bool GetShowBoundaryTypes() const { return false; }
+	FString GetActiveRuntimePresetLabel() const { return TEXT("V6KeptCandidate"); }
+	FString GetRuntimeConfigSummary() const;
+
+	void GeneratePlanet(int32 InSampleCount, int32 InPlateCount, int32 InRandomSeed, float InBoundaryWarpAmplitude, float InContinentalFraction);
+	void AdvancePlanetSteps(int32 InStepCount);
+	void BuildMeshWithMode(ETectonicMapExportMode Mode);
+	void SetShowPlateVelocities(bool bShow);
+	void SetShowPlateBoundaries(bool bShow);
+	void SetShowBoundaryTypes(bool bShow);
+	bool ExportCurrentMaps(ETectonicMapExportMode Mode, int32 Width, int32 Height, FString& OutDirectory, FString& OutError) const;
 
 	// Editor-callable controls (via details panel CallInEditor buttons)
 	UFUNCTION(CallInEditor, Category = "V6 Preview|Controls")
@@ -73,6 +100,9 @@ protected:
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "V6 Preview|Planet")
 	bool bEnableStochasticRifting = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "V6 Preview|Export", meta = (ClampMin = "256"))
+	int32 ExportWidth = 4096;
 
 	// Rendering
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "V6 Preview|Rendering", meta = (ClampMin = "0.0001"))
@@ -131,6 +161,14 @@ private:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "V6 Preview", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<URealtimeMeshComponent> MeshComponent = nullptr;
+
+#if WITH_EDITORONLY_DATA
+	UPROPERTY(Transient)
+	TObjectPtr<USceneCaptureComponent2D> EditorExportCaptureComponent = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextureRenderTarget2D> EditorExportRenderTarget = nullptr;
+#endif
 
 	FTectonicPlanetV6 PlanetV6;
 	ETectonicMapExportMode VisualizationMode = ETectonicMapExportMode::Elevation;

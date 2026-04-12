@@ -6072,6 +6072,21 @@ void FTectonicPlanet::AdvanceStep()
 						static_cast<float>(AndeanContinentalConversionRatePerMy * DeltaTimeMyears));
 			}
 
+			// Submerged continental relaxation: slowly decay CW for deeply submerged
+			// continental crust (below -2 km, well past any continental shelf) when
+			// not tectonically supported. This prevents runaway continental overgrowth
+			// from the quiet-interior retention guard without stripping shallow shelves.
+			if (bEnableSubmergedContinentalRelaxation &&
+				CarriedSample.ContinentalWeight >= 0.5f &&
+				CarriedSample.Elevation < -2.0f &&
+				CarriedSample.OrogenyType == EOrogenyType::None)
+			{
+				CarriedSample.ContinentalWeight = FMath::Max(
+					0.0f,
+					CarriedSample.ContinentalWeight -
+						static_cast<float>(SubmergedContinentalRelaxationRatePerStep));
+			}
+
 			if (CarriedSample.ContinentalWeight >= 0.5f)
 			{
 				CarriedSample.Elevation -= static_cast<float>((CarriedSample.Elevation / ElevationCeilingKm) * ErosionRateKmPerStep);

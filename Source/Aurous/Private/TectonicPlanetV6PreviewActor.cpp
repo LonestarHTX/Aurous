@@ -1,15 +1,23 @@
 #include "TectonicPlanetV6PreviewActor.h"
 
 #include "DrawDebugHelpers.h"
+#include "Editor/TectonicEditorExportHelpers.h"
 #include "HAL/PlatformTime.h"
+#include "Misc/Paths.h"
 #include "RealtimeMeshComponent.h"
 #include "RealtimeMeshSimple.h"
+#include "TectonicMollweideExporter.h"
 #include "TectonicPlanetVisualization.h"
 
 using namespace RealtimeMesh;
 
 namespace
 {
+	FString BuildV6PreviewRunId(const int32 RandomSeed, const int32 SampleCount, const int32 PlateCount)
+	{
+		return FString::Printf(TEXT("V6Preview_S%d_N%d_P%d"), RandomSeed, SampleCount, PlateCount);
+	}
+
 	UMaterialInterface* ResolvePlanetMaterialV6(UMaterialInterface* PreferredMaterial)
 	{
 		if (PreferredMaterial)
@@ -43,6 +51,13 @@ namespace
 	}
 }
 
+FString ATectonicPlanetV6PreviewActor::GetRuntimeConfigSummary() const
+{
+	return FString::Printf(
+		TEXT("Solve=ThesisPartitionedFrontierProcessSpike cadence=16 retention=ON submerged_relaxation=ON rifting=%s"),
+		bEnableStochasticRifting ? TEXT("ON") : TEXT("OFF"));
+}
+
 ATectonicPlanetV6PreviewActor::ATectonicPlanetV6PreviewActor()
 {
 	PrimaryActorTick.bCanEverTick = false;
@@ -60,6 +75,11 @@ void ATectonicPlanetV6PreviewActor::BeginPlay()
 
 void ATectonicPlanetV6PreviewActor::BeginDestroy()
 {
+#if WITH_EDITOR
+	TectonicEditorExportHelpers::ReleaseMeshScreenshotCaptureResources(
+		EditorExportCaptureComponent,
+		EditorExportRenderTarget);
+#endif
 	Super::BeginDestroy();
 }
 
@@ -82,6 +102,7 @@ void ATectonicPlanetV6PreviewActor::ConfigureKeptCandidateDefaults()
 	PlanetV6.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
 	PlanetV6.SetV9ThesisShapedCollisionExecutionForTest(true);
 	PlanetV6.SetV9QuietInteriorContinentalRetentionForTest(true);
+	PlanetV6.SetSubmergedContinentalRelaxationForTest(true, 0.005);
 	PlanetV6.SetAutomaticRiftingForTest(bEnableStochasticRifting);
 }
 
@@ -115,6 +136,22 @@ void ATectonicPlanetV6PreviewActor::Generate()
 #endif
 }
 
+void ATectonicPlanetV6PreviewActor::GeneratePlanet(
+	const int32 InSampleCount,
+	const int32 InPlateCount,
+	const int32 InRandomSeed,
+	const float InBoundaryWarpAmplitude,
+	const float InContinentalFraction)
+{
+	SampleCount = InSampleCount;
+	PlateCount = InPlateCount;
+	RandomSeed = InRandomSeed;
+	BoundaryWarpAmplitude = InBoundaryWarpAmplitude;
+	ContinentalFraction = InContinentalFraction;
+	LastAdvanceStepMs = 0.0;
+	Generate();
+}
+
 void ATectonicPlanetV6PreviewActor::Advance1Step()
 {
 	AdvanceSteps(1);
@@ -139,6 +176,11 @@ void ATectonicPlanetV6PreviewActor::AdvanceToNextSolve()
 	int32 StepsToNext = Interval - (CurrentStepVal % Interval);
 	if (StepsToNext == 0) { StepsToNext = Interval; }
 	AdvanceSteps(StepsToNext);
+}
+
+void ATectonicPlanetV6PreviewActor::AdvancePlanetSteps(const int32 InStepCount)
+{
+	AdvanceSteps(InStepCount);
 }
 
 void ATectonicPlanetV6PreviewActor::AdvanceSteps(const int32 StepCount)
@@ -195,6 +237,185 @@ void ATectonicPlanetV6PreviewActor::ShowBoundaryMask()
 {
 	VisualizationMode = ETectonicMapExportMode::BoundaryMask;
 	if (bInitialized) { BuildMesh(); }
+}
+
+void ATectonicPlanetV6PreviewActor::BuildMeshWithMode(const ETectonicMapExportMode Mode)
+{
+	VisualizationMode = Mode;
+	if (bInitialized)
+	{
+		BuildMesh();
+	}
+}
+
+void ATectonicPlanetV6PreviewActor::SetShowPlateVelocities(const bool bShow)
+{
+	bShowPlateVelocities = bShow;
+	RefreshDebugOverlays();
+}
+
+void ATectonicPlanetV6PreviewActor::SetShowPlateBoundaries(const bool bShow)
+{
+	bShowPlateBoundaries = bShow;
+	RefreshDebugOverlays();
+}
+
+void ATectonicPlanetV6PreviewActor::SetShowBoundaryTypes(const bool /*bShow*/)
+{
+	// Boundary-type debug visualization is not implemented on the V6 preview actor yet.
+}
+
+bool ATectonicPlanetV6PreviewActor::ExportCurrentMaps(
+	const ETectonicMapExportMode Mode,
+	const int32 Width,
+	const int32 Height,
+	FString& OutDirectory,
+	FString& OutError) const
+{
+	if (!bInitialized)
+	{
+		OutError = TEXT("V6 preview actor has not generated a planet yet.");
+		return false;
+	}
+
+	OutDirectory = FPaths::Combine(
+		FPaths::ProjectSavedDir(),
+		TEXT("MapExports"),
+		BuildV6PreviewRunId(RandomSeed, SampleCount, PlateCount),
+		FString::Printf(TEXT("Step_%d"), PlanetV6.GetPlanet().CurrentStep));
+
+	FTectonicMollweideExportOptions Options;
+	Options.Mode = Mode;
+	Options.Width = Width;
+	Options.Height = Height;
+	Options.OutputDirectory = OutDirectory;
+
+	FTectonicMollweideExportStats Stats;
+	if (!TectonicMollweideExporter::ExportPlanet(PlanetV6.GetPlanet(), Options, Stats, OutError))
+	{
+		return false;
+	}
+
+#if WITH_EDITOR
+	const double RenderRadius = PlanetRadiusKm * FMath::Max(VisualScale, UE_DOUBLE_SMALL_NUMBER);
+	ATectonicPlanetV6PreviewActor* MutableThis = const_cast<ATectonicPlanetV6PreviewActor*>(this);
+	if (!TectonicEditorExportHelpers::ExportCurrentMeshScreenshots(
+		*MutableThis,
+		MeshComponent,
+		RenderRadius,
+		GetActorLocation(),
+		PlanetV6.GetPlanet().CurrentStep,
+		OutDirectory,
+		MutableThis->EditorExportCaptureComponent,
+		MutableThis->EditorExportRenderTarget,
+		[this, RenderRadius](TArray<TectonicEditorExportHelpers::FMeshScreenshotOverlayLine>& OutLines)
+		{
+			if (!bInitialized)
+			{
+				return;
+			}
+
+			const FTectonicPlanet& Planet = PlanetV6.GetPlanet();
+			if (Planet.Samples.IsEmpty() || Planet.Plates.IsEmpty())
+			{
+				return;
+			}
+
+			const double SurfaceOffset = RenderRadius * 1.005;
+
+			if (bShowPlateBoundaries)
+			{
+				const FColor BoundaryColor = FColor::Yellow;
+				for (int32 I = 0; I < Planet.SampleAdjacency.Num(); ++I)
+				{
+					const int32 PlateI = Planet.Samples[I].PlateId;
+					for (const int32 J : Planet.SampleAdjacency[I])
+					{
+						if (J > I && Planet.Samples[J].PlateId != PlateI)
+						{
+							OutLines.Add({
+								FVector(Planet.Samples[I].Position.GetSafeNormal() * SurfaceOffset),
+								FVector(Planet.Samples[J].Position.GetSafeNormal() * SurfaceOffset),
+								BoundaryColor,
+								1 });
+						}
+					}
+				}
+			}
+
+			if (bShowPlateVelocities)
+			{
+				double MaxAngularSpeed = 0.0;
+				for (const FPlate& Plate : Planet.Plates)
+				{
+					MaxAngularSpeed = FMath::Max(MaxAngularSpeed, Plate.AngularSpeed);
+				}
+				if (MaxAngularSpeed <= UE_DOUBLE_SMALL_NUMBER)
+				{
+					return;
+				}
+
+				for (const FPlate& Plate : Planet.Plates)
+				{
+					if (Plate.MemberSamples.IsEmpty())
+					{
+						continue;
+					}
+
+					FVector3d Centroid = FVector3d::ZeroVector;
+					for (const int32 SampleIndex : Plate.MemberSamples)
+					{
+						if (Planet.Samples.IsValidIndex(SampleIndex))
+						{
+							Centroid += Planet.Samples[SampleIndex].Position;
+						}
+					}
+					Centroid = Centroid.GetSafeNormal();
+					if (Centroid.IsNearlyZero())
+					{
+						continue;
+					}
+
+					const FVector3d RotationAxis = Plate.RotationAxis.GetSafeNormal();
+					const FVector3d VelocityDir = (RotationAxis ^ Centroid).GetSafeNormal();
+					const double SpeedFraction = FMath::Clamp(Plate.AngularSpeed / MaxAngularSpeed, 0.0, 1.0);
+					const double ArrowLength = RenderRadius * 0.3 * SpeedFraction;
+					const FVector ArrowStart = FVector(Centroid * SurfaceOffset);
+					const FVector ArrowEnd = FVector(Centroid * SurfaceOffset + VelocityDir * ArrowLength);
+					FVector3d ArrowSide = VelocityDir ^ Centroid;
+					if (ArrowSide.IsNearlyZero())
+					{
+						ArrowSide = Centroid ^ FVector3d(0.0, 0.0, 1.0);
+					}
+					ArrowSide.Normalize();
+					const double HeadLength = ArrowLength * 0.3;
+					const double HeadWidth = ArrowLength * 0.12;
+					const FVector HeadLeft = ArrowEnd - FVector(VelocityDir * HeadLength) + FVector(ArrowSide * HeadWidth);
+					const FVector HeadRight = ArrowEnd - FVector(VelocityDir * HeadLength) - FVector(ArrowSide * HeadWidth);
+					const FColor ArrowColor = TectonicPlanetVisualization::GetPlateColor(Plate.Id);
+
+					OutLines.Add({ ArrowStart, ArrowEnd, ArrowColor, 2 });
+					OutLines.Add({ ArrowEnd, HeadLeft, ArrowColor, 2 });
+					OutLines.Add({ ArrowEnd, HeadRight, ArrowColor, 2 });
+				}
+			}
+		},
+		OutError))
+	{
+		return false;
+	}
+#endif
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[V6 Preview Export Step=%d] export_dir=%s resolved_pixels=%lld uncovered_interior=%d files=%d"),
+		PlanetV6.GetPlanet().CurrentStep,
+		*OutDirectory,
+		static_cast<long long>(Stats.ResolvedPixelCount),
+		Stats.UncoveredInteriorPixelCount,
+		Stats.WrittenFiles.Num());
+	return true;
 }
 
 void ATectonicPlanetV6PreviewActor::UpdateStatusReadout()

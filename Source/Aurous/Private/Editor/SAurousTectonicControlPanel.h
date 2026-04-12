@@ -7,7 +7,9 @@
 #include "TectonicPlanetVisualization.h"
 #include "Widgets/SCompoundWidget.h"
 
+class AActor;
 class ATectonicPlanetActor;
+class ATectonicPlanetV6PreviewActor;
 class STextComboBox;
 
 class SAurousTectonicControlPanel : public SCompoundWidget
@@ -19,9 +21,11 @@ public:
 	void Construct(const FArguments& InArgs);
 
 private:
-	ATectonicPlanetActor* GetSelectedActor() const;
-	ATectonicPlanetActor* FindActorInEditorSelection() const;
-	void SetSelectedActor(ATectonicPlanetActor* InActor);
+	AActor* GetSelectedActor() const;
+	ATectonicPlanetActor* GetSelectedLegacyActor() const;
+	ATectonicPlanetV6PreviewActor* GetSelectedV6Actor() const;
+	AActor* FindActorInEditorSelection() const;
+	void SetSelectedActor(AActor* InActor);
 	void SyncPendingSettingsFromActor();
 	void RefreshMetrics();
 	ETectonicMapExportMode GetSelectedVisualizationMode() const;
@@ -44,9 +48,9 @@ private:
 	FText GetMetricsText() const;
 
 private:
-	TWeakObjectPtr<ATectonicPlanetActor> SelectedActor;
+	TWeakObjectPtr<AActor> SelectedActor;
 	int32 PendingSampleCount = 60000;
-	int32 PendingPlateCount = 7;
+	int32 PendingPlateCount = 40;
 	int32 PendingRandomSeed = 42;
 	float PendingBoundaryWarpAmplitude = 0.2f;
 	float PendingContinentalFraction = 0.30f;

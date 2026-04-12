@@ -763,6 +763,8 @@ struct AUROUS_API FTectonicPlanet
 	int32 GeometricCollisionDonorMinNewFragmentSampleCount = 0;
 	bool bEnableSlabPull = true;
 	bool bEnableAndeanContinentalConversion = true;
+	bool bEnableSubmergedContinentalRelaxation = false;
+	double SubmergedContinentalRelaxationRatePerStep = 0.005; // CW decay per step for deeply submerged (elev < -2 km) continental crust
 	bool bEnableOverlapHysteresis = false; // Legacy experiment path retained for tests.
 	bool bEnableContinentalCollision = true;
 	bool bEnableAutomaticRifting = true;

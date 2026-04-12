@@ -71,6 +71,14 @@ enum class ETectonicPlanetV6ActiveZoneClassifierMode : uint8
 	PersistentPairLocalTightFreshAdmission,
 };
 
+enum class ETectonicPlanetV6PaperSurrogateFieldMode : uint8
+{
+	FullState,
+	ContinentalWeightElevationThickness,
+	ContinentalWeightThickness,
+	ContinentalWeightThicknessSelectiveElevation,
+};
+
 enum class ETectonicPlanetV6TransferSourceKind : uint8
 {
 	None,
@@ -306,6 +314,29 @@ struct AUROUS_API FTectonicPlanetV6PeriodicSolveStats
 	int32 QuietInteriorContinentalRetentionCount = 0;
 	int32 QuietInteriorContinentalRetentionTriangleCount = 0;
 	int32 QuietInteriorContinentalRetentionSingleSourceCount = 0;
+	int32 ContinentalBreadthPreservationCount = 0;
+	int32 ContinentalBreadthPreservationStrongInteriorCount = 0;
+	int32 ContinentalBreadthPreservationModerateInteriorCount = 0;
+	int32 PaperSurrogateOwnershipOverrideCount = 0;
+	int32 PaperSurrogateOwnershipOverrideSubaerialCount = 0;
+	int32 PaperSurrogateOwnershipOverrideSubmergedCount = 0;
+	int32 PaperSurrogateOwnershipOverrideTriangleCount = 0;
+	int32 PaperSurrogateOwnershipOverrideSingleSourceCount = 0;
+	int32 PaperSurrogateOwnershipOverrideStrongInteriorCount = 0;
+	int32 PaperSurrogateOwnershipOverrideModerateInteriorCount = 0;
+	int32 PaperSurrogateOwnershipOverrideLowElevationBandCount = 0;
+	int32 PaperSurrogateOwnershipOverrideModerateElevationBandCount = 0;
+	int32 PaperSurrogateOwnershipOverrideHighElevationBandCount = 0;
+	int32 PaperSurrogateQuietInteriorDirectHitEligibleCount = 0;
+	double PaperSurrogateQuietInteriorDirectHitPreSolveContinentalWeightSum = 0.0;
+	double PaperSurrogateQuietInteriorDirectHitPostTransferContinentalWeightSum = 0.0;
+	double PaperSurrogateQuietInteriorDirectHitFinalContinentalWeightSum = 0.0;
+	double PaperSurrogateQuietInteriorDirectHitPreSolveElevationSum = 0.0;
+	double PaperSurrogateQuietInteriorDirectHitPostTransferElevationSum = 0.0;
+	double PaperSurrogateQuietInteriorDirectHitFinalElevationSum = 0.0;
+	double PaperSurrogateQuietInteriorDirectHitPreSolveThicknessSum = 0.0;
+	double PaperSurrogateQuietInteriorDirectHitPostTransferThicknessSum = 0.0;
+	double PaperSurrogateQuietInteriorDirectHitFinalThicknessSum = 0.0;
 	bool bDestructiveTriangleExclusionApplied = false;
 	FTectonicPlanetV6TransferResolutionCounts TriangleTransferCountsByResolution;
 	FTectonicPlanetV6TransferResolutionCounts SingleSourceTransferCountsByResolution;
@@ -1177,6 +1208,10 @@ struct AUROUS_API FTectonicPlanetV6
 	void SetV9ThesisShapedCollisionExecutionForTest(bool bEnable);
 	void SetV9ThesisShapedCollisionRidgeSurgeForTest(bool bEnable);
 	void SetV9QuietInteriorContinentalRetentionForTest(bool bEnable);
+	void SetV9ContinentalBreadthPreservationForTest(bool bEnable);
+	void SetV9PaperSurrogateOwnershipForTest(bool bEnable);
+	void SetV9PaperSurrogateFieldModeForTest(ETectonicPlanetV6PaperSurrogateFieldMode InMode);
+	void SetSubmergedContinentalRelaxationForTest(bool bEnable, double RatePerStep = 0.005);
 	void SetAutomaticRiftingForTest(bool bEnable);
 	bool ForceLargestEligibleAutomaticRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
 	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
@@ -1339,6 +1374,10 @@ private:
 	bool bEnableV9ThesisShapedCollisionExecutionForTest = false;
 	bool bEnableV9ThesisShapedCollisionRidgeSurgeForTest = false;
 	bool bEnableV9QuietInteriorContinentalRetentionForTest = false;
+	bool bEnableV9ContinentalBreadthPreservationForTest = false;
+	bool bEnableV9PaperSurrogateOwnershipForTest = false;
+	ETectonicPlanetV6PaperSurrogateFieldMode V9PaperSurrogateFieldModeForTest =
+		ETectonicPlanetV6PaperSurrogateFieldMode::FullState;
 	bool bEnableAutomaticRiftingForTest = false;
 	bool bUseLinearConvergentMaintenanceSpeedFactorForTest = true;
 	bool bUseLinearConvergentMaintenanceInfluenceForTest = true;

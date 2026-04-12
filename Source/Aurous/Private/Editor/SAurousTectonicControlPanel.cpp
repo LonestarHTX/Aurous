@@ -3,6 +3,7 @@
 #if WITH_EDITOR
 
 #include "TectonicPlanetActor.h"
+#include "TectonicPlanetV6PreviewActor.h"
 #include "Editor.h"
 #include "Engine/Selection.h"
 #include "Misc/MessageDialog.h"
@@ -305,7 +306,13 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 						SNew(SCheckBox)
 						.IsChecked_Lambda([this]()
 						{
-							if (const ATectonicPlanetActor* Actor = GetSelectedActor())
+							if (const ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
+							{
+								return Actor->GetShowPlateVelocities()
+									? ECheckBoxState::Checked
+									: ECheckBoxState::Unchecked;
+							}
+							if (const ATectonicPlanetV6PreviewActor* Actor = GetSelectedV6Actor())
 							{
 								return Actor->GetShowPlateVelocities()
 									? ECheckBoxState::Checked
@@ -316,9 +323,13 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 						})
 						.OnCheckStateChanged_Lambda([this](const ECheckBoxState NewState)
 						{
-							if (ATectonicPlanetActor* Actor = GetSelectedActor())
+							if (ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
 							{
 								Actor->SetShowPlateVelocities(NewState == ECheckBoxState::Checked);
+							}
+							else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+							{
+								V6Actor->SetShowPlateVelocities(NewState == ECheckBoxState::Checked);
 							}
 						})
 					]
@@ -346,7 +357,13 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 						SNew(SCheckBox)
 						.IsChecked_Lambda([this]()
 						{
-							if (const ATectonicPlanetActor* Actor = GetSelectedActor())
+							if (const ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
+							{
+								return Actor->GetShowPlateBoundaries()
+									? ECheckBoxState::Checked
+									: ECheckBoxState::Unchecked;
+							}
+							if (const ATectonicPlanetV6PreviewActor* Actor = GetSelectedV6Actor())
 							{
 								return Actor->GetShowPlateBoundaries()
 									? ECheckBoxState::Checked
@@ -357,9 +374,13 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 						})
 						.OnCheckStateChanged_Lambda([this](const ECheckBoxState NewState)
 						{
-							if (ATectonicPlanetActor* Actor = GetSelectedActor())
+							if (ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
 							{
 								Actor->SetShowPlateBoundaries(NewState == ECheckBoxState::Checked);
+							}
+							else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+							{
+								V6Actor->SetShowPlateBoundaries(NewState == ECheckBoxState::Checked);
 							}
 						})
 					]
@@ -387,7 +408,13 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 						SNew(SCheckBox)
 						.IsChecked_Lambda([this]()
 						{
-							if (const ATectonicPlanetActor* Actor = GetSelectedActor())
+							if (const ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
+							{
+								return Actor->GetShowBoundaryTypes()
+									? ECheckBoxState::Checked
+									: ECheckBoxState::Unchecked;
+							}
+							if (const ATectonicPlanetV6PreviewActor* Actor = GetSelectedV6Actor())
 							{
 								return Actor->GetShowBoundaryTypes()
 									? ECheckBoxState::Checked
@@ -398,9 +425,13 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 						})
 						.OnCheckStateChanged_Lambda([this](const ECheckBoxState NewState)
 						{
-							if (ATectonicPlanetActor* Actor = GetSelectedActor())
+							if (ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
 							{
 								Actor->SetShowBoundaryTypes(NewState == ECheckBoxState::Checked);
+							}
+							else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+							{
+								V6Actor->SetShowBoundaryTypes(NewState == ECheckBoxState::Checked);
 							}
 						})
 					]
@@ -509,12 +540,22 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 	RefreshMetrics();
 }
 
-ATectonicPlanetActor* SAurousTectonicControlPanel::GetSelectedActor() const
+AActor* SAurousTectonicControlPanel::GetSelectedActor() const
 {
 	return SelectedActor.Get();
 }
 
-ATectonicPlanetActor* SAurousTectonicControlPanel::FindActorInEditorSelection() const
+ATectonicPlanetActor* SAurousTectonicControlPanel::GetSelectedLegacyActor() const
+{
+	return Cast<ATectonicPlanetActor>(SelectedActor.Get());
+}
+
+ATectonicPlanetV6PreviewActor* SAurousTectonicControlPanel::GetSelectedV6Actor() const
+{
+	return Cast<ATectonicPlanetV6PreviewActor>(SelectedActor.Get());
+}
+
+AActor* SAurousTectonicControlPanel::FindActorInEditorSelection() const
 {
 	if (!GEditor)
 	{
@@ -529,13 +570,17 @@ ATectonicPlanetActor* SAurousTectonicControlPanel::FindActorInEditorSelection() 
 			{
 				return Actor;
 			}
+			if (ATectonicPlanetV6PreviewActor* Actor = Cast<ATectonicPlanetV6PreviewActor>(*It))
+			{
+				return Actor;
+			}
 		}
 	}
 
 	return nullptr;
 }
 
-void SAurousTectonicControlPanel::SetSelectedActor(ATectonicPlanetActor* InActor)
+void SAurousTectonicControlPanel::SetSelectedActor(AActor* InActor)
 {
 	SelectedActor = InActor;
 	SyncPendingSettingsFromActor();
@@ -544,7 +589,7 @@ void SAurousTectonicControlPanel::SetSelectedActor(ATectonicPlanetActor* InActor
 
 void SAurousTectonicControlPanel::SyncPendingSettingsFromActor()
 {
-	if (ATectonicPlanetActor* Actor = GetSelectedActor())
+	if (ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
 	{
 		PendingSampleCount = Actor->GetConfiguredSampleCount();
 		PendingPlateCount = Actor->GetConfiguredPlateCount();
@@ -554,27 +599,73 @@ void SAurousTectonicControlPanel::SyncPendingSettingsFromActor()
 		PendingExportWidth = Actor->GetConfiguredExportWidth();
 		SelectVisualizationMode(Actor->GetVisualizationMode());
 	}
+	else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+	{
+		PendingSampleCount = V6Actor->GetConfiguredSampleCount();
+		PendingPlateCount = V6Actor->GetConfiguredPlateCount();
+		PendingRandomSeed = V6Actor->GetConfiguredRandomSeed();
+		PendingBoundaryWarpAmplitude = V6Actor->GetConfiguredBoundaryWarpAmplitude();
+		PendingContinentalFraction = V6Actor->GetConfiguredContinentalFraction();
+		PendingExportWidth = V6Actor->GetConfiguredExportWidth();
+		SelectVisualizationMode(V6Actor->GetVisualizationMode());
+	}
 }
 
 void SAurousTectonicControlPanel::RefreshMetrics()
 {
-	if (ATectonicPlanetActor* Actor = GetSelectedActor())
-		{
-			const FTectonicPlanetMetrics Metrics = Actor->GetMetrics();
-			CachedCurrentStep = Metrics.CurrentStep;
-			CachedLastAdvanceStepMs = Actor->GetLastAdvanceStepMs();
-			CachedMetricsText = FText::FromString(FString::Printf(
-				TEXT("Preset: %s\nRuntime: %s\nStep: %d\nSamples: %d\nPlates: %d\nTerranes: %d\nContinental Fraction: %.3f\nElevation Min/Max/Mean: %.3f / %.3f / %.3f"),
-				*Actor->GetActiveRuntimePresetLabel(),
-				*Actor->GetRuntimeConfigSummary(),
-				Metrics.CurrentStep,
-				Metrics.SampleCount,
-				Metrics.PlateCount,
+	if (ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
+	{
+		const FTectonicPlanetMetrics Metrics = Actor->GetMetrics();
+		CachedCurrentStep = Metrics.CurrentStep;
+		CachedLastAdvanceStepMs = Actor->GetLastAdvanceStepMs();
+		CachedMetricsText = FText::FromString(FString::Printf(
+			TEXT("Preset: %s\nRuntime: %s\nStep: %d\nSamples: %d\nPlates: %d\nTerranes: %d\nContinental Fraction: %.3f\nElevation Min/Max/Mean: %.3f / %.3f / %.3f"),
+			*Actor->GetActiveRuntimePresetLabel(),
+			*Actor->GetRuntimeConfigSummary(),
+			Metrics.CurrentStep,
+			Metrics.SampleCount,
+			Metrics.PlateCount,
 			Metrics.TerraneCount,
 			Metrics.ContinentalFraction,
 			Metrics.MinElevation,
 			Metrics.MaxElevation,
 			Metrics.MeanElevation));
+	}
+	else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+	{
+		const FTectonicPlanet& Planet = V6Actor->GetPlanetV6().GetPlanet();
+		double MinElevation = 0.0;
+		double MaxElevation = 0.0;
+		double MeanElevation = 0.0;
+		if (!Planet.Samples.IsEmpty())
+		{
+			MinElevation = TNumericLimits<double>::Max();
+			MaxElevation = -TNumericLimits<double>::Max();
+			for (const FSample& Sample : Planet.Samples)
+			{
+				const double Elevation = static_cast<double>(Sample.Elevation);
+				MinElevation = FMath::Min(MinElevation, Elevation);
+				MaxElevation = FMath::Max(MaxElevation, Elevation);
+				MeanElevation += Elevation;
+			}
+			MeanElevation /= static_cast<double>(Planet.Samples.Num());
+		}
+		CachedCurrentStep = Planet.CurrentStep;
+		CachedLastAdvanceStepMs = V6Actor->GetLastAdvanceStepMs();
+		CachedMetricsText = FText::FromString(FString::Printf(
+			TEXT("Preset: %s\nRuntime: %s\nStep: %d\nSamples: %d\nPlates: %d\nContinental Fraction: %.3f\nPeriodic Solves: %d\nCollisions: %d\nRifts: %d\nElevation Min/Max/Mean: %.3f / %.3f / %.3f"),
+			*V6Actor->GetActiveRuntimePresetLabel(),
+			*V6Actor->GetRuntimeConfigSummary(),
+			Planet.CurrentStep,
+			Planet.Samples.Num(),
+			Planet.Plates.Num(),
+			V6Actor->GetContinentalAreaFraction(),
+			V6Actor->GetPeriodicSolveCountValue(),
+			V6Actor->GetCumulativeCollisionCountValue(),
+			V6Actor->GetCumulativeRiftCountValue(),
+			MinElevation,
+			MaxElevation,
+			MeanElevation));
 	}
 	else
 	{
@@ -655,7 +746,7 @@ bool SAurousTectonicControlPanel::EnsureSelectedActor(const TCHAR* ActionName) c
 
 	FMessageDialog::Open(
 		EAppMsgType::Ok,
-		FText::FromString(FString::Printf(TEXT("%s requires a selected ATectonicPlanetActor."), ActionName)));
+		FText::FromString(FString::Printf(TEXT("%s requires a selected ATectonicPlanetActor or ATectonicPlanetV6PreviewActor."), ActionName)));
 	return false;
 }
 
@@ -678,14 +769,26 @@ FReply SAurousTectonicControlPanel::OnGenerateClicked()
 		return FReply::Handled();
 	}
 
-	ATectonicPlanetActor* Actor = GetSelectedActor();
-	Actor->GeneratePlanet(
-		PendingSampleCount,
-		PendingPlateCount,
-		PendingRandomSeed,
-		PendingBoundaryWarpAmplitude,
-		PendingContinentalFraction);
-	Actor->BuildMeshWithMode(GetSelectedVisualizationMode());
+	if (ATectonicPlanetActor* LegacyActor = GetSelectedLegacyActor())
+	{
+		LegacyActor->GeneratePlanet(
+			PendingSampleCount,
+			PendingPlateCount,
+			PendingRandomSeed,
+			PendingBoundaryWarpAmplitude,
+			PendingContinentalFraction);
+		LegacyActor->BuildMeshWithMode(GetSelectedVisualizationMode());
+	}
+	else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+	{
+		V6Actor->GeneratePlanet(
+			PendingSampleCount,
+			PendingPlateCount,
+			PendingRandomSeed,
+			PendingBoundaryWarpAmplitude,
+			PendingContinentalFraction);
+		V6Actor->BuildMeshWithMode(GetSelectedVisualizationMode());
+	}
 	RefreshMetrics();
 	return FReply::Handled();
 }
@@ -697,9 +800,16 @@ FReply SAurousTectonicControlPanel::OnStep1Clicked()
 		return FReply::Handled();
 	}
 
-	ATectonicPlanetActor* Actor = GetSelectedActor();
-	Actor->BuildMeshWithMode(GetSelectedVisualizationMode());
-	Actor->AdvancePlanetSteps(1);
+	if (ATectonicPlanetActor* LegacyActor = GetSelectedLegacyActor())
+	{
+		LegacyActor->BuildMeshWithMode(GetSelectedVisualizationMode());
+		LegacyActor->AdvancePlanetSteps(1);
+	}
+	else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+	{
+		V6Actor->BuildMeshWithMode(GetSelectedVisualizationMode());
+		V6Actor->AdvancePlanetSteps(1);
+	}
 	RefreshMetrics();
 	return FReply::Handled();
 }
@@ -711,9 +821,16 @@ FReply SAurousTectonicControlPanel::OnStep10Clicked()
 		return FReply::Handled();
 	}
 
-	ATectonicPlanetActor* Actor = GetSelectedActor();
-	Actor->BuildMeshWithMode(GetSelectedVisualizationMode());
-	Actor->AdvancePlanetSteps(10);
+	if (ATectonicPlanetActor* LegacyActor = GetSelectedLegacyActor())
+	{
+		LegacyActor->BuildMeshWithMode(GetSelectedVisualizationMode());
+		LegacyActor->AdvancePlanetSteps(10);
+	}
+	else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+	{
+		V6Actor->BuildMeshWithMode(GetSelectedVisualizationMode());
+		V6Actor->AdvancePlanetSteps(10);
+	}
 	RefreshMetrics();
 	return FReply::Handled();
 }
@@ -725,9 +842,16 @@ FReply SAurousTectonicControlPanel::OnStep50Clicked()
 		return FReply::Handled();
 	}
 
-	ATectonicPlanetActor* Actor = GetSelectedActor();
-	Actor->BuildMeshWithMode(GetSelectedVisualizationMode());
-	Actor->AdvancePlanetSteps(50);
+	if (ATectonicPlanetActor* LegacyActor = GetSelectedLegacyActor())
+	{
+		LegacyActor->BuildMeshWithMode(GetSelectedVisualizationMode());
+		LegacyActor->AdvancePlanetSteps(50);
+	}
+	else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+	{
+		V6Actor->BuildMeshWithMode(GetSelectedVisualizationMode());
+		V6Actor->AdvancePlanetSteps(50);
+	}
 	RefreshMetrics();
 	return FReply::Handled();
 }
@@ -742,7 +866,17 @@ FReply SAurousTectonicControlPanel::OnExportMapsClicked()
 	FString OutputDirectory;
 	FString ExportError;
 	const int32 ExportHeight = FMath::Max(MinimumExportHeight, PendingExportWidth / 2);
-	if (!GetSelectedActor()->ExportCurrentMaps(ETectonicMapExportMode::All, PendingExportWidth, ExportHeight, OutputDirectory, ExportError))
+	bool bExported = false;
+	if (ATectonicPlanetActor* LegacyActor = GetSelectedLegacyActor())
+	{
+		bExported = LegacyActor->ExportCurrentMaps(ETectonicMapExportMode::All, PendingExportWidth, ExportHeight, OutputDirectory, ExportError);
+	}
+	else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+	{
+		bExported = V6Actor->ExportCurrentMaps(ETectonicMapExportMode::All, PendingExportWidth, ExportHeight, OutputDirectory, ExportError);
+	}
+
+	if (!bExported)
 	{
 		FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(ExportError));
 	}
@@ -762,18 +896,28 @@ void SAurousTectonicControlPanel::OnVisualizationModeChanged(TSharedPtr<FString>
 		return;
 	}
 
-	if (ATectonicPlanetActor* Actor = GetSelectedActor())
+	if (ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
 	{
 		Actor->BuildMeshWithMode(GetSelectedVisualizationMode());
+		RefreshMetrics();
+	}
+	else if (ATectonicPlanetV6PreviewActor* V6Actor = GetSelectedV6Actor())
+	{
+		V6Actor->BuildMeshWithMode(GetSelectedVisualizationMode());
 		RefreshMetrics();
 	}
 }
 
 FText SAurousTectonicControlPanel::GetSelectedActorText() const
 {
-	if (const ATectonicPlanetActor* Actor = GetSelectedActor())
+	if (const ATectonicPlanetActor* Actor = GetSelectedLegacyActor())
 	{
-		return FormatMetricLine(TEXT("Selected"), Actor->GetActorNameOrLabel());
+		return FormatMetricLine(TEXT("Selected"), FString::Printf(TEXT("%s (Legacy)"), *Actor->GetActorNameOrLabel()));
+	}
+
+	if (const ATectonicPlanetV6PreviewActor* Actor = GetSelectedV6Actor())
+	{
+		return FormatMetricLine(TEXT("Selected"), FString::Printf(TEXT("%s (V6 Preview)"), *Actor->GetActorNameOrLabel()));
 	}
 
 	return FormatMetricLine(TEXT("Selected"), TEXT("None"));
