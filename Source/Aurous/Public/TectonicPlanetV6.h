@@ -105,6 +105,25 @@ enum class ETectonicPlanetV6DirectionalTransferKind : uint8
 	ZeroVectorFallback,
 };
 
+struct AUROUS_API FTectonicPlanetV6KeptRuntimeProfileOptions
+{
+	bool bEnableAutomaticRifting = true;
+	bool bEnableSubmergedContinentalFringeRelaxation = true;
+	bool bEnablePlateCandidatePruning = true;
+	bool bEnableCopiedFrontierUnfilteredMeshReuse = true;
+	bool bUseCachedSubductionAdjacencyEdgeDistances = true;
+	bool bUseSubductionPerformanceOptimizations = true;
+	double SubmergedContinentalRelaxationRatePerStep = 0.005;
+	double SubmergedContinentalFringeRelaxationRatePerStep = 0.004;
+	double SubmergedContinentalFringeBoundaryOrActiveBonusRatePerStep = 0.002;
+};
+
+struct AUROUS_API FTectonicPlanetV6KeptDiagnosticsOptions
+{
+	bool bEnablePhaseTiming = false;
+	bool bEnableDetailedCopiedFrontierAttribution = true;
+};
+
 struct AUROUS_API FTectonicPlanetV6OwnerCandidate
 {
 	int32 PlateId = INDEX_NONE;
@@ -246,6 +265,8 @@ struct AUROUS_API FTectonicPlanetV6PhaseTiming
 	double SampleAdjacencyBuildMs = 0.0;
 	double ActiveZoneMaskMs = 0.0;
 	double CopiedFrontierMeshBuildMs = 0.0;
+	double CopiedFrontierUnfilteredMeshPrepareMs = 0.0;
+	double CopiedFrontierFilteredMeshBuildMs = 0.0;
 	double QueryGeometryBuildMs = 0.0;
 	double FrontierPointSetBuildMs = 0.0;
 	double ResolveTransferLoopMs = 0.0;
@@ -1256,6 +1277,15 @@ struct AUROUS_API FTectonicPlanetV6
 	const FTectonicPlanetV6PeriodicSolveStats& GetLastSolveStats() const;
 	const TArray<FTectonicPlanetV6ResolvedSample>& GetLastResolvedSamples() const;
 	const TArray<int32>& GetPeriodicSolveSteps() const;
+	static ETectonicPlanetV6PeriodicSolveMode GetKeptV6PeriodicSolveMode();
+	static int32 GetKeptV6FixedIntervalSteps();
+	static FString DescribeKeptV6RuntimeProfile(
+		bool bEnableAutomaticRifting,
+		bool bEnableSubmergedContinentalFringeRelaxation = true);
+	void ApplyKeptV6RuntimeProfile(
+		const FTectonicPlanetV6KeptRuntimeProfileOptions& Options = FTectonicPlanetV6KeptRuntimeProfileOptions{});
+	void ApplyKeptV6DiagnosticsProfile(
+		const FTectonicPlanetV6KeptDiagnosticsOptions& Options = FTectonicPlanetV6KeptDiagnosticsOptions{});
 	void SetPeriodicSolveModeForTest(
 		ETectonicPlanetV6PeriodicSolveMode InMode,
 		int32 InFixedIntervalSteps = 25);
@@ -1338,6 +1368,16 @@ private:
 	void PerformThesisRemeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisCopiedFrontierSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisPlateSubmeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
+	void CaptureCopiedFrontierPreSolveState(
+		TArray<int32>& OutPreSolvePlateIds,
+		TArray<uint8>& OutPreSolveContinentalFlags,
+		TArray<float>& OutPreSolveContinentalWeights,
+		TArray<float>& OutPreSolveElevations,
+		TArray<float>& OutPreSolveThicknesses);
+	void ResetCopiedFrontierSolveTransientState(
+		const TArray<int32>& PreSolvePlateIds,
+		const TArray<float>& PreSolveContinentalWeights,
+		const TArray<float>& PreSolveElevations);
 	void RebuildSubmergedContinentalFringeRelaxationMask();
 	void RebuildThesisCopiedFrontierMeshes();
 	void RebuildThesisPlateSubmeshMeshes();
