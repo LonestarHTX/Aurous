@@ -13631,3 +13631,736 @@ bool FTectonicPlanetV6V9PaperSurrogateSelectiveElevationRefinementTest::RunTest(
 	TestTrue(TEXT("Selective candidate reached step 100"), Selective.Planet.GetPlanet().CurrentStep >= 100);
 	return true;
 }
+
+// ============================================================================
+// Paper-Selective Elevation Confirmation And Robustness Test
+// Confirms the kept selective-elevation candidate against the equilibrium
+// baseline on the canonical seed, then runs a small seed sweep to check whether
+// the same morphological/stability class holds beyond the single kept seed.
+// ============================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9PaperSelectiveElevationConfirmationAndRobustnessTest,
+	"Aurous.TectonicPlanet.V6V9PaperSelectiveElevationConfirmationAndRobustnessTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9PaperSelectiveElevationConfirmationAndRobustnessTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 FixedIntervalSteps = 16;
+	constexpr int32 SampleCount = 100000;
+	constexpr int32 PlateCount = 40;
+	const FString RunId = TEXT("V9PaperSelectiveElevationConfirmation100k");
+	const TArray<int32> SweepSeeds = { TestRandomSeed, 31415, 27182 };
+
+	struct FSurrogateDriftMeans
+	{
+		double EligibleCount = 0.0;
+		double PreCWMean = 0.0;
+		double PostTransferCWMean = 0.0;
+		double FinalCWMean = 0.0;
+		double PreElevationMean = 0.0;
+		double PostTransferElevationMean = 0.0;
+		double FinalElevationMean = 0.0;
+		double PreThicknessMean = 0.0;
+		double PostTransferThicknessMean = 0.0;
+		double FinalThicknessMean = 0.0;
+	};
+
+	struct FRunState
+	{
+		FString Label;
+		int32 Seed = TestRandomSeed;
+		bool bEnablePaperSurrogate = false;
+		ETectonicPlanetV6PaperSurrogateFieldMode FieldMode =
+			ETectonicPlanetV6PaperSurrogateFieldMode::FullState;
+		FString ExportRoot;
+		FTectonicPlanetV6 Planet;
+		TMap<int32, FV6CheckpointSnapshot> Snapshots;
+		TMap<int32, FV9ContinentalMassDiagnostic> MassDiagnostics;
+		TMap<int32, FV9ContinentalElevationStats> ElevationDiagnostics;
+		TMap<int32, FV9SeededContinentalSurvivalDiagnostic> SurvivalDiagnostics;
+		TArray<uint8> Step0ContinentalFlags;
+		TArray<uint8> Step0BroadInteriorFlags;
+		TArray<uint8> Step0CoastAdjacentFlags;
+	};
+
+	struct FSeedGateResult
+	{
+		int32 Seed = 0;
+		bool bCoastPass = false;
+		bool bLargestSubaerialPass = false;
+		bool bBroadSeedPass = false;
+		bool bSubmergedPass = false;
+		bool bCoherencePass = false;
+		bool bLeakagePass = false;
+		bool bChurnPass = false;
+		bool bP95Pass = false;
+		bool bAbove5Pass = false;
+		bool bMorphologyPass = false;
+		bool bStabilityPass = false;
+		bool bReliefPass = false;
+		bool bAllowStep200 = false;
+		bool bStep200Healthy = false;
+	};
+
+	const auto ComputeDriftMeans = [](const FTectonicPlanetV6PeriodicSolveStats& SolveStats)
+	{
+		FSurrogateDriftMeans Drift;
+		Drift.EligibleCount =
+			static_cast<double>(SolveStats.PaperSurrogateQuietInteriorDirectHitEligibleCount);
+		if (Drift.EligibleCount <= 0.0)
+		{
+			return Drift;
+		}
+
+		Drift.PreCWMean =
+			SolveStats.PaperSurrogateQuietInteriorDirectHitPreSolveContinentalWeightSum /
+			Drift.EligibleCount;
+		Drift.PostTransferCWMean =
+			SolveStats.PaperSurrogateQuietInteriorDirectHitPostTransferContinentalWeightSum /
+			Drift.EligibleCount;
+		Drift.FinalCWMean =
+			SolveStats.PaperSurrogateQuietInteriorDirectHitFinalContinentalWeightSum /
+			Drift.EligibleCount;
+		Drift.PreElevationMean =
+			SolveStats.PaperSurrogateQuietInteriorDirectHitPreSolveElevationSum /
+			Drift.EligibleCount;
+		Drift.PostTransferElevationMean =
+			SolveStats.PaperSurrogateQuietInteriorDirectHitPostTransferElevationSum /
+			Drift.EligibleCount;
+		Drift.FinalElevationMean =
+			SolveStats.PaperSurrogateQuietInteriorDirectHitFinalElevationSum /
+			Drift.EligibleCount;
+		Drift.PreThicknessMean =
+			SolveStats.PaperSurrogateQuietInteriorDirectHitPreSolveThicknessSum /
+			Drift.EligibleCount;
+		Drift.PostTransferThicknessMean =
+			SolveStats.PaperSurrogateQuietInteriorDirectHitPostTransferThicknessSum /
+			Drift.EligibleCount;
+		Drift.FinalThicknessMean =
+			SolveStats.PaperSurrogateQuietInteriorDirectHitFinalThicknessSum /
+			Drift.EligibleCount;
+		return Drift;
+	};
+
+	const auto InitializePlanet =
+		[=](const int32 Seed, const bool bEnablePaperSurrogate, const ETectonicPlanetV6PaperSurrogateFieldMode FieldMode)
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			ETectonicPlanetV6PeriodicSolveMode::ThesisPartitionedFrontierProcessSpike,
+			FixedIntervalSteps,
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			Seed);
+		Planet.SetSyntheticCoverageRetentionForTest(false);
+		Planet.SetWholeTriangleBoundaryDuplicationForTest(false);
+		Planet.SetExcludeMixedTrianglesForTest(false);
+		Planet.SetV9Phase1AuthorityForTest(true, 1);
+		Planet.SetV9Phase1ActiveZoneClassifierModeForTest(
+			ETectonicPlanetV6ActiveZoneClassifierMode::PersistentPairLocalTightFreshAdmission);
+		Planet.SetV9Phase1PersistentActivePairHorizonForTest(2);
+		Planet.SetV9CollisionShadowForTest(true);
+		Planet.SetV9CollisionExecutionForTest(true);
+		Planet.SetV9CollisionExecutionEnhancedConsequencesForTest(true);
+		Planet.SetV9CollisionExecutionStructuralTransferForTest(true);
+		Planet.SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
+		Planet.SetV9ThesisShapedCollisionExecutionForTest(true);
+		Planet.SetV9QuietInteriorContinentalRetentionForTest(true);
+		Planet.SetV9ContinentalBreadthPreservationForTest(false);
+		Planet.SetSubmergedContinentalRelaxationForTest(true, 0.005);
+		Planet.SetAutomaticRiftingForTest(true);
+		Planet.SetV9PaperSurrogateOwnershipForTest(bEnablePaperSurrogate);
+		Planet.SetV9PaperSurrogateFieldModeForTest(FieldMode);
+		return Planet;
+	};
+
+	const auto BuildSeedFlags = [](
+		const FV9ContinentalMassDiagnostic& Step0Mass,
+		TArray<uint8>& OutStep0ContinentalFlags,
+		TArray<uint8>& OutStep0BroadInteriorFlags,
+		TArray<uint8>& OutStep0CoastAdjacentFlags)
+	{
+		const int32 N = Step0Mass.SampleCoastDistHops.Num();
+		OutStep0ContinentalFlags.Init(0, N);
+		OutStep0BroadInteriorFlags.Init(0, N);
+		OutStep0CoastAdjacentFlags.Init(0, N);
+		for (int32 I = 0; I < N; ++I)
+		{
+			if (!Step0Mass.SampleComponentId.IsValidIndex(I) ||
+				!Step0Mass.SampleCoastDistHops.IsValidIndex(I) ||
+				Step0Mass.SampleComponentId[I] < 0)
+			{
+				continue;
+			}
+
+			OutStep0ContinentalFlags[I] = 1;
+			const int32 CoastDepth = Step0Mass.SampleCoastDistHops[I];
+			if (CoastDepth >= 2)
+			{
+				OutStep0BroadInteriorFlags[I] = 1;
+			}
+			else if (CoastDepth == 1)
+			{
+				OutStep0CoastAdjacentFlags[I] = 1;
+			}
+		}
+	};
+
+	const auto InitializeRunState =
+		[&](FRunState& Run,
+			const FString& Label,
+			const int32 Seed,
+			const bool bEnablePaperSurrogate,
+			const ETectonicPlanetV6PaperSurrogateFieldMode FieldMode,
+			const FString& ExportRoot)
+	{
+		Run.Label = Label;
+		Run.Seed = Seed;
+		Run.bEnablePaperSurrogate = bEnablePaperSurrogate;
+		Run.FieldMode = FieldMode;
+		Run.ExportRoot = ExportRoot;
+		Run.Planet = InitializePlanet(Seed, bEnablePaperSurrogate, FieldMode);
+	};
+
+	const auto FinalizeStep0Flags = [&](FRunState& Run)
+	{
+		const FV9ContinentalMassDiagnostic& Step0Mass = Run.MassDiagnostics.FindChecked(0);
+		BuildSeedFlags(
+			Step0Mass,
+			Run.Step0ContinentalFlags,
+			Run.Step0BroadInteriorFlags,
+			Run.Step0CoastAdjacentFlags);
+		Run.SurvivalDiagnostics[0] = ComputeSeededContinentalSurvivalDiagnostic(
+			Run.Planet.GetPlanet(),
+			Run.Step0ContinentalFlags,
+			Run.Step0BroadInteriorFlags,
+			Run.Step0CoastAdjacentFlags);
+	};
+
+	const auto CaptureCheckpoint =
+		[this, &ComputeDriftMeans](
+			FRunState& Run,
+			const int32 Step,
+			const bool bExport)
+	{
+		const FString Tag = FString::Printf(
+			TEXT("[V9PaperConfirm %s seed=%d step=%d]"),
+			*Run.Label,
+			Run.Seed,
+			Step);
+		if (bExport && !Run.ExportRoot.IsEmpty())
+		{
+			ExportV6CheckpointMaps(*this, Run.Planet, Run.ExportRoot, Step);
+			ExportV6DebugOverlays(*this, Run.Planet, Run.ExportRoot, Step);
+		}
+
+		const FV6CheckpointSnapshot Snapshot = BuildV6CheckpointSnapshot(Run.Planet);
+		const FV9ContinentalMassDiagnostic MassDiag = ComputeContinentalMassDiagnostic(Run.Planet);
+		const FV9ContinentalElevationStats ElevStats = ComputeContinentalElevationStats(Run.Planet);
+		const FV9SeededContinentalSurvivalDiagnostic SurvivalDiag =
+			ComputeSeededContinentalSurvivalDiagnostic(
+				Run.Planet.GetPlanet(),
+				Run.Step0ContinentalFlags,
+				Run.Step0BroadInteriorFlags,
+				Run.Step0CoastAdjacentFlags);
+		Run.Snapshots.Add(Step, Snapshot);
+		Run.MassDiagnostics.Add(Step, MassDiag);
+		Run.ElevationDiagnostics.Add(Step, ElevStats);
+		Run.SurvivalDiagnostics.Add(Step, SurvivalDiag);
+
+		AddV6BoundaryCoherenceInfo(*this, Tag, Snapshot);
+		AddV6ActiveZoneInfo(*this, Tag, Snapshot);
+		AddV6ContinentalMassDiagnosticInfo(*this, Tag, MassDiag);
+
+		const FTectonicPlanetV6PeriodicSolveStats& SolveStats =
+			Run.Planet.GetPeriodicSolveCount() > 0
+				? Run.Planet.GetLastSolveStats()
+				: Run.Planet.BuildCurrentDiagnosticSnapshotForTest();
+		const FSurrogateDriftMeans Drift = ComputeDriftMeans(SolveStats);
+		AddInfo(FString::Printf(
+			TEXT("%s relief: mean=%.4f p95=%.4f max=%.4f above_2km=%d above_5km=%d surrogate=%d(subaerial=%d,submerged=%d,tri=%d,ss=%d,strong=%d,moderate=%d,low=%d,elev_mid=%d,elev_high=%d)"),
+			*Tag,
+			ElevStats.MeanElevationKm,
+			ElevStats.P95ElevationKm,
+			ElevStats.MaxElevationKm,
+			ElevStats.SamplesAbove2Km,
+			ElevStats.SamplesAbove5Km,
+			SolveStats.PaperSurrogateOwnershipOverrideCount,
+			SolveStats.PaperSurrogateOwnershipOverrideSubaerialCount,
+			SolveStats.PaperSurrogateOwnershipOverrideSubmergedCount,
+			SolveStats.PaperSurrogateOwnershipOverrideTriangleCount,
+			SolveStats.PaperSurrogateOwnershipOverrideSingleSourceCount,
+			SolveStats.PaperSurrogateOwnershipOverrideStrongInteriorCount,
+			SolveStats.PaperSurrogateOwnershipOverrideModerateInteriorCount,
+			SolveStats.PaperSurrogateOwnershipOverrideLowElevationBandCount,
+			SolveStats.PaperSurrogateOwnershipOverrideModerateElevationBandCount,
+			SolveStats.PaperSurrogateOwnershipOverrideHighElevationBandCount));
+		AddInfo(FString::Printf(
+			TEXT("%s surrogate_drift: eligible=%d pre_cw=%.4f post_cw=%.4f final_cw=%.4f pre_elev=%.4f post_elev=%.4f final_elev=%.4f pre_thickness=%.4f post_thickness=%.4f final_thickness=%.4f"),
+			*Tag,
+			SolveStats.PaperSurrogateQuietInteriorDirectHitEligibleCount,
+			Drift.PreCWMean,
+			Drift.PostTransferCWMean,
+			Drift.FinalCWMean,
+			Drift.PreElevationMean,
+			Drift.PostTransferElevationMean,
+			Drift.FinalElevationMean,
+			Drift.PreThicknessMean,
+			Drift.PostTransferThicknessMean,
+			Drift.FinalThicknessMean));
+		AddInfo(FString::Printf(
+			TEXT("%s seeded_survival: all=%d/%d(%.4f) broad_interior=%d/%d(%.4f) coast_adjacent=%d/%d(%.4f)"),
+			*Tag,
+			SurvivalDiag.Step0ContinentalRemainingCount,
+			SurvivalDiag.Step0ContinentalCount,
+			SurvivalDiag.Step0ContinentalRemainingFraction,
+			SurvivalDiag.Step0BroadInteriorRemainingCount,
+			SurvivalDiag.Step0BroadInteriorCount,
+			SurvivalDiag.Step0BroadInteriorRemainingFraction,
+			SurvivalDiag.Step0CoastAdjacentRemainingCount,
+			SurvivalDiag.Step0CoastAdjacentCount,
+			SurvivalDiag.Step0CoastAdjacentRemainingFraction));
+
+		if (bExport && !Run.ExportRoot.IsEmpty())
+		{
+			ExportContinentalMassOverlays(*this, Run.Planet, MassDiag, Run.ExportRoot, Step);
+		}
+	};
+
+	const auto LogCanonicalComparison =
+		[this, &ComputeDriftMeans](
+			const int32 Step,
+			const FRunState& BaselineRun,
+			const FRunState& CandidateRun)
+	{
+		const FV6CheckpointSnapshot& BS = BaselineRun.Snapshots.FindChecked(Step);
+		const FV6CheckpointSnapshot& CS = CandidateRun.Snapshots.FindChecked(Step);
+		const FV9ContinentalMassDiagnostic& BM = BaselineRun.MassDiagnostics.FindChecked(Step);
+		const FV9ContinentalMassDiagnostic& CM = CandidateRun.MassDiagnostics.FindChecked(Step);
+		const FV9ContinentalElevationStats& BE =
+			BaselineRun.ElevationDiagnostics.FindChecked(Step);
+		const FV9ContinentalElevationStats& CE =
+			CandidateRun.ElevationDiagnostics.FindChecked(Step);
+		const FV9SeededContinentalSurvivalDiagnostic& BSurv =
+			BaselineRun.SurvivalDiagnostics.FindChecked(Step);
+		const FV9SeededContinentalSurvivalDiagnostic& CSurv =
+			CandidateRun.SurvivalDiagnostics.FindChecked(Step);
+		const FTectonicPlanetV6PeriodicSolveStats& BStats =
+			BaselineRun.Planet.GetPeriodicSolveCount() > 0
+				? BaselineRun.Planet.GetLastSolveStats()
+				: BaselineRun.Planet.BuildCurrentDiagnosticSnapshotForTest();
+		const FTectonicPlanetV6PeriodicSolveStats& CStats =
+			CandidateRun.Planet.GetPeriodicSolveCount() > 0
+				? CandidateRun.Planet.GetLastSolveStats()
+				: CandidateRun.Planet.BuildCurrentDiagnosticSnapshotForTest();
+		const FSurrogateDriftMeans BDrift = ComputeDriftMeans(BStats);
+		const FSurrogateDriftMeans CDrift = ComputeDriftMeans(CStats);
+
+		AddInfo(FString::Printf(
+			TEXT("[V9PaperConfirm compare step=%d baseline=%s candidate=%s] coast_mean=%.2f/%.2f coast_p50=%.1f/%.1f coast_p90=%.1f/%.1f subaerial_coast_mean=%.2f/%.2f largest=%d/%d largest_subaerial=%d/%d broad_seed=%.4f/%.4f"),
+			Step,
+			*BaselineRun.Label,
+			*CandidateRun.Label,
+			BM.MeanCoastDistHops, CM.MeanCoastDistHops,
+			BM.P50CoastDist, CM.P50CoastDist,
+			BM.P90CoastDist, CM.P90CoastDist,
+			BM.SubaerialMeanCoastDistHops, CM.SubaerialMeanCoastDistHops,
+			BM.LargestComponentSize, CM.LargestComponentSize,
+			BM.LargestSubaerialComponentSize, CM.LargestSubaerialComponentSize,
+			BSurv.Step0BroadInteriorRemainingFraction, CSurv.Step0BroadInteriorRemainingFraction));
+		AddInfo(FString::Printf(
+			TEXT("[V9PaperConfirm compare step=%d baseline=%s candidate=%s] caf=%.4f/%.4f subaerial_frac=%.4f/%.4f submerged_frac=%.4f/%.4f coherence=%.4f/%.4f leakage=%.4f/%.4f churn=%.4f/%.4f miss=%d/%d multi_hit=%d/%d"),
+			Step,
+			*BaselineRun.Label,
+			*CandidateRun.Label,
+			BM.ContinentalAreaFraction, CM.ContinentalAreaFraction,
+			BM.SubaerialContinentalFraction, CM.SubaerialContinentalFraction,
+			BM.SubmergedContinentalFraction, CM.SubmergedContinentalFraction,
+			BS.BoundaryCoherence.BoundaryCoherenceScore, CS.BoundaryCoherence.BoundaryCoherenceScore,
+			BS.BoundaryCoherence.InteriorLeakageFraction, CS.BoundaryCoherence.InteriorLeakageFraction,
+			BS.OwnershipChurn.ChurnFraction, CS.OwnershipChurn.ChurnFraction,
+			BS.MissCount, CS.MissCount,
+			BS.OverlapCount, CS.OverlapCount));
+		AddInfo(FString::Printf(
+			TEXT("[V9PaperConfirm compare step=%d baseline=%s candidate=%s] relief_mean=%.4f/%.4f relief_p95=%.4f/%.4f relief_max=%.4f/%.4f above_2km=%d/%d above_5km=%d/%d"),
+			Step,
+			*BaselineRun.Label,
+			*CandidateRun.Label,
+			BE.MeanElevationKm, CE.MeanElevationKm,
+			BE.P95ElevationKm, CE.P95ElevationKm,
+			BE.MaxElevationKm, CE.MaxElevationKm,
+			BE.SamplesAbove2Km, CE.SamplesAbove2Km,
+			BE.SamplesAbove5Km, CE.SamplesAbove5Km));
+		AddInfo(FString::Printf(
+			TEXT("[V9PaperConfirm compare step=%d baseline=%s candidate=%s] surrogate_usage_total=%d/%d subaerial=%d/%d submerged=%d/%d low=%d/%d elev_mid=%d/%d elev_high=%d/%d"),
+			Step,
+			*BaselineRun.Label,
+			*CandidateRun.Label,
+			BStats.PaperSurrogateOwnershipOverrideCount, CStats.PaperSurrogateOwnershipOverrideCount,
+			BStats.PaperSurrogateOwnershipOverrideSubaerialCount, CStats.PaperSurrogateOwnershipOverrideSubaerialCount,
+			BStats.PaperSurrogateOwnershipOverrideSubmergedCount, CStats.PaperSurrogateOwnershipOverrideSubmergedCount,
+			BStats.PaperSurrogateOwnershipOverrideLowElevationBandCount, CStats.PaperSurrogateOwnershipOverrideLowElevationBandCount,
+			BStats.PaperSurrogateOwnershipOverrideModerateElevationBandCount, CStats.PaperSurrogateOwnershipOverrideModerateElevationBandCount,
+			BStats.PaperSurrogateOwnershipOverrideHighElevationBandCount, CStats.PaperSurrogateOwnershipOverrideHighElevationBandCount));
+		AddInfo(FString::Printf(
+			TEXT("[V9PaperConfirm compare step=%d baseline=%s candidate=%s] drift_cw=eligible=%d/%d pre=%.4f/%.4f post_transfer=%.4f/%.4f final=%.4f/%.4f drift_elev=%.4f/%.4f->%.4f/%.4f->%.4f/%.4f drift_thickness=%.4f/%.4f->%.4f/%.4f->%.4f/%.4f"),
+			Step,
+			*BaselineRun.Label,
+			*CandidateRun.Label,
+			BStats.PaperSurrogateQuietInteriorDirectHitEligibleCount,
+			CStats.PaperSurrogateQuietInteriorDirectHitEligibleCount,
+			BDrift.PreCWMean, CDrift.PreCWMean,
+			BDrift.PostTransferCWMean, CDrift.PostTransferCWMean,
+			BDrift.FinalCWMean, CDrift.FinalCWMean,
+			BDrift.PreElevationMean, CDrift.PreElevationMean,
+			BDrift.PostTransferElevationMean, CDrift.PostTransferElevationMean,
+			BDrift.FinalElevationMean, CDrift.FinalElevationMean,
+			BDrift.PreThicknessMean, CDrift.PreThicknessMean,
+			BDrift.PostTransferThicknessMean, CDrift.PostTransferThicknessMean,
+			BDrift.FinalThicknessMean, CDrift.FinalThicknessMean));
+	};
+
+	const auto EvaluateSeedStep100Gate =
+		[this](
+			const FRunState& Run)
+	{
+		constexpr double MinSubaerialCoastMean = 4.50;
+		constexpr int32 MinLargestSubaerial = 2500;
+		constexpr double MinBroadSeedSurvival = 0.75;
+		constexpr double MaxSubmergedFraction = 0.07;
+		constexpr double MinCoherence = 0.93;
+		constexpr double MaxLeakage = 0.18;
+		constexpr double MaxChurn = 0.05;
+		constexpr double MaxP95ElevationKm = 5.50;
+		constexpr int32 MaxSamplesAbove5Km = 1000;
+
+		FSeedGateResult Result;
+		Result.Seed = Run.Seed;
+		const FV6CheckpointSnapshot& Snapshot = Run.Snapshots.FindChecked(100);
+		const FV9ContinentalMassDiagnostic& MassDiag = Run.MassDiagnostics.FindChecked(100);
+		const FV9ContinentalElevationStats& ElevDiag = Run.ElevationDiagnostics.FindChecked(100);
+		const FV9SeededContinentalSurvivalDiagnostic& SurvivalDiag =
+			Run.SurvivalDiagnostics.FindChecked(100);
+
+		Result.bCoastPass = MassDiag.SubaerialMeanCoastDistHops >= MinSubaerialCoastMean;
+		Result.bLargestSubaerialPass =
+			MassDiag.LargestSubaerialComponentSize >= MinLargestSubaerial;
+		Result.bBroadSeedPass =
+			SurvivalDiag.Step0BroadInteriorRemainingFraction >= MinBroadSeedSurvival;
+		Result.bSubmergedPass =
+			MassDiag.SubmergedContinentalFraction <= MaxSubmergedFraction;
+		Result.bCoherencePass =
+			Snapshot.BoundaryCoherence.BoundaryCoherenceScore >= MinCoherence;
+		Result.bLeakagePass =
+			Snapshot.BoundaryCoherence.InteriorLeakageFraction < MaxLeakage;
+		Result.bChurnPass =
+			Snapshot.OwnershipChurn.ChurnFraction < MaxChurn;
+		Result.bP95Pass = ElevDiag.P95ElevationKm <= MaxP95ElevationKm;
+		Result.bAbove5Pass = ElevDiag.SamplesAbove5Km <= MaxSamplesAbove5Km;
+		Result.bMorphologyPass =
+			Result.bCoastPass &&
+			Result.bLargestSubaerialPass &&
+			Result.bBroadSeedPass &&
+			Result.bSubmergedPass;
+		Result.bStabilityPass =
+			Result.bCoherencePass &&
+			Result.bLeakagePass &&
+			Result.bChurnPass;
+		Result.bReliefPass =
+			Result.bP95Pass &&
+			Result.bAbove5Pass;
+		Result.bAllowStep200 =
+			Result.bMorphologyPass &&
+			Result.bStabilityPass &&
+			Result.bReliefPass;
+
+		AddInfo(FString::Printf(
+			TEXT("[V9PaperConfirm seed=%d gate step=100] coast=%d(%.2f>=4.50) largest=%d(%d>=2500) broad_seed=%d(%.4f>=0.7500) submerged=%d(%.4f<=0.0700) coherence=%d(%.4f>=0.9300) leakage=%d(%.4f<0.1800) churn=%d(%.4f<0.0500) p95=%d(%.4f<=5.5000) above5=%d(%d<=1000) morphology=%d stability=%d relief=%d run_step200=%d"),
+			Run.Seed,
+			Result.bCoastPass ? 1 : 0,
+			MassDiag.SubaerialMeanCoastDistHops,
+			Result.bLargestSubaerialPass ? 1 : 0,
+			MassDiag.LargestSubaerialComponentSize,
+			Result.bBroadSeedPass ? 1 : 0,
+			SurvivalDiag.Step0BroadInteriorRemainingFraction,
+			Result.bSubmergedPass ? 1 : 0,
+			MassDiag.SubmergedContinentalFraction,
+			Result.bCoherencePass ? 1 : 0,
+			Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			Result.bLeakagePass ? 1 : 0,
+			Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+			Result.bChurnPass ? 1 : 0,
+			Snapshot.OwnershipChurn.ChurnFraction,
+			Result.bP95Pass ? 1 : 0,
+			ElevDiag.P95ElevationKm,
+			Result.bAbove5Pass ? 1 : 0,
+			ElevDiag.SamplesAbove5Km,
+			Result.bMorphologyPass ? 1 : 0,
+			Result.bStabilityPass ? 1 : 0,
+			Result.bReliefPass ? 1 : 0,
+			Result.bAllowStep200 ? 1 : 0));
+
+		return Result;
+	};
+
+	const auto EvaluateSeedStep200Health =
+		[this](
+			const FRunState& Run,
+			FSeedGateResult& Result)
+	{
+		constexpr double MinSubaerialCoastMean = 4.00;
+		constexpr double MinBroadSeedSurvival = 0.60;
+		constexpr double MaxSubmergedFraction = 0.08;
+		constexpr double MinCoherence = 0.93;
+		constexpr double MaxLeakage = 0.18;
+		constexpr double MaxChurn = 0.05;
+		constexpr double MaxP95ElevationKm = 6.00;
+		constexpr int32 MaxSamplesAbove5Km = 1500;
+
+		const FV6CheckpointSnapshot& Snapshot = Run.Snapshots.FindChecked(200);
+		const FV9ContinentalMassDiagnostic& MassDiag = Run.MassDiagnostics.FindChecked(200);
+		const FV9ContinentalElevationStats& ElevDiag = Run.ElevationDiagnostics.FindChecked(200);
+		const FV9SeededContinentalSurvivalDiagnostic& SurvivalDiag =
+			Run.SurvivalDiagnostics.FindChecked(200);
+
+		const bool bCoastPass = MassDiag.SubaerialMeanCoastDistHops >= MinSubaerialCoastMean;
+		const bool bBroadSeedPass =
+			SurvivalDiag.Step0BroadInteriorRemainingFraction >= MinBroadSeedSurvival;
+		const bool bSubmergedPass =
+			MassDiag.SubmergedContinentalFraction <= MaxSubmergedFraction;
+		const bool bCoherencePass =
+			Snapshot.BoundaryCoherence.BoundaryCoherenceScore >= MinCoherence;
+		const bool bLeakagePass =
+			Snapshot.BoundaryCoherence.InteriorLeakageFraction < MaxLeakage;
+		const bool bChurnPass =
+			Snapshot.OwnershipChurn.ChurnFraction < MaxChurn;
+		const bool bP95Pass =
+			ElevDiag.P95ElevationKm <= MaxP95ElevationKm;
+		const bool bAbove5Pass =
+			ElevDiag.SamplesAbove5Km <= MaxSamplesAbove5Km;
+
+		Result.bStep200Healthy =
+			bCoastPass &&
+			bBroadSeedPass &&
+			bSubmergedPass &&
+			bCoherencePass &&
+			bLeakagePass &&
+			bChurnPass &&
+			bP95Pass &&
+			bAbove5Pass;
+
+		AddInfo(FString::Printf(
+			TEXT("[V9PaperConfirm seed=%d gate step=200] coast=%d(%.2f>=4.00) broad_seed=%d(%.4f>=0.6000) submerged=%d(%.4f<=0.0800) coherence=%d(%.4f>=0.9300) leakage=%d(%.4f<0.1800) churn=%d(%.4f<0.0500) p95=%d(%.4f<=6.0000) above5=%d(%d<=1500) healthy=%d"),
+			Run.Seed,
+			bCoastPass ? 1 : 0,
+			MassDiag.SubaerialMeanCoastDistHops,
+			bBroadSeedPass ? 1 : 0,
+			SurvivalDiag.Step0BroadInteriorRemainingFraction,
+			bSubmergedPass ? 1 : 0,
+			MassDiag.SubmergedContinentalFraction,
+			bCoherencePass ? 1 : 0,
+			Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			bLeakagePass ? 1 : 0,
+			Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+			bChurnPass ? 1 : 0,
+			Snapshot.OwnershipChurn.ChurnFraction,
+			bP95Pass ? 1 : 0,
+			ElevDiag.P95ElevationKm,
+			bAbove5Pass ? 1 : 0,
+			ElevDiag.SamplesAbove5Km,
+			Result.bStep200Healthy ? 1 : 0));
+	};
+
+	const auto LogSeedSummary =
+		[this, &ComputeDriftMeans](
+			const FRunState& Run,
+			const FSeedGateResult& Gate100)
+	{
+		const FV9ContinentalMassDiagnostic& Mass100 = Run.MassDiagnostics.FindChecked(100);
+		const FV9ContinentalElevationStats& Elev100 = Run.ElevationDiagnostics.FindChecked(100);
+		const FV6CheckpointSnapshot& Snap100 = Run.Snapshots.FindChecked(100);
+		const FV9SeededContinentalSurvivalDiagnostic& Surv100 =
+			Run.SurvivalDiagnostics.FindChecked(100);
+		const FTectonicPlanetV6PeriodicSolveStats& Stats100 =
+			Run.Planet.GetPeriodicSolveCount() > 0
+				? Run.Planet.GetLastSolveStats()
+				: Run.Planet.BuildCurrentDiagnosticSnapshotForTest();
+		const FSurrogateDriftMeans Drift100 = ComputeDriftMeans(Stats100);
+
+		FString Step200Summary = TEXT("not_run");
+		if (Run.Snapshots.Contains(200))
+		{
+			const FV9ContinentalMassDiagnostic& Mass200 = Run.MassDiagnostics.FindChecked(200);
+			const FV9ContinentalElevationStats& Elev200 = Run.ElevationDiagnostics.FindChecked(200);
+			const FV6CheckpointSnapshot& Snap200 = Run.Snapshots.FindChecked(200);
+			const FV9SeededContinentalSurvivalDiagnostic& Surv200 =
+				Run.SurvivalDiagnostics.FindChecked(200);
+			Step200Summary = FString::Printf(
+				TEXT("coast=%.2f broad_seed=%.4f submerged=%.4f coherence=%.4f leakage=%.4f churn=%.4f p95=%.4f above5=%d healthy=%d"),
+				Mass200.SubaerialMeanCoastDistHops,
+				Surv200.Step0BroadInteriorRemainingFraction,
+				Mass200.SubmergedContinentalFraction,
+				Snap200.BoundaryCoherence.BoundaryCoherenceScore,
+				Snap200.BoundaryCoherence.InteriorLeakageFraction,
+				Snap200.OwnershipChurn.ChurnFraction,
+				Elev200.P95ElevationKm,
+				Elev200.SamplesAbove5Km,
+				Gate100.bStep200Healthy ? 1 : 0);
+		}
+
+		AddInfo(FString::Printf(
+			TEXT("[V9PaperConfirm seed_summary] seed=%d step100_pass=%d coast100=%.2f largest100=%d broad_seed100=%.4f submerged100=%.4f coherence100=%.4f leakage100=%.4f churn100=%.4f p95_100=%.4f above5_100=%d touched100=%d bands100=%d/%d/%d drift100_cw=%.4f->%.4f->%.4f drift100_elev=%.4f->%.4f->%.4f drift100_thickness=%.4f->%.4f->%.4f step200=%s"),
+			Run.Seed,
+			Gate100.bAllowStep200 ? 1 : 0,
+			Mass100.SubaerialMeanCoastDistHops,
+			Mass100.LargestSubaerialComponentSize,
+			Surv100.Step0BroadInteriorRemainingFraction,
+			Mass100.SubmergedContinentalFraction,
+			Snap100.BoundaryCoherence.BoundaryCoherenceScore,
+			Snap100.BoundaryCoherence.InteriorLeakageFraction,
+			Snap100.OwnershipChurn.ChurnFraction,
+			Elev100.P95ElevationKm,
+			Elev100.SamplesAbove5Km,
+			Stats100.PaperSurrogateOwnershipOverrideCount,
+			Stats100.PaperSurrogateOwnershipOverrideLowElevationBandCount,
+			Stats100.PaperSurrogateOwnershipOverrideModerateElevationBandCount,
+			Stats100.PaperSurrogateOwnershipOverrideHighElevationBandCount,
+			Drift100.PreCWMean,
+			Drift100.PostTransferCWMean,
+			Drift100.FinalCWMean,
+			Drift100.PreElevationMean,
+			Drift100.PostTransferElevationMean,
+			Drift100.FinalElevationMean,
+			Drift100.PreThicknessMean,
+			Drift100.PostTransferThicknessMean,
+			Drift100.FinalThicknessMean,
+			*Step200Summary));
+	};
+
+	const FString ExportRoot = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MapExports"), RunId);
+	const FString CanonicalBaselineExportRoot =
+		FPaths::Combine(ExportRoot, TEXT("canonical_baseline_equilibrium"));
+	const FString CanonicalCandidateExportRoot =
+		FPaths::Combine(ExportRoot, TEXT("canonical_candidate_selective_elevation"));
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*CanonicalBaselineExportRoot);
+	PlatformFile.CreateDirectoryTree(*CanonicalCandidateExportRoot);
+
+	FRunState CanonicalBaseline;
+	InitializeRunState(
+		CanonicalBaseline,
+		TEXT("canonical_baseline_equilibrium"),
+		TestRandomSeed,
+		false,
+		ETectonicPlanetV6PaperSurrogateFieldMode::FullState,
+		CanonicalBaselineExportRoot);
+
+	FRunState CanonicalCandidate;
+	InitializeRunState(
+		CanonicalCandidate,
+		TEXT("canonical_candidate_selective_elevation"),
+		TestRandomSeed,
+		true,
+		ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation,
+		CanonicalCandidateExportRoot);
+
+	CaptureCheckpoint(CanonicalBaseline, 0, false);
+	CaptureCheckpoint(CanonicalCandidate, 0, false);
+	FinalizeStep0Flags(CanonicalBaseline);
+	FinalizeStep0Flags(CanonicalCandidate);
+
+	const auto AdvanceCanonicalToStep =
+		[&](const int32 TargetStep)
+	{
+		while (CanonicalBaseline.Planet.GetPlanet().CurrentStep < TargetStep)
+		{
+			CanonicalBaseline.Planet.AdvanceStep();
+			CanonicalCandidate.Planet.AdvanceStep();
+		}
+	};
+
+	for (const int32 Step : TArray<int32>{25, 100, 200})
+	{
+		AdvanceCanonicalToStep(Step);
+		const bool bExport = Step >= 100;
+		CaptureCheckpoint(CanonicalBaseline, Step, bExport);
+		CaptureCheckpoint(CanonicalCandidate, Step, bExport);
+		LogCanonicalComparison(Step, CanonicalBaseline, CanonicalCandidate);
+	}
+
+	TArray<FSeedGateResult> SeedGateResults;
+	SeedGateResults.Reserve(SweepSeeds.Num());
+
+	FSeedGateResult CanonicalGate = EvaluateSeedStep100Gate(CanonicalCandidate);
+	EvaluateSeedStep200Health(CanonicalCandidate, CanonicalGate);
+	SeedGateResults.Add(CanonicalGate);
+	LogSeedSummary(CanonicalCandidate, SeedGateResults[0]);
+
+	for (int32 SeedIndex = 1; SeedIndex < SweepSeeds.Num(); ++SeedIndex)
+	{
+		FRunState SeedRun;
+		InitializeRunState(
+			SeedRun,
+			FString::Printf(TEXT("candidate_seed_%d"), SweepSeeds[SeedIndex]),
+			SweepSeeds[SeedIndex],
+			true,
+			ETectonicPlanetV6PaperSurrogateFieldMode::ContinentalWeightThicknessSelectiveElevation,
+			TEXT(""));
+
+		CaptureCheckpoint(SeedRun, 0, false);
+		FinalizeStep0Flags(SeedRun);
+		while (SeedRun.Planet.GetPlanet().CurrentStep < 100)
+		{
+			SeedRun.Planet.AdvanceStep();
+		}
+		CaptureCheckpoint(SeedRun, 100, false);
+
+		FSeedGateResult SeedGate = EvaluateSeedStep100Gate(SeedRun);
+		if (SeedGate.bAllowStep200)
+		{
+			while (SeedRun.Planet.GetPlanet().CurrentStep < 200)
+			{
+				SeedRun.Planet.AdvanceStep();
+			}
+			CaptureCheckpoint(SeedRun, 200, false);
+			EvaluateSeedStep200Health(SeedRun, SeedGate);
+		}
+		SeedGateResults.Add(SeedGate);
+		LogSeedSummary(SeedRun, SeedGateResults.Last());
+		const int32 RequiredStep = SeedRun.Snapshots.Contains(200) ? 200 : 100;
+		TestTrue(
+			*FString::Printf(TEXT("Seed %d reached required checkpoint %d"), SeedRun.Seed, RequiredStep),
+			SeedRun.Planet.GetPlanet().CurrentStep >= RequiredStep);
+	}
+
+	int32 Step100PassCount = 0;
+	int32 Step200RunCount = 0;
+	int32 Step200HealthyCount = 0;
+	for (const FSeedGateResult& Gate : SeedGateResults)
+	{
+		Step100PassCount += Gate.bAllowStep200 ? 1 : 0;
+		Step200RunCount += Gate.bAllowStep200 ? 1 : 0;
+		Step200HealthyCount += Gate.bStep200Healthy ? 1 : 0;
+	}
+
+	AddInfo(FString::Printf(
+		TEXT("[V9PaperConfirm robustness] seeds=%d step100_pass=%d step200_run=%d step200_healthy=%d canonical_seed=%d export_root=%s canonical_baseline_root=%s canonical_candidate_root=%s"),
+		SeedGateResults.Num(),
+		Step100PassCount,
+		Step200RunCount,
+		Step200HealthyCount,
+		TestRandomSeed,
+		*ExportRoot,
+		*CanonicalBaselineExportRoot,
+		*CanonicalCandidateExportRoot));
+
+	TestTrue(
+		TEXT("Canonical baseline reached step 200"),
+		CanonicalBaseline.Planet.GetPlanet().CurrentStep >= 200);
+	TestTrue(
+		TEXT("Canonical candidate reached step 200"),
+		CanonicalCandidate.Planet.GetPlanet().CurrentStep >= 200);
+	return true;
+}
