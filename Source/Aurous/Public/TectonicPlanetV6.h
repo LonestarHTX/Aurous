@@ -126,6 +126,12 @@ struct AUROUS_API FTectonicPlanetV6KeptDiagnosticsOptions
 
 struct AUROUS_API FTectonicPlanetV6LegacyHarnessConfig
 {
+	bool bOverridePeriodicSolveMode = false;
+	ETectonicPlanetV6PeriodicSolveMode PeriodicSolveMode =
+		ETectonicPlanetV6PeriodicSolveMode::Phase3Authoritative;
+	int32 FixedIntervalSteps = 25;
+	bool bOverrideCopiedFrontierIntervalPropagationWaveCap = false;
+	int32 CopiedFrontierIntervalPropagationWaveCap = INDEX_NONE;
 	bool bEnableSyntheticCoverageRetention = false;
 	bool bEnableWholeTriangleBoundaryDuplication = false;
 	bool bEnableExcludeMixedTriangles = false;
@@ -1210,7 +1216,6 @@ struct AUROUS_API FTectonicPlanetV6
 	const FTectonicPlanetV6CopiedFrontierSolveAttribution& GetLastCopiedFrontierSolveAttributionForTest() const;
 	const TArray<uint8>& GetTrackedCopiedFrontierDestructiveKindsForTest() const;
 	void RefreshCopiedFrontierDestructiveTrackingForTest();
-	void SetCopiedFrontierIntervalPropagationWaveCapForTest(int32 InMaxWaves);
 	FTectonicPlanetV6BoundaryCoherenceDiagnostic ComputeBoundaryCoherenceDiagnosticForTest() const;
 	FTectonicPlanetV6OwnershipChurnDiagnostic ComputeOwnershipChurnDiagnosticForTest() const;
 	FTectonicPlanetV6CompetitiveParticipationDiagnostic ComputeCompetitiveParticipationDiagnosticForTest() const;
@@ -1325,10 +1330,7 @@ struct AUROUS_API FTectonicPlanetV6
 	// Legacy/reference comparison surface retained for active harnesses. This is not part of the
 	// authoritative kept runtime profile and should not be used by editor/runtime callers.
 	void ApplyLegacyHarnessConfigForTest(const FTectonicPlanetV6LegacyHarnessConfig& Config);
-	void SetPeriodicSolveModeForTest(
-		ETectonicPlanetV6PeriodicSolveMode InMode,
-		int32 InFixedIntervalSteps = 25);
-	bool ForceLargestEligibleAutomaticRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
+	bool ExecuteLegacyHarnessForcedRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
 
 	static FTectonicPlanetV6ResolvedSample ResolvePhase1OwnershipForTest(
 		const TArray<FTectonicPlanetV6OwnerCandidate>& OwnerCandidates,
@@ -1377,10 +1379,14 @@ private:
 	void PerformThesisRemeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisCopiedFrontierSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisPlateSubmeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
+	void SetPeriodicSolveModeForTest(
+		ETectonicPlanetV6PeriodicSolveMode InMode,
+		int32 InFixedIntervalSteps = 25);
 	void SetPhaseTimingEnabled(bool bEnable);
 	void SetDetailedCopiedFrontierAttributionEnabled(bool bEnable);
 	void SetPlateCandidatePruningEnabled(bool bEnable);
 	void SetCopiedFrontierUnfilteredMeshReuseEnabled(bool bEnable);
+	void SetCopiedFrontierIntervalPropagationWaveCapForTest(int32 InMaxWaves);
 	void SetSyntheticCoverageRetentionForTest(bool bEnable);
 	void SetWholeTriangleBoundaryDuplicationForTest(bool bEnable);
 	void SetExcludeMixedTrianglesForTest(bool bEnable);
@@ -1405,6 +1411,7 @@ private:
 		double RatePerStep = 0.004,
 		double BoundaryOrActiveBonusRatePerStep = 0.002);
 	void SetAutomaticRiftingForTest(bool bEnable);
+	bool ForceLargestEligibleAutomaticRiftForTest(int32 ChildCount = 2, int32 Seed = 0);
 	void SetUseLinearConvergentMaintenanceSpeedFactorForTest(bool bEnableLinear);
 	void SetUseLinearConvergentMaintenanceInfluenceForTest(bool bEnableLinear);
 	void CaptureCopiedFrontierPreSolveState(

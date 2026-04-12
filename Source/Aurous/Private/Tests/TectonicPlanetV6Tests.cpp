@@ -73,6 +73,23 @@ namespace
 		return Config;
 	}
 
+	FTectonicPlanetV6LegacyHarnessConfig MakeLegacyRuntimeControlConfig(
+		const ETectonicPlanetV6PeriodicSolveMode SolveMode,
+		const int32 FixedIntervalSteps,
+		const int32 PropagationWaveCap = INDEX_NONE)
+	{
+		FTectonicPlanetV6LegacyHarnessConfig Config;
+		Config.bOverridePeriodicSolveMode = true;
+		Config.PeriodicSolveMode = SolveMode;
+		Config.FixedIntervalSteps = FixedIntervalSteps;
+		if (PropagationWaveCap != INDEX_NONE)
+		{
+			Config.bOverrideCopiedFrontierIntervalPropagationWaveCap = true;
+			Config.CopiedFrontierIntervalPropagationWaveCap = PropagationWaveCap;
+		}
+		return Config;
+	}
+
 	FTectonicPlanetV6LegacyHarnessConfig MakeLegacyPhase1ComparisonConfig(
 		const int32 ActiveBoundaryRingCount = 1,
 		const ETectonicPlanetV6ActiveZoneClassifierMode ClassifierMode =
@@ -376,11 +393,8 @@ namespace
 			RandomSeed,
 			TestBoundaryWarpAmplitude,
 			TestContinentalFraction);
-		Planet.SetPeriodicSolveModeForTest(SolveMode, FixedIntervalSteps);
-		if (PropagationWaveCap != INDEX_NONE)
-		{
-			Planet.SetCopiedFrontierIntervalPropagationWaveCapForTest(PropagationWaveCap);
-		}
+		Planet.ApplyLegacyHarnessConfigForTest(
+			MakeLegacyRuntimeControlConfig(SolveMode, FixedIntervalSteps, PropagationWaveCap));
 		return Planet;
 	}
 
@@ -11205,7 +11219,9 @@ bool FTectonicPlanetV6V9ForcedRiftValidationHarnessTest::RunTest(const FString& 
 
 	AdvanceBothToStep(ForcedRiftTriggerStep);
 	const bool bForcedRiftTriggered =
-		CandidatePlanet.ForceLargestEligibleAutomaticRiftForTest(ForcedRiftChildCount, ForcedRiftSeed);
+		CandidatePlanet.ExecuteLegacyHarnessForcedRiftForTest(
+			ForcedRiftChildCount,
+			ForcedRiftSeed);
 	const FTectonicPlanetV6RiftDiagnostic ForcedRiftDiagnostic = CandidatePlanet.ComputeRiftDiagnosticForTest();
 	const FString ForcedEventMessage = FString::Printf(
 		TEXT("[V9ForcedRiftHarness EVENT step=%d] forced_triggered=%d parent=%d children=(%d,%d) parent_present=%d parent_samples=%d child_samples_at_event=(%d,%d) child_samples_current=(%d,%d) parent_continental_fraction=%.4f trigger_probability=%.6f trigger_draw=%.6f post_rift_plate_count=%d ownership_applied_directly=%d remesh_ran=%d copied_frontier_rebuilt=%d plate_submesh_rebuilt=%d child_boundary_divergent=%d child_boundary_contact_edges=%d child_boundary_divergent_edges=%d child_boundary_convergent_edges=%d child_boundary_mean_rel_normal_velocity=%.4f child_boundary_max_abs_rel_normal_velocity=%.4f"),

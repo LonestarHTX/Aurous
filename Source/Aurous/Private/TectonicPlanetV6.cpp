@@ -21130,6 +21130,15 @@ void FTectonicPlanetV6::ApplyKeptV6DiagnosticsProfile(
 void FTectonicPlanetV6::ApplyLegacyHarnessConfigForTest(
 	const FTectonicPlanetV6LegacyHarnessConfig& Config)
 {
+	if (Config.bOverridePeriodicSolveMode)
+	{
+		SetPeriodicSolveModeForTest(Config.PeriodicSolveMode, Config.FixedIntervalSteps);
+	}
+	if (Config.bOverrideCopiedFrontierIntervalPropagationWaveCap)
+	{
+		SetCopiedFrontierIntervalPropagationWaveCapForTest(
+			Config.CopiedFrontierIntervalPropagationWaveCap);
+	}
 	SetSyntheticCoverageRetentionForTest(Config.bEnableSyntheticCoverageRetention);
 	SetWholeTriangleBoundaryDuplicationForTest(Config.bEnableWholeTriangleBoundaryDuplication);
 	SetExcludeMixedTrianglesForTest(Config.bEnableExcludeMixedTriangles);
@@ -21167,6 +21176,13 @@ void FTectonicPlanetV6::ApplyLegacyHarnessConfigForTest(
 		Config.bUseLinearConvergentMaintenanceSpeedFactor);
 	SetUseLinearConvergentMaintenanceInfluenceForTest(
 		Config.bUseLinearConvergentMaintenanceInfluence);
+}
+
+bool FTectonicPlanetV6::ExecuteLegacyHarnessForcedRiftForTest(
+	const int32 ChildCount,
+	const int32 Seed)
+{
+	return ForceLargestEligibleAutomaticRiftForTest(ChildCount, Seed);
 }
 
 void FTectonicPlanetV6::SetPeriodicSolveModeForTest(
