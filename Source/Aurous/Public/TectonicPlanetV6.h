@@ -49,6 +49,7 @@ enum class ETectonicPlanetV6ResolutionKind : uint8
 	ThesisRemeshMissAmbiguous,
 	ThesisRemeshRetainedSyntheticCoverage,
 	ThesisRemeshRetainedOutsideActiveZone,
+	ThesisRemeshInteriorAdvection,
 	ThesisRemeshTransferFallback,
 };
 
@@ -149,6 +150,7 @@ struct AUROUS_API FTectonicPlanetV6LegacyHarnessConfig
 	bool bEnableV9ThesisShapedCollisionExecution = false;
 	bool bEnableV9ThesisShapedCollisionRidgeSurge = false;
 	bool bEnableV9QuietInteriorContinentalRetention = false;
+	bool bEnableV9InteriorAdvection = false;
 	bool bEnableV9ContinentalBreadthPreservation = false;
 	bool bEnableV9PaperSurrogateOwnership = false;
 	ETectonicPlanetV6PaperSurrogateFieldMode V9PaperSurrogateFieldMode =
@@ -1402,6 +1404,7 @@ private:
 	void SetV9ThesisShapedCollisionExecutionForTest(bool bEnable);
 	void SetV9ThesisShapedCollisionRidgeSurgeForTest(bool bEnable);
 	void SetV9QuietInteriorContinentalRetentionForTest(bool bEnable);
+	void SetV9InteriorAdvectionForTest(bool bEnable);
 	void SetV9ContinentalBreadthPreservationForTest(bool bEnable);
 	void SetV9PaperSurrogateOwnershipForTest(bool bEnable);
 	void SetV9PaperSurrogateFieldModeForTest(ETectonicPlanetV6PaperSurrogateFieldMode InMode);
@@ -1539,6 +1542,7 @@ private:
 	bool bEnableV9ThesisShapedCollisionExecutionForTest = false;
 	bool bEnableV9ThesisShapedCollisionRidgeSurgeForTest = false;
 	bool bEnableV9QuietInteriorContinentalRetentionForTest = false;
+	bool bEnableV9InteriorAdvectionForTest = false;
 	bool bEnableV9ContinentalBreadthPreservationForTest = false;
 	bool bEnableV9PaperSurrogateOwnershipForTest = false;
 	bool bEnableV9SubmergedContinentalFringeRelaxationForTest = false;

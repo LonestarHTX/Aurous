@@ -16963,6 +16963,10 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 	TAtomic<int32> OverlapCoherenceSupportPrunedSampleCount(0);
 	TAtomic<int32> OverlapCoherencePreviousPlateStabilizedSampleCount(0);
 	TAtomic<int32> OverlapCoherenceSuppressedCandidateCount(0);
+	TAtomic<int32> InteriorAdvectionBroadQueryCount(0);
+	TAtomic<int32> InteriorAdvectionTransferCount(0);
+	TAtomic<int32> InteriorAdvectionAmbiguousRetainCount(0);
+	TAtomic<int32> InteriorAdvectionNoHitRetainCount(0);
 	TArray<int32> UnfilteredExactCandidateCounts;
 	TArray<int32> UnfilteredDestructiveCandidateCounts;
 	TArray<uint8> MultiHitTrackedCandidateFlags;
@@ -17078,7 +17082,7 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 
 	// Stage: resolve copied-frontier ownership decisions from hit search and recovery support.
 	const double ResolveTransferLoopStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
-	ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &QueryGeometries, &UnfilteredComparisonQueryGeometries, &QueryGeometryIndexByPlateId, &UnfilteredComparisonQueryGeometryIndexByPlateId, &DestructiveFilterState, &NewPlateIds, &UnfilteredExactCandidateCounts, &UnfilteredDestructiveCandidateCounts, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &HitSearchPlateCandidateCounts, &RecoveryCandidatePlateCandidateCounts, &RecoveryMissPlateCandidateCounts, &RecoveryMissSampleFlags, &HitSearchPrunedSampleFlags, &HitCount, &CopiedFrontierHitCount, &InteriorHitCount, &DestructiveTriangleRejectedCount, &HitSearchMicroseconds, &ZeroHitRecoveryMicroseconds, &DirectHitTransferMicroseconds, &FallbackTransferMicroseconds, &QuietInteriorPreservationMicroseconds, &RecoveryPreparationStageContext, &ZeroHitResolvedDecisionStageContext, &DirectHitResolvedDecisionStageContext, bApplyDestructiveFilter, bEnableV9Phase1Authority, bRecordPhaseTiming](const int32 SampleIndex)
+	ParallelFor(Planet.Samples.Num(), [this, &SolveCopiedFrontierMeshes, &QueryGeometries, &UnfilteredComparisonQueryGeometries, &QueryGeometryIndexByPlateId, &UnfilteredComparisonQueryGeometryIndexByPlateId, &DestructiveFilterState, &NewPlateIds, &UnfilteredExactCandidateCounts, &UnfilteredDestructiveCandidateCounts, &ConvergentActiveFieldContinuityFlags, &AdjacentToConvergentActiveFieldContinuityFlags, &HitSearchPlateCandidateCounts, &RecoveryCandidatePlateCandidateCounts, &RecoveryMissPlateCandidateCounts, &RecoveryMissSampleFlags, &HitSearchPrunedSampleFlags, &HitCount, &CopiedFrontierHitCount, &InteriorHitCount, &DestructiveTriangleRejectedCount, &InteriorAdvectionBroadQueryCount, &InteriorAdvectionTransferCount, &InteriorAdvectionAmbiguousRetainCount, &InteriorAdvectionNoHitRetainCount, &HitSearchMicroseconds, &ZeroHitRecoveryMicroseconds, &DirectHitTransferMicroseconds, &FallbackTransferMicroseconds, &QuietInteriorPreservationMicroseconds, &RecoveryPreparationStageContext, &ZeroHitResolvedDecisionStageContext, &DirectHitResolvedDecisionStageContext, bApplyDestructiveFilter, bEnableV9Phase1Authority, bRecordPhaseTiming](const int32 SampleIndex)
 	{
 			const FVector3d QueryPoint = Planet.Samples[SampleIndex].Position;
 			const int32 PreviousPlateId = Planet.Samples[SampleIndex].PlateId;
@@ -17239,6 +17243,64 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 				bOutsideZoneQueryMiss ? 1 : 0;
 			CurrentSolveOutsideActiveZoneCoverageDeficitFlags[SampleIndex] =
 				bOutsideZoneCoverageDeficit ? 1 : 0;
+
+			// Interior advection: when the previous owner's geometry no longer
+			// contains this sample, run a broad query against all plates. If
+			// exactly one plate unambiguously covers this position, transfer
+			// ownership to that plate. This restores paper-like continental drift
+			// for clearly interior samples while preserving guarded V9 behavior
+			// at boundaries and in ambiguous overlap regions.
+			if (bEnableV9InteriorAdvectionForTest && bOutsideZoneQueryMiss)
+			{
+				TArray<FV6ThesisRemeshRayHit> BroadHitCandidates;
+				CollectThesisRemeshRayHitCandidates(
+					QueryGeometries,
+					static_cast<const TArray<int32, TInlineAllocator<4>>*>(nullptr),
+					QueryPoint,
+					BroadHitCandidates);
+				++InteriorAdvectionBroadQueryCount;
+
+				if (BroadHitCandidates.Num() == 1)
+				{
+					const FV6ThesisRemeshRayHit& WinningHit = BroadHitCandidates[0];
+					Resolved.FinalPlateId = WinningHit.PlateId;
+					Resolved.PreCoherencePlateId = WinningHit.PlateId;
+					Resolved.ResolutionKind =
+						ETectonicPlanetV6ResolutionKind::ThesisRemeshInteriorAdvection;
+					Resolved.bOutsideActiveZoneQueryMiss = false;
+					Resolved.bOutsideActiveZoneCoverageDeficit = false;
+					Resolved.bAuthorityRetainedOutsideActiveZone = false;
+					Resolved.SourceCanonicalSampleIndex = SampleIndex;
+					Resolved.ExactCandidateCount = 1;
+					Resolved.SourceLocalTriangleIndex = WinningHit.LocalTriangleIndex;
+					Resolved.SourceTriangleIndex = WinningHit.GlobalTriangleIndex;
+					Resolved.SourceBarycentric = WinningHit.Barycentric;
+					Resolved.WinningFitScore = WinningHit.FitScore;
+					++HitCount;
+					++InteriorAdvectionTransferCount;
+					if (WinningHit.bCopiedFrontierTriangle)
+					{
+						++CopiedFrontierHitCount;
+					}
+					else
+					{
+						++InteriorHitCount;
+					}
+
+					LastResolvedSamples[SampleIndex] = Resolved;
+					NewPlateIds[SampleIndex] = Resolved.FinalPlateId;
+					return;
+				}
+				else if (BroadHitCandidates.Num() > 1)
+				{
+					++InteriorAdvectionAmbiguousRetainCount;
+				}
+				else
+				{
+					++InteriorAdvectionNoHitRetainCount;
+				}
+				// Fall through to normal retain logic below.
+			}
 
 			Resolved.FinalPlateId = PreviousPlateId;
 			Resolved.PreCoherencePlateId = PreviousPlateId;
@@ -17838,6 +17900,16 @@ void FTectonicPlanetV6::PerformThesisCopiedFrontierSpikeSolve(const ETectonicPla
 		&PaperSurrogateQuietInteriorDirectHitPostTransferThicknessScaledSum,
 		&PaperSurrogateQuietInteriorDirectHitFinalThicknessScaledSum};
 	LastSolveStats = BuildCopiedFrontierFinalSolveStats(FinalStatsPackingStageContext);
+	if (bEnableV9InteriorAdvectionForTest)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[V9InteriorAdvection step=%d] broad_queries=%d transferred=%d ambiguous_retain=%d no_hit_retain=%d"),
+			Planet.CurrentStep,
+			InteriorAdvectionBroadQueryCount.Load(),
+			InteriorAdvectionTransferCount.Load(),
+			InteriorAdvectionAmbiguousRetainCount.Load(),
+			InteriorAdvectionNoHitRetainCount.Load());
+	}
 	if (bEnableV9CollisionShadowForTest && bEnableV9Phase1Authority)
 	{
 		const double CollisionShadowStartTime = bRecordPhaseTiming ? GetPhaseTimingSeconds() : 0.0;
@@ -21102,6 +21174,7 @@ void FTectonicPlanetV6::ApplyKeptV6RuntimeProfile(
 	SetV9CollisionExecutionRefinedStructuralTransferForTest(true);
 	SetV9ThesisShapedCollisionExecutionForTest(true);
 	SetV9QuietInteriorContinentalRetentionForTest(true);
+	SetV9InteriorAdvectionForTest(true);
 	SetV9ContinentalBreadthPreservationForTest(false);
 	SetV9PaperSurrogateOwnershipForTest(true);
 	SetV9PaperSurrogateFieldModeForTest(
@@ -21160,6 +21233,7 @@ void FTectonicPlanetV6::ApplyLegacyHarnessConfigForTest(
 	SetV9ThesisShapedCollisionRidgeSurgeForTest(Config.bEnableV9ThesisShapedCollisionRidgeSurge);
 	SetV9QuietInteriorContinentalRetentionForTest(
 		Config.bEnableV9QuietInteriorContinentalRetention);
+	SetV9InteriorAdvectionForTest(Config.bEnableV9InteriorAdvection);
 	SetV9ContinentalBreadthPreservationForTest(
 		Config.bEnableV9ContinentalBreadthPreservation);
 	SetV9PaperSurrogateOwnershipForTest(Config.bEnableV9PaperSurrogateOwnership);
@@ -21535,6 +21609,11 @@ void FTectonicPlanetV6::SetV9ThesisShapedCollisionRidgeSurgeForTest(const bool b
 void FTectonicPlanetV6::SetV9QuietInteriorContinentalRetentionForTest(const bool bEnable)
 {
 	bEnableV9QuietInteriorContinentalRetentionForTest = bEnable;
+}
+
+void FTectonicPlanetV6::SetV9InteriorAdvectionForTest(const bool bEnable)
+{
+	bEnableV9InteriorAdvectionForTest = bEnable;
 }
 
 void FTectonicPlanetV6::SetV9ContinentalBreadthPreservationForTest(const bool bEnable)
