@@ -27,6 +27,7 @@ public:
 	float GetConfiguredContinentalFraction() const { return ContinentalFraction; }
 	int32 GetConfiguredExportWidth() const { return ExportWidth; }
 	ETectonicMapExportMode GetVisualizationMode() const { return VisualizationMode; }
+	ETectonicElevationPresentationMode GetElevationPresentationMode() const { return ElevationPresentationMode; }
 	double GetLastAdvanceStepMs() const { return LastAdvanceStepMs; }
 	double GetContinentalAreaFraction() const { return ContinentalAreaFraction; }
 	int32 GetPeriodicSolveCountValue() const { return PeriodicSolveCount; }
@@ -34,7 +35,6 @@ public:
 	int32 GetCumulativeRiftCountValue() const { return CumulativeRiftCount; }
 	bool GetShowPlateVelocities() const { return bShowPlateVelocities; }
 	bool GetShowPlateBoundaries() const { return bShowPlateBoundaries; }
-	bool GetShowBoundaryTypes() const { return false; }
 	FString GetActiveRuntimePresetLabel() const { return TEXT("V6KeptCandidate"); }
 	FString GetRuntimeConfigSummary() const;
 
@@ -43,7 +43,6 @@ public:
 	void BuildMeshWithMode(ETectonicMapExportMode Mode);
 	void SetShowPlateVelocities(bool bShow);
 	void SetShowPlateBoundaries(bool bShow);
-	void SetShowBoundaryTypes(bool bShow);
 	bool ExportCurrentMaps(ETectonicMapExportMode Mode, int32 Width, int32 Height, FString& OutDirectory, FString& OutError) const;
 
 	// Editor-callable controls (via details panel CallInEditor buttons)
@@ -65,6 +64,12 @@ public:
 	// Visualization mode switching
 	UFUNCTION(CallInEditor, Category = "V6 Preview|Visualization")
 	void ShowElevation();
+
+	UFUNCTION(CallInEditor, Category = "V6 Preview|Visualization")
+	void ShowElevationRaw();
+
+	UFUNCTION(CallInEditor, Category = "V6 Preview|Visualization")
+	void ShowElevationEnhanced();
 
 	UFUNCTION(CallInEditor, Category = "V6 Preview|Visualization")
 	void ShowPlateId();
@@ -111,6 +116,12 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "V6 Preview|Rendering")
 	bool bDisplaceByElevation = false;
 
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "V6 Preview|Rendering")
+	ETectonicElevationPresentationMode ElevationPresentationMode = ETectonicElevationPresentationMode::Raw;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "V6 Preview|Rendering", meta = (EditCondition = "bDisplaceByElevation"))
+	bool bUseEnhancedElevationForDisplacement = true;
+
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "V6 Preview|Rendering", meta = (ClampMin = "0.0", EditCondition = "bDisplaceByElevation"))
 	double ElevationDisplacementScale = 5.0;
 
@@ -150,14 +161,13 @@ protected:
 	int32 CumulativeRiftCount = 0;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "V6 Preview|Status")
-	FString SimulationPath = TEXT("V6/v9 Kept Candidate");
+	FString SimulationPath = TEXT("V6/v9 Kept Selective-Elevation Hybrid + Shoulder Fix");
 
 private:
 	void AdvanceSteps(int32 StepCount);
 	void BuildMesh();
 	void UpdateStatusReadout();
 	void RefreshDebugOverlays();
-	void ConfigureKeptCandidateDefaults();
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "V6 Preview", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<URealtimeMeshComponent> MeshComponent = nullptr;

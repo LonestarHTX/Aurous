@@ -3439,6 +3439,12 @@ namespace
 		Test.TestTrue(
 			*FString::Printf(TEXT("Step %d elevation export exists"), Step),
 			PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("Elevation.png"))));
+		if (Mode == ETectonicMapExportMode::All || Mode == ETectonicMapExportMode::Elevation)
+		{
+			Test.TestTrue(
+				*FString::Printf(TEXT("Step %d enhanced elevation export exists"), Step),
+				PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("ElevationEnhanced.png"))));
+		}
 		Test.TestTrue(
 			*FString::Printf(TEXT("Step %d plate export exists"), Step),
 			PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("PlateId.png"))));
@@ -3507,6 +3513,12 @@ namespace
 		Test.TestTrue(
 			*FString::Printf(TEXT("%s elevation export exists"), *Label),
 			PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("Elevation.png"))));
+		if (Mode == ETectonicMapExportMode::All || Mode == ETectonicMapExportMode::Elevation)
+		{
+			Test.TestTrue(
+				*FString::Printf(TEXT("%s enhanced elevation export exists"), *Label),
+				PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("ElevationEnhanced.png"))));
+		}
 		Test.TestTrue(
 			*FString::Printf(TEXT("%s plate export exists"), *Label),
 			PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("PlateId.png"))));
@@ -8667,6 +8679,7 @@ bool FTectonicPlanetMollweideExportTest::RunTest(const FString& Parameters)
 
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 	TestTrue(TEXT("Elevation export exists"), PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("Elevation.png"))));
+	TestTrue(TEXT("Enhanced elevation export exists"), PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("ElevationEnhanced.png"))));
 	TestTrue(TEXT("PlateId export exists"), PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("PlateId.png"))));
 	TestTrue(TEXT("CrustType export exists"), PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("CrustType.png"))));
 	TestTrue(TEXT("ContinentalWeight export exists"), PlatformFile.FileExists(*FPaths::Combine(OutputDirectory, TEXT("ContinentalWeight.png"))));

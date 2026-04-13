@@ -19,45 +19,117 @@ namespace
 			LerpByte(A.B, B.B, ClampedAlpha),
 			255);
 	}
+
+	FColor GetRawElevationColor(const double ElevationKm)
+	{
+		const FColor DeepOcean(7, 36, 97);
+		const FColor MidOcean(36, 102, 170);
+		const FColor ShallowOcean(108, 179, 214);
+		const FColor CoastalGreen(76, 134, 68);
+		const FColor HighlandTan(171, 145, 86);
+		const FColor MountainBrown(123, 90, 60);
+		const FColor Snow(245, 245, 245);
+
+		if (ElevationKm <= -6.0)
+		{
+			return DeepOcean;
+		}
+
+		if (ElevationKm < -1.0)
+		{
+			return LerpColor(DeepOcean, MidOcean, (ElevationKm + 6.0) / 5.0);
+		}
+
+		if (ElevationKm < 0.0)
+		{
+			return LerpColor(MidOcean, ShallowOcean, ElevationKm + 1.0);
+		}
+
+		if (ElevationKm < 2.0)
+		{
+			return LerpColor(CoastalGreen, HighlandTan, ElevationKm / 2.0);
+		}
+
+		if (ElevationKm < 5.0)
+		{
+			return LerpColor(HighlandTan, MountainBrown, (ElevationKm - 2.0) / 3.0);
+		}
+
+		const double SnowAlpha = FMath::Clamp((ElevationKm - 5.0) / 3.0, 0.0, 1.0);
+		return LerpColor(MountainBrown, Snow, SnowAlpha);
+	}
+
+	FColor GetEnhancedElevationColor(const double ElevationKm)
+	{
+		const FColor DeepOcean(9, 34, 90);
+		const FColor MidOcean(32, 94, 160);
+		const FColor ShallowOcean(95, 168, 209);
+		const FColor CoastalPlain(92, 146, 82);
+		const FColor ElevatedPlain(126, 165, 102);
+		const FColor UplandPlain(162, 177, 120);
+		const FColor Plateau(188, 175, 124);
+		const FColor Highland(153, 127, 91);
+		const FColor MountainBrown(121, 91, 68);
+		const FColor Snow(245, 245, 245);
+
+		if (ElevationKm <= -6.0)
+		{
+			return DeepOcean;
+		}
+
+		if (ElevationKm < -1.0)
+		{
+			return LerpColor(DeepOcean, MidOcean, (ElevationKm + 6.0) / 5.0);
+		}
+
+		if (ElevationKm < 0.0)
+		{
+			return LerpColor(MidOcean, ShallowOcean, ElevationKm + 1.0);
+		}
+
+		if (ElevationKm < 0.5)
+		{
+			return LerpColor(CoastalPlain, ElevatedPlain, ElevationKm / 0.5);
+		}
+
+		if (ElevationKm < 1.0)
+		{
+			return LerpColor(ElevatedPlain, UplandPlain, (ElevationKm - 0.5) / 0.5);
+		}
+
+		if (ElevationKm < 2.0)
+		{
+			return LerpColor(UplandPlain, Plateau, (ElevationKm - 1.0) / 1.0);
+		}
+
+		if (ElevationKm < 4.0)
+		{
+			return LerpColor(Plateau, Highland, (ElevationKm - 2.0) / 2.0);
+		}
+
+		if (ElevationKm < 6.5)
+		{
+			return LerpColor(Highland, MountainBrown, (ElevationKm - 4.0) / 2.5);
+		}
+
+		const double SnowAlpha = FMath::Clamp((ElevationKm - 6.5) / 2.0, 0.0, 1.0);
+		return LerpColor(MountainBrown, Snow, SnowAlpha);
+	}
 }
 
-FColor TectonicPlanetVisualization::GetElevationColor(const double ElevationKm)
+FColor TectonicPlanetVisualization::GetElevationColor(
+	const double ElevationKm,
+	const ETectonicElevationPresentationMode PresentationMode)
 {
-	const FColor DeepOcean(7, 36, 97);
-	const FColor MidOcean(36, 102, 170);
-	const FColor ShallowOcean(108, 179, 214);
-	const FColor CoastalGreen(76, 134, 68);
-	const FColor HighlandTan(171, 145, 86);
-	const FColor MountainBrown(123, 90, 60);
-	const FColor Snow(245, 245, 245);
-
-	if (ElevationKm <= -6.0)
+	switch (PresentationMode)
 	{
-		return DeepOcean;
-	}
+	case ETectonicElevationPresentationMode::Enhanced:
+		return GetEnhancedElevationColor(ElevationKm);
 
-	if (ElevationKm < -1.0)
-	{
-		return LerpColor(DeepOcean, MidOcean, (ElevationKm + 6.0) / 5.0);
+	case ETectonicElevationPresentationMode::Raw:
+	default:
+		return GetRawElevationColor(ElevationKm);
 	}
-
-	if (ElevationKm < 0.0)
-	{
-		return LerpColor(MidOcean, ShallowOcean, ElevationKm + 1.0);
-	}
-
-	if (ElevationKm < 2.0)
-	{
-		return LerpColor(CoastalGreen, HighlandTan, ElevationKm / 2.0);
-	}
-
-	if (ElevationKm < 5.0)
-	{
-		return LerpColor(HighlandTan, MountainBrown, (ElevationKm - 2.0) / 3.0);
-	}
-
-	const double SnowAlpha = FMath::Clamp((ElevationKm - 5.0) / 3.0, 0.0, 1.0);
-	return LerpColor(MountainBrown, Snow, SnowAlpha);
 }
 
 FColor TectonicPlanetVisualization::GetPlateColor(const int32 PlateId)
@@ -131,6 +203,8 @@ const TCHAR* TectonicPlanetVisualization::GetExportModeName(const ETectonicMapEx
 		return TEXT("GapMask");
 	case ETectonicMapExportMode::OverlapMask:
 		return TEXT("OverlapMask");
+	case ETectonicMapExportMode::CombinedTectonicSummary:
+		return TEXT("CombinedTectonicSummary");
 	case ETectonicMapExportMode::All:
 	default:
 		return TEXT("All");

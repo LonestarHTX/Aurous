@@ -14,12 +14,22 @@ enum class ETectonicMapExportMode : uint8
 	BoundaryMask UMETA(DisplayName = "Boundary Mask"),
 	GapMask UMETA(DisplayName = "Gap Mask"),
 	OverlapMask UMETA(DisplayName = "Overlap Mask"),
+	CombinedTectonicSummary UMETA(DisplayName = "Combined Tectonic Summary"),
 	All UMETA(DisplayName = "All")
+};
+
+UENUM(BlueprintType)
+enum class ETectonicElevationPresentationMode : uint8
+{
+	Raw UMETA(DisplayName = "Raw"),
+	Enhanced UMETA(DisplayName = "Enhanced")
 };
 
 namespace TectonicPlanetVisualization
 {
-	AUROUS_API FColor GetElevationColor(double ElevationKm);
+	AUROUS_API FColor GetElevationColor(
+		double ElevationKm,
+		ETectonicElevationPresentationMode PresentationMode = ETectonicElevationPresentationMode::Raw);
 	AUROUS_API FColor GetPlateColor(int32 PlateId);
 	AUROUS_API FColor GetCrustTypeColor(float ContinentalWeight);
 	AUROUS_API FColor GetContinentalWeightColor(float ContinentalWeight);

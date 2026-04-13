@@ -18,6 +18,7 @@ namespace
 	constexpr double MollweideHalfWidth = 2.0 * MollweideSqrtTwo;
 	constexpr double MollweideHalfHeight = MollweideSqrtTwo;
 	constexpr double RasterEpsilon = 1.0e-8;
+	constexpr int32 EnhancedOceanDisplaySmoothingPasses = 2;
 
 	struct FProjectedSample
 	{
@@ -37,6 +38,17 @@ namespace
 	bool ShouldExportMode(const ETectonicMapExportMode RequestedMode, const ETectonicMapExportMode CandidateMode)
 	{
 		return RequestedMode == ETectonicMapExportMode::All || RequestedMode == CandidateMode;
+	}
+
+	bool ShouldSmoothOceanDisplayPixel(const FRasterBuffers& Buffers, const int32 PixelIndex)
+	{
+		return Buffers.ContinentalWeight[PixelIndex] < 0.5f && Buffers.Elevation[PixelIndex] <= 0.0f;
+	}
+
+	float ComputeOceanDisplayBlendAlpha(const float RawElevationKm)
+	{
+		const float DepthKm = FMath::Max(-RawElevationKm, 0.0f);
+		return FMath::Clamp(0.35f + 0.10f * DepthKm, 0.35f, 0.80f);
 	}
 
 	double SolveMollweideTheta(const double Latitude)
@@ -462,6 +474,367 @@ namespace
 			}
 		}
 	}
+
+	void BuildEnhancedDisplayElevationBuffer(
+		const FRasterBuffers& Buffers,
+		const FTectonicMollweideExportOptions& Options,
+		TArray<float>& OutEnhancedElevation)
+	{
+		OutEnhancedElevation = Buffers.Elevation;
+		if (OutEnhancedElevation.IsEmpty())
+		{
+			return;
+		}
+
+		TArray<float> PreviousElevation = OutEnhancedElevation;
+		for (int32 PassIndex = 0; PassIndex < EnhancedOceanDisplaySmoothingPasses; ++PassIndex)
+		{
+			for (int32 PixelY = 0; PixelY < Options.Height; ++PixelY)
+			{
+				for (int32 PixelX = 0; PixelX < Options.Width; ++PixelX)
+				{
+					const int32 PixelIndex = PixelY * Options.Width + PixelX;
+					if (Buffers.Coverage[PixelIndex] == 0 ||
+						!IsInsideMollweideEllipse(PixelX, PixelY, Options.Width, Options.Height) ||
+						!ShouldSmoothOceanDisplayPixel(Buffers, PixelIndex))
+					{
+						OutEnhancedElevation[PixelIndex] = Buffers.Elevation[PixelIndex];
+						continue;
+					}
+
+					float WeightedSum = PreviousElevation[PixelIndex] * 4.0f;
+					float WeightSum = 4.0f;
+					for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY)
+					{
+						const int32 NeighborY = PixelY + OffsetY;
+						if (NeighborY < 0 || NeighborY >= Options.Height)
+						{
+							continue;
+						}
+
+						for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX)
+						{
+							if (OffsetX == 0 && OffsetY == 0)
+							{
+								continue;
+							}
+
+							const int32 NeighborX = WrapPixelX(PixelX + OffsetX, Options.Width);
+							const int32 NeighborIndex = NeighborY * Options.Width + NeighborX;
+							if (Buffers.Coverage[NeighborIndex] == 0 ||
+								!ShouldSmoothOceanDisplayPixel(Buffers, NeighborIndex))
+							{
+								continue;
+							}
+
+							const float NeighborWeight = (OffsetX == 0 || OffsetY == 0) ? 2.0f : 1.0f;
+							WeightedSum += PreviousElevation[NeighborIndex] * NeighborWeight;
+							WeightSum += NeighborWeight;
+						}
+					}
+
+					const float SmoothedElevation = WeightSum > UE_SMALL_NUMBER
+						? WeightedSum / WeightSum
+						: PreviousElevation[PixelIndex];
+					const float BlendAlpha = ComputeOceanDisplayBlendAlpha(Buffers.Elevation[PixelIndex]);
+					OutEnhancedElevation[PixelIndex] =
+						FMath::Lerp(PreviousElevation[PixelIndex], SmoothedElevation, BlendAlpha);
+				}
+			}
+
+			PreviousElevation = OutEnhancedElevation;
+		}
+	}
+
+	void BuildEnhancedElevationImage(
+		const FRasterBuffers& Buffers,
+		const FTectonicMollweideExportOptions& Options,
+		TArray<FColor>& OutPixels)
+	{
+		TArray<float> EnhancedElevation;
+		BuildEnhancedDisplayElevationBuffer(Buffers, Options, EnhancedElevation);
+
+		const int32 PixelCount = Options.Width * Options.Height;
+		OutPixels.SetNum(PixelCount);
+		for (int32 PixelIndex = 0; PixelIndex < PixelCount; ++PixelIndex)
+		{
+			const int32 PixelX = PixelIndex % Options.Width;
+			const int32 PixelY = PixelIndex / Options.Width;
+			if (Buffers.Coverage[PixelIndex] == 0 || !IsInsideMollweideEllipse(PixelX, PixelY, Options.Width, Options.Height))
+			{
+				OutPixels[PixelIndex] = FColor::Black;
+				continue;
+			}
+
+			OutPixels[PixelIndex] = TectonicPlanetVisualization::GetElevationColor(
+				EnhancedElevation[PixelIndex],
+				ETectonicElevationPresentationMode::Enhanced);
+		}
+	}
+
+	void DrawLineOnImage(TArray<FColor>& Pixels, const int32 Width, const int32 Height,
+		int32 X0, int32 Y0, int32 X1, int32 Y1, const FColor& Color, const int32 Thickness)
+	{
+		const int32 DeltaX = FMath::Abs(X1 - X0);
+		const int32 DeltaY = FMath::Abs(Y1 - Y0);
+		const int32 StepX = (X0 < X1) ? 1 : -1;
+		const int32 StepY = (Y0 < Y1) ? 1 : -1;
+		int32 Error = DeltaX - DeltaY;
+
+		const int32 HalfThick = Thickness / 2;
+		auto PlotThick = [&](int32 CenterX, int32 CenterY)
+		{
+			for (int32 OffsetY = -HalfThick; OffsetY <= HalfThick; ++OffsetY)
+			{
+				for (int32 OffsetX = -HalfThick; OffsetX <= HalfThick; ++OffsetX)
+				{
+					const int32 PlotX = CenterX + OffsetX;
+					const int32 PlotY = CenterY + OffsetY;
+					if (PlotX >= 0 && PlotX < Width && PlotY >= 0 && PlotY < Height)
+					{
+						Pixels[PlotY * Width + PlotX] = Color;
+					}
+				}
+			}
+		};
+
+		for (;;)
+		{
+			PlotThick(X0, Y0);
+			if (X0 == X1 && Y0 == Y1)
+			{
+				break;
+			}
+
+			const int32 Error2 = 2 * Error;
+			if (Error2 > -DeltaY)
+			{
+				Error -= DeltaY;
+				X0 += StepX;
+			}
+			if (Error2 < DeltaX)
+			{
+				Error += DeltaX;
+				Y0 += StepY;
+			}
+		}
+	}
+
+	void DrawArrowhead(TArray<FColor>& Pixels, const int32 Width, const int32 Height,
+		const FVector2d& Tip, const FVector2d& From, const FColor& Color, const double HeadLength)
+	{
+		FVector2d Direction = Tip - From;
+		const double Length = Direction.Length();
+		if (Length < 1.0)
+		{
+			return;
+		}
+		Direction /= Length;
+		const FVector2d Perp(-Direction.Y, Direction.X);
+		const FVector2d Base = Tip - Direction * HeadLength;
+		const FVector2d Left = Base + Perp * HeadLength * 0.5;
+		const FVector2d Right = Base - Perp * HeadLength * 0.5;
+
+		DrawLineOnImage(Pixels, Width, Height,
+			FMath::RoundToInt(Tip.X), FMath::RoundToInt(Tip.Y),
+			FMath::RoundToInt(Left.X), FMath::RoundToInt(Left.Y),
+			Color, 2);
+		DrawLineOnImage(Pixels, Width, Height,
+			FMath::RoundToInt(Tip.X), FMath::RoundToInt(Tip.Y),
+			FMath::RoundToInt(Right.X), FMath::RoundToInt(Right.Y),
+			Color, 2);
+	}
+
+	struct FCombinedMapArrowStats
+	{
+		int32 ArrowsDrawn = 0;
+		int32 ArrowsSkippedNearZero = 0;
+		int32 ArrowsSkippedOffEllipse = 0;
+		int32 ArrowsSkippedSeamOrTooLong = 0;
+		double SpeedSum = 0.0;
+		double MaxSpeed = 0.0;
+	};
+
+	void BuildCombinedTectonicSummaryImage(
+		const FTectonicPlanet& Planet,
+		const FRasterBuffers& Buffers,
+		const FTectonicMollweideExportOptions& Options,
+		TArray<FColor>& OutPixels,
+		FCombinedMapArrowStats& OutArrowStats)
+	{
+		OutArrowStats = FCombinedMapArrowStats{};
+
+		// Layer 1: Enhanced elevation base
+		TArray<float> EnhancedElevation;
+		BuildEnhancedDisplayElevationBuffer(Buffers, Options, EnhancedElevation);
+
+		const int32 PixelCount = Options.Width * Options.Height;
+		OutPixels.SetNum(PixelCount);
+		for (int32 PixelIndex = 0; PixelIndex < PixelCount; ++PixelIndex)
+		{
+			const int32 PixelX = PixelIndex % Options.Width;
+			const int32 PixelY = PixelIndex / Options.Width;
+			if (Buffers.Coverage[PixelIndex] == 0 || !IsInsideMollweideEllipse(PixelX, PixelY, Options.Width, Options.Height))
+			{
+				OutPixels[PixelIndex] = FColor::Black;
+				continue;
+			}
+
+			OutPixels[PixelIndex] = TectonicPlanetVisualization::GetElevationColor(
+				EnhancedElevation[PixelIndex],
+				ETectonicElevationPresentationMode::Enhanced);
+		}
+
+		// Layer 2: Semi-transparent white boundary overlay
+		constexpr double BoundaryBlendAlpha = 0.45;
+		const FColor BoundaryOverlayColor(255, 255, 255);
+		for (int32 PixelIndex = 0; PixelIndex < PixelCount; ++PixelIndex)
+		{
+			if (Buffers.Coverage[PixelIndex] == 0 || Buffers.BoundaryMask[PixelIndex] == 0)
+			{
+				continue;
+			}
+			const FColor& Base = OutPixels[PixelIndex];
+			OutPixels[PixelIndex] = FColor(
+				static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(static_cast<double>(Base.R), 255.0, BoundaryBlendAlpha)), 0, 255)),
+				static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(static_cast<double>(Base.G), 255.0, BoundaryBlendAlpha)), 0, 255)),
+				static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(static_cast<double>(Base.B), 255.0, BoundaryBlendAlpha)), 0, 255)),
+				255);
+		}
+
+		// Layer 3: Velocity arrows from plate rotation data
+		if (Planet.Plates.IsEmpty() || Planet.Samples.IsEmpty())
+		{
+			return;
+		}
+
+		// Display time horizon scaled to image width so typical plate speeds (~10 km/My) produce ~30px arrows
+		constexpr double DisplayTimeMy = 30.0;
+		constexpr double NearZeroSpeedThreshold = 0.5; // km/My
+		constexpr double ArrowGridSpacingDeg = 18.0;
+		constexpr double MaxProjectedArrowLengthPx = 200.0;
+		constexpr double SeamProximityFraction = 0.05;
+		const FColor ArrowColor(220, 40, 40);
+		const int32 ArrowShaftThickness = FMath::Max(Options.Width / 1500, 2);
+		const double ArrowHeadLength = FMath::Max(static_cast<double>(Options.Width) / 300.0, 6.0);
+
+		// Build a lookup: for each sample, which plate index owns it?
+		TMap<int32, int32> PlateIdToArrayIndex;
+		for (int32 PlateArrayIndex = 0; PlateArrayIndex < Planet.Plates.Num(); ++PlateArrayIndex)
+		{
+			PlateIdToArrayIndex.Add(Planet.Plates[PlateArrayIndex].Id, PlateArrayIndex);
+		}
+
+		// Place arrows on a regular lat/lon grid
+		for (double LatDeg = -80.0; LatDeg <= 80.0; LatDeg += ArrowGridSpacingDeg)
+		{
+			for (double LonDeg = -180.0; LonDeg < 180.0; LonDeg += ArrowGridSpacingDeg)
+			{
+				const double LatRad = FMath::DegreesToRadians(LatDeg);
+				const double LonRad = FMath::DegreesToRadians(LonDeg);
+				const FVector3d Origin(
+					FMath::Cos(LatRad) * FMath::Cos(LonRad),
+					FMath::Cos(LatRad) * FMath::Sin(LonRad),
+					FMath::Sin(LatRad));
+
+				// Find nearest sample to determine plate ownership
+				int32 NearestSampleIndex = INDEX_NONE;
+				double BestDot = -2.0;
+				for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+				{
+					const double Dot = FVector3d::DotProduct(Origin, Planet.Samples[SampleIndex].Position);
+					if (Dot > BestDot)
+					{
+						BestDot = Dot;
+						NearestSampleIndex = SampleIndex;
+					}
+				}
+				if (NearestSampleIndex == INDEX_NONE)
+				{
+					continue;
+				}
+
+				const int32 OwnerPlateId = Planet.Samples[NearestSampleIndex].PlateId;
+				const int32* PlateArrayIndexPtr = PlateIdToArrayIndex.Find(OwnerPlateId);
+				if (!PlateArrayIndexPtr)
+				{
+					continue;
+				}
+
+				const FPlate& Plate = Planet.Plates[*PlateArrayIndexPtr];
+				const FVector3d Axis = Plate.RotationAxis.GetSafeNormal();
+				const FVector3d OriginNorm = Origin.GetSafeNormal();
+				const FVector3d Tangent = FVector3d::CrossProduct(Axis, OriginNorm);
+				const double TangentLength = Tangent.Size();
+
+				if (TangentLength < 1.0e-6)
+				{
+					++OutArrowStats.ArrowsSkippedNearZero;
+					continue;
+				}
+
+				const double SpeedKmPerMy = TangentLength * Plate.AngularSpeed * Planet.PlanetRadiusKm;
+
+				if (SpeedKmPerMy < NearZeroSpeedThreshold)
+				{
+					++OutArrowStats.ArrowsSkippedNearZero;
+					continue;
+				}
+
+				// Tangent-on-sphere tip construction
+				const FVector3d TangentDir = Tangent.GetSafeNormal();
+				const double DisplacementRad = (SpeedKmPerMy * DisplayTimeMy) / Planet.PlanetRadiusKm;
+				const FVector3d TipPosition = (OriginNorm + TangentDir * DisplacementRad).GetSafeNormal();
+
+				// Project origin and tip through Mollweide
+				const FVector2d OriginPixel = ProjectMollweidePixel(OriginNorm, Options.Width, Options.Height);
+				const FVector2d TipPixel = ProjectMollweidePixel(TipPosition, Options.Width, Options.Height);
+
+				// Check ellipse containment for both endpoints
+				const int32 OriginPx = FMath::RoundToInt(OriginPixel.X);
+				const int32 OriginPy = FMath::RoundToInt(OriginPixel.Y);
+				const int32 TipPx = FMath::RoundToInt(TipPixel.X);
+				const int32 TipPy = FMath::RoundToInt(TipPixel.Y);
+
+				if (!IsInsideMollweideEllipse(OriginPx, OriginPy, Options.Width, Options.Height) ||
+					!IsInsideMollweideEllipse(TipPx, TipPy, Options.Width, Options.Height))
+				{
+					++OutArrowStats.ArrowsSkippedOffEllipse;
+					continue;
+				}
+
+				// Check for seam crossing or unreasonably long projected arrows
+				const double ProjectedLength = (TipPixel - OriginPixel).Size();
+				const double SeamThreshold = Options.Width * SeamProximityFraction;
+				const bool bCrossesSeam = FMath::Abs(TipPixel.X - OriginPixel.X) > Options.Width * 0.4;
+
+				if (bCrossesSeam || ProjectedLength > MaxProjectedArrowLengthPx)
+				{
+					++OutArrowStats.ArrowsSkippedSeamOrTooLong;
+					continue;
+				}
+
+				if (ProjectedLength < 2.0)
+				{
+					++OutArrowStats.ArrowsSkippedNearZero;
+					continue;
+				}
+
+				// Draw shaft
+				DrawLineOnImage(OutPixels, Options.Width, Options.Height,
+					OriginPx, OriginPy, TipPx, TipPy,
+					ArrowColor, ArrowShaftThickness);
+
+				// Draw arrowhead
+				DrawArrowhead(OutPixels, Options.Width, Options.Height,
+					TipPixel, OriginPixel, ArrowColor, ArrowHeadLength);
+
+				++OutArrowStats.ArrowsDrawn;
+				OutArrowStats.SpeedSum += SpeedKmPerMy;
+				OutArrowStats.MaxSpeed = FMath::Max(OutArrowStats.MaxSpeed, SpeedKmPerMy);
+			}
+		}
+	}
 }
 
 bool TectonicMollweideExporter::ExportPlanet(
@@ -558,6 +931,56 @@ bool TectonicMollweideExporter::ExportPlanet(
 		}
 
 		OutStats.WrittenFiles.Add(OutputPath);
+
+		if (Mode == ETectonicMapExportMode::Elevation)
+		{
+			BuildEnhancedElevationImage(Buffers, Options, ImagePixels);
+			const FString EnhancedOutputPath = FPaths::Combine(
+				Options.OutputDirectory,
+				TEXT("ElevationEnhanced.png"));
+
+			FString EnhancedWriteError;
+			if (!WritePng(EnhancedOutputPath, ImagePixels, Options.Width, Options.Height, EnhancedWriteError))
+			{
+				OutError = EnhancedWriteError;
+				return false;
+			}
+
+			OutStats.WrittenFiles.Add(EnhancedOutputPath);
+		}
+	}
+
+	// Combined Tectonic Summary: special-cased because it needs the full Planet for velocity arrows
+	if (ShouldExportMode(Options.Mode, ETectonicMapExportMode::CombinedTectonicSummary))
+	{
+		FCombinedMapArrowStats ArrowStats;
+		BuildCombinedTectonicSummaryImage(Planet, Buffers, Options, ImagePixels, ArrowStats);
+
+		const FString CombinedOutputPath = FPaths::Combine(
+			Options.OutputDirectory,
+			TEXT("CombinedTectonicSummary.png"));
+
+		FString CombinedWriteError;
+		if (!WritePng(CombinedOutputPath, ImagePixels, Options.Width, Options.Height, CombinedWriteError))
+		{
+			OutError = CombinedWriteError;
+			return false;
+		}
+
+		OutStats.WrittenFiles.Add(CombinedOutputPath);
+
+		const double MeanSpeed = ArrowStats.ArrowsDrawn > 0
+			? ArrowStats.SpeedSum / static_cast<double>(ArrowStats.ArrowsDrawn)
+			: 0.0;
+
+		UE_LOG(LogTemp, Log,
+			TEXT("CombinedTectonicSummary arrows: drawn=%d, skipped_near_zero=%d, skipped_off_ellipse=%d, skipped_seam_or_too_long=%d, mean_speed=%.2f km/My, max_speed=%.2f km/My"),
+			ArrowStats.ArrowsDrawn,
+			ArrowStats.ArrowsSkippedNearZero,
+			ArrowStats.ArrowsSkippedOffEllipse,
+			ArrowStats.ArrowsSkippedSeamOrTooLong,
+			MeanSpeed,
+			ArrowStats.MaxSpeed);
 	}
 
 	return true;
