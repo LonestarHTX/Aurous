@@ -6478,29 +6478,68 @@ bool FTectonicPlanet::IsPlateEligibleForAutomaticRift(
 		OutContinentalFraction >= AutomaticRiftMinContinentalFraction;
 }
 
+namespace
+{
+	struct FAutomaticRiftProbabilityComponents
+	{
+		double ParentSampleShare = 0.0;
+		double ContinentalScale = 1.0;
+		double LateContinentalPressure = 0.0;
+		double LateContinentalBoost = 1.0;
+		double Lambda = 0.0;
+		double Probability = 0.0;
+	};
+
+	FAutomaticRiftProbabilityComponents ComputeAutomaticRiftProbabilityComponents(
+		const FTectonicPlanet& Planet,
+		const int32 ParentSampleCount,
+		const double ContinentalFraction)
+	{
+		FAutomaticRiftProbabilityComponents Components;
+		if (Planet.Samples.IsEmpty() || ParentSampleCount <= 0)
+		{
+			return Components;
+		}
+
+		Components.ParentSampleShare = FMath::Clamp(
+			static_cast<double>(ParentSampleCount) / static_cast<double>(Planet.Samples.Num()),
+			0.0,
+			1.0);
+		Components.ContinentalScale = FMath::Clamp(
+			ContinentalFraction / FMath::Max(Planet.AutomaticRiftMinContinentalFraction, 0.01),
+			1.0,
+			4.0);
+
+		// Keep the early/medium-horizon regime unchanged, but raise the hazard once the
+		// selected parent has become overwhelmingly continental. The previous capped
+		// continental scale left 70% and 95% continental parents with nearly identical
+		// trigger rates, which made the Wilson-cycle counterweight effectively inert.
+		Components.LateContinentalPressure = FMath::Clamp(
+			(ContinentalFraction - 0.70) / 0.20,
+			0.0,
+			1.0);
+		Components.LateContinentalBoost =
+			1.0 + 19.0 * FMath::Square(Components.LateContinentalPressure);
+
+		const int32 InitialPlateCount = FMath::Max(Planet.InitialPlateCountConfig, 1);
+		Components.Lambda =
+			FMath::Max(0.0, Planet.AutomaticRiftBaseRatePerMy) *
+			DeltaTimeMyears *
+			Components.ParentSampleShare *
+			Components.ContinentalScale *
+			Components.LateContinentalBoost /
+			static_cast<double>(InitialPlateCount);
+		Components.Probability =
+			FMath::Clamp(1.0 - FMath::Exp(-Components.Lambda), 0.0, 0.95);
+		return Components;
+	}
+}
+
 double FTectonicPlanet::ComputeAutomaticRiftProbabilityForSampleCount(
 	const int32 ParentSampleCount,
 	const double ContinentalFraction) const
 {
-	if (Samples.IsEmpty() || ParentSampleCount <= 0)
-	{
-		return 0.0;
-	}
-
-	const double ParentSampleShare =
-		FMath::Clamp(static_cast<double>(ParentSampleCount) / static_cast<double>(Samples.Num()), 0.0, 1.0);
-	const double ContinentalScale = FMath::Clamp(
-		ContinentalFraction / FMath::Max(AutomaticRiftMinContinentalFraction, 0.01),
-		1.0,
-		4.0);
-	const int32 InitialPlateCount = FMath::Max(InitialPlateCountConfig, 1);
-	const double Lambda =
-		FMath::Max(0.0, AutomaticRiftBaseRatePerMy) *
-		DeltaTimeMyears *
-		ParentSampleShare *
-		ContinentalScale /
-		static_cast<double>(InitialPlateCount);
-	return FMath::Clamp(1.0 - FMath::Exp(-Lambda), 0.0, 0.95);
+	return ComputeAutomaticRiftProbabilityComponents(*this, ParentSampleCount, ContinentalFraction).Probability;
 }
 
 int32 FTectonicPlanet::FindLargestEligibleAutomaticRiftParentId(
@@ -6572,8 +6611,9 @@ bool FTectonicPlanet::TryTriggerAutomaticRift()
 	}
 
 	const int32 ChildCount = 2; // M6b stabilization: automatic rifts stay binary to suppress fragmentation cascades.
-	const double Probability =
-		ComputeAutomaticRiftProbabilityForSampleCount(ParentPlate->MemberSamples.Num(), ContinentalFraction);
+	const FAutomaticRiftProbabilityComponents ProbabilityComponents =
+		ComputeAutomaticRiftProbabilityComponents(*this, ParentPlate->MemberSamples.Num(), ContinentalFraction);
+	const double Probability = ProbabilityComponents.Probability;
 	const int32 EventSeed = MakeDeterministicSeed(SimulationSeed, CurrentStep, MakeDeterministicSeed(ParentPlateId, ChildCount, 991));
 	FRandomStream TriggerRandom(MakeDeterministicSeed(SimulationSeed, CurrentStep, MakeDeterministicSeed(ParentPlateId, ChildCount, 701)));
 	const double Draw = TriggerRandom.FRand();
@@ -6582,13 +6622,17 @@ bool FTectonicPlanet::TryTriggerAutomaticRift()
 	UE_LOG(
 		LogTemp,
 		Log,
-		TEXT("[AutoRiftCheck Step=%d] parent=%d child_count=%d parent_samples=%d parent_continental_samples=%d parent_continental_fraction=%.4f probability=%.6f draw=%.6f triggered=%d event_seed=%d"),
+		TEXT("[AutoRiftCheck Step=%d] parent=%d child_count=%d parent_samples=%d parent_continental_samples=%d parent_continental_fraction=%.4f parent_share=%.6f continental_scale=%.4f late_pressure=%.4f late_boost=%.4f probability=%.6f draw=%.6f triggered=%d event_seed=%d"),
 		CurrentStep,
 		ParentPlateId,
 		ChildCount,
 		ParentPlate->MemberSamples.Num(),
 		ContinentalSampleCount,
 		ContinentalFraction,
+		ProbabilityComponents.ParentSampleShare,
+		ProbabilityComponents.ContinentalScale,
+		ProbabilityComponents.LateContinentalPressure,
+		ProbabilityComponents.LateContinentalBoost,
 		Probability,
 		Draw,
 		bTriggered ? 1 : 0,

@@ -18570,3 +18570,319 @@ bool FTectonicPlanetV6V9TectonicBalanceAuditTest::RunTest(const FString& Paramet
 
 	return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6V9AutomaticRiftCalibrationTest,
+	"Aurous.TectonicPlanet.V6V9AutomaticRiftCalibrationTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6V9AutomaticRiftCalibrationTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 PlateCount = 40;
+	constexpr int32 CanonicalSeed = 42;
+	constexpr int32 Secondary250kSeed = 31415;
+
+	struct FCheckpointRecord
+	{
+		FV6CheckpointSnapshot Snapshot;
+		FV9ContinentalMassDiagnostic MassDiag;
+		FV9SeededContinentalSurvivalDiagnostic SurvivalDiag;
+		FTectonicPlanetV6PeriodicSolveStats SolveStats;
+		FTectonicPlanetV6CopiedFrontierSolveAttribution SolveAttribution;
+		FTectonicPlanetV6RiftDiagnostic RiftDiag;
+		int32 AndeanSampleCount = 0;
+	};
+
+	struct FRunState
+	{
+		FString Label;
+		int32 SampleCount = 0;
+		int32 Seed = 0;
+		FTectonicPlanetV6 Planet;
+		TArray<uint8> Step0ContinentalFlags;
+		TArray<uint8> Step0BroadInteriorFlags;
+		TArray<uint8> Step0CoastAdjacentFlags;
+		TMap<int32, FCheckpointRecord> RecordsByStep;
+	};
+
+	struct FGuardExpectation
+	{
+		int32 SampleCount = 0;
+		int32 Step = 0;
+		double CAF = 0.0;
+		double CoastMean = 0.0;
+		double BroadSeed = 0.0;
+		double Submerged = 0.0;
+		double Coherence = 0.0;
+		double Leakage = 0.0;
+	};
+
+	const TArray<FGuardExpectation> GuardExpectations = {
+		{ 100000, 100, 0.3796, 7.14, 0.9085, 0.0183, 0.9698, 0.0887 },
+		{ 100000, 200, 0.4248, 6.25, 0.8278, 0.0279, 0.9726, 0.0729 },
+		{ 250000, 100, 0.4655, 11.02, 0.9392, 0.0491, 0.9553, 0.1257 },
+		{ 250000, 200, 0.6354, 11.05, 0.8838, 0.0815, 0.9817, 0.0505 },
+	};
+
+	const auto FindGuardExpectation = [&GuardExpectations](
+		const int32 SampleCount,
+		const int32 Step) -> const FGuardExpectation*
+	{
+		for (const FGuardExpectation& Expectation : GuardExpectations)
+		{
+			if (Expectation.SampleCount == SampleCount && Expectation.Step == Step)
+			{
+				return &Expectation;
+			}
+		}
+		return nullptr;
+	};
+
+	const auto InitializePlanet = [=](const int32 SampleCount, const int32 Seed)
+	{
+		FTectonicPlanetV6 Planet = CreateInitializedPlanetV6WithConfig(
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
+			INDEX_NONE,
+			SampleCount,
+			PlateCount,
+			Seed);
+		ApplyKeptV6TestProfile(
+			Planet,
+			MakeKeptV6RuntimeProfileOptions(),
+			MakeKeptV6DiagnosticsOptions(false, false));
+		return Planet;
+	};
+
+	const auto BuildSeedFlags = [](
+		const FV9ContinentalMassDiagnostic& Step0Mass,
+		TArray<uint8>& OutStep0ContinentalFlags,
+		TArray<uint8>& OutStep0BroadInteriorFlags,
+		TArray<uint8>& OutStep0CoastAdjacentFlags)
+	{
+		const int32 SampleNum = Step0Mass.SampleCoastDistHops.Num();
+		OutStep0ContinentalFlags.Init(0, SampleNum);
+		OutStep0BroadInteriorFlags.Init(0, SampleNum);
+		OutStep0CoastAdjacentFlags.Init(0, SampleNum);
+		for (int32 SampleIndex = 0; SampleIndex < SampleNum; ++SampleIndex)
+		{
+			if (!Step0Mass.SampleComponentId.IsValidIndex(SampleIndex) ||
+				!Step0Mass.SampleCoastDistHops.IsValidIndex(SampleIndex) ||
+				Step0Mass.SampleComponentId[SampleIndex] < 0)
+			{
+				continue;
+			}
+
+			OutStep0ContinentalFlags[SampleIndex] = 1;
+			const int32 CoastDepth = Step0Mass.SampleCoastDistHops[SampleIndex];
+			if (CoastDepth >= 2)
+			{
+				OutStep0BroadInteriorFlags[SampleIndex] = 1;
+			}
+			else if (CoastDepth == 1)
+			{
+				OutStep0CoastAdjacentFlags[SampleIndex] = 1;
+			}
+		}
+	};
+
+	const auto CaptureCheckpoint = [](
+		FRunState& Run,
+		const int32 Step)
+	{
+		FCheckpointRecord& Record = Run.RecordsByStep.FindOrAdd(Step);
+		Record.Snapshot = BuildV6CheckpointSnapshot(Run.Planet);
+		Record.MassDiag = ComputeContinentalMassDiagnostic(Run.Planet);
+		Record.SurvivalDiag = ComputeSeededContinentalSurvivalDiagnostic(
+			Run.Planet.GetPlanet(),
+			Run.Step0ContinentalFlags,
+			Run.Step0BroadInteriorFlags,
+			Run.Step0CoastAdjacentFlags);
+		Record.SolveStats =
+			Run.Planet.GetPeriodicSolveCount() > 0
+				? Run.Planet.GetLastSolveStats()
+				: Run.Planet.BuildCurrentDiagnosticSnapshotForTest();
+		Record.SolveAttribution = Run.Planet.GetLastCopiedFrontierSolveAttributionForTest();
+		Record.RiftDiag = Run.Planet.ComputeRiftDiagnosticForTest();
+		Record.AndeanSampleCount = ComputeAndeanSampleCount(Run.Planet);
+	};
+
+	const auto EmitMediumGuard = [this, &FindGuardExpectation](
+		const FRunState& Run,
+		const int32 Step)
+	{
+		const FCheckpointRecord& Record = Run.RecordsByStep.FindChecked(Step);
+		const FGuardExpectation* Expectation = FindGuardExpectation(Run.SampleCount, Step);
+		TestNotNull(
+			*FString::Printf(TEXT("%s step %d has guard expectation"), *Run.Label, Step),
+			Expectation);
+		if (Expectation == nullptr)
+		{
+			return;
+		}
+
+		const bool bCAFPass =
+			FMath::Abs(Record.MassDiag.ContinentalAreaFraction - Expectation->CAF) <= 0.02;
+		const bool bCoastPass =
+			FMath::Abs(Record.MassDiag.MeanCoastDistHops - Expectation->CoastMean) <= 0.75;
+		const bool bBroadSeedPass =
+			FMath::Abs(
+				Record.SurvivalDiag.Step0BroadInteriorRemainingFraction -
+				Expectation->BroadSeed) <= 0.03;
+		const bool bSubmergedPass =
+			FMath::Abs(Record.MassDiag.SubmergedContinentalFraction - Expectation->Submerged) <= 0.02;
+		const bool bCoherencePass =
+			Record.Snapshot.BoundaryCoherence.BoundaryCoherenceScore >= Expectation->Coherence - 0.02;
+		const bool bLeakagePass =
+			Record.Snapshot.BoundaryCoherence.InteriorLeakageFraction <= Expectation->Leakage + 0.03;
+		const bool bInFamily =
+			bCAFPass &&
+			bCoastPass &&
+			bBroadSeedPass &&
+			bSubmergedPass &&
+			bCoherencePass &&
+			bLeakagePass;
+
+		AddInfo(FString::Printf(
+			TEXT("[V9AutoRiftGuard label=%s sample_count=%d seed=%d step=%d] caf=%.4f target=%.4f coast_mean=%.2f target=%.2f broad_seed=%.4f target=%.4f submerged=%.4f target=%.4f coherence=%.4f target=%.4f leakage=%.4f target=%.4f in_family=%d"),
+			*Run.Label,
+			Run.SampleCount,
+			Run.Seed,
+			Step,
+			Record.MassDiag.ContinentalAreaFraction,
+			Expectation->CAF,
+			Record.MassDiag.MeanCoastDistHops,
+			Expectation->CoastMean,
+			Record.SurvivalDiag.Step0BroadInteriorRemainingFraction,
+			Expectation->BroadSeed,
+			Record.MassDiag.SubmergedContinentalFraction,
+			Expectation->Submerged,
+			Record.Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			Expectation->Coherence,
+			Record.Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+			Expectation->Leakage,
+			bInFamily ? 1 : 0));
+
+		TestTrue(
+			*FString::Printf(TEXT("%s step %d stays in family"), *Run.Label, Step),
+			bInFamily);
+	};
+
+	const auto EmitLongHorizon = [this](
+		const FRunState& Run,
+		const int32 Step)
+	{
+		const FCheckpointRecord& Record = Run.RecordsByStep.FindChecked(Step);
+		AddInfo(FString::Printf(
+			TEXT("[V9AutoRiftLong label=%s sample_count=%d seed=%d step=%d] caf=%.4f oceanic=%.4f subaerial=%.4f submerged=%.4f largest_subaerial=%d rifts=%d collisions=%d andean_samples=%d andean_gain_last=%d maintenance_andean_last=%d oceanic_creation_last=%d collision_gain_cum=%d collision_transferred_cont_cum=%d parent_continental_fraction=%.4f trigger_probability=%.6f"),
+			*Run.Label,
+			Run.SampleCount,
+			Run.Seed,
+			Step,
+			Record.MassDiag.ContinentalAreaFraction,
+			1.0 - Record.MassDiag.ContinentalAreaFraction,
+			Record.MassDiag.SubaerialContinentalFraction,
+			Record.MassDiag.SubmergedContinentalFraction,
+			Record.MassDiag.LargestSubaerialComponentSize,
+			Record.RiftDiag.CumulativeRiftCount,
+			Record.Snapshot.CollisionExecution.CumulativeExecutedCollisionCount,
+			Record.AndeanSampleCount,
+			Record.SolveAttribution.TectonicMaintenanceContinentalGainCount,
+			Record.SolveAttribution.TectonicMaintenanceAndeanTaggedCount,
+			Record.SolveStats.OceanicCreationCount,
+			Record.Snapshot.CollisionExecution.CumulativeCollisionDrivenContinentalGainCount,
+			Record.Snapshot.CollisionExecution.CumulativeCollisionTransferredContinentalSampleCount,
+			Record.RiftDiag.ParentContinentalFraction,
+			Record.RiftDiag.TriggerProbability));
+	};
+
+	const auto AdvanceToStep = [](
+		FRunState& Run,
+		const int32 TargetStep)
+	{
+		while (Run.Planet.GetPlanet().CurrentStep < TargetStep)
+		{
+			Run.Planet.AdvanceStep();
+		}
+	};
+
+	const auto ExecuteRun = [this, &BuildSeedFlags, &CaptureCheckpoint, &EmitMediumGuard, &EmitLongHorizon, &AdvanceToStep, InitializePlanet](
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const int32 SampleCount,
+		const int32 Seed,
+		const TArray<int32>& Checkpoints,
+		const bool bRunMediumGuards) -> FRunState
+	{
+		FRunState Run;
+		Run.Label = Label;
+		Run.SampleCount = SampleCount;
+		Run.Seed = Seed;
+		Run.Planet = InitializePlanet(SampleCount, Seed);
+
+		const FV9ContinentalMassDiagnostic Step0Mass = ComputeContinentalMassDiagnostic(Run.Planet);
+		BuildSeedFlags(
+			Step0Mass,
+			Run.Step0ContinentalFlags,
+			Run.Step0BroadInteriorFlags,
+			Run.Step0CoastAdjacentFlags);
+
+		for (const int32 Step : Checkpoints)
+		{
+			AdvanceToStep(Run, Step);
+			CaptureCheckpoint(Run, Step);
+			if (bRunMediumGuards && (Step == 100 || Step == 200))
+			{
+				EmitMediumGuard(Run, Step);
+			}
+			if (Step >= 200)
+			{
+				EmitLongHorizon(Run, Step);
+			}
+		}
+
+		TestTrue(
+			*FString::Printf(TEXT("%s reached step %d"), *Run.Label, Checkpoints.Last()),
+			Run.Planet.GetPlanet().CurrentStep >= Checkpoints.Last());
+		return Run;
+	};
+
+	const TArray<int32> Guard100kCheckpoints = { 100, 200 };
+	const TArray<int32> Long250kCheckpoints = { 100, 200, 300, 400, 500 };
+	const TArray<int32> Robust250kCheckpoints = { 100, 200, 300, 400 };
+
+	FRunState Guard100k =
+		ExecuteRun(*this, TEXT("100k_seed42"), 100000, CanonicalSeed, Guard100kCheckpoints, true);
+	FRunState Long250k =
+		ExecuteRun(*this, TEXT("250k_seed42"), 250000, CanonicalSeed, Long250kCheckpoints, true);
+	FRunState Robust250k =
+		ExecuteRun(*this, TEXT("250k_seed31415"), 250000, Secondary250kSeed, Robust250kCheckpoints, false);
+	static_cast<void>(Guard100k);
+
+	const FCheckpointRecord& Step500 = Long250k.RecordsByStep.FindChecked(500);
+	const bool bNaturalRiftsFired = Step500.RiftDiag.CumulativeRiftCount > 0;
+	const bool bOceanicStillMaterial = (1.0 - Step500.MassDiag.ContinentalAreaFraction) >= 0.10;
+	const bool bCAFNoLongerNearTotal = Step500.MassDiag.ContinentalAreaFraction < 0.90;
+
+	AddInfo(FString::Printf(
+		TEXT("[V9AutoRiftOutcome sample_count=250000 seed=%d] natural_rifts=%d oceanic_material=%d caf_not_near_total=%d final_caf=%.4f final_oceanic=%.4f final_rifts=%d final_collisions=%d"),
+		CanonicalSeed,
+		bNaturalRiftsFired ? 1 : 0,
+		bOceanicStillMaterial ? 1 : 0,
+		bCAFNoLongerNearTotal ? 1 : 0,
+		Step500.MassDiag.ContinentalAreaFraction,
+		1.0 - Step500.MassDiag.ContinentalAreaFraction,
+		Step500.RiftDiag.CumulativeRiftCount,
+		Step500.Snapshot.CollisionExecution.CumulativeExecutedCollisionCount));
+
+	AddInfo(FString::Printf(
+		TEXT("[V9AutoRiftRobustness sample_count=250000 seed=%d step=400] caf=%.4f oceanic=%.4f rifts=%d collisions=%d"),
+		Secondary250kSeed,
+		Robust250k.RecordsByStep.FindChecked(400).MassDiag.ContinentalAreaFraction,
+		1.0 - Robust250k.RecordsByStep.FindChecked(400).MassDiag.ContinentalAreaFraction,
+		Robust250k.RecordsByStep.FindChecked(400).RiftDiag.CumulativeRiftCount,
+		Robust250k.RecordsByStep.FindChecked(400).Snapshot.CollisionExecution.CumulativeExecutedCollisionCount));
+
+	TestTrue(TEXT("250k seed42 natural rifts fired by step 500"), bNaturalRiftsFired);
+	return true;
+}
