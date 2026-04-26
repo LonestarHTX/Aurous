@@ -19409,6 +19409,14 @@ bool FTectonicPlanetV6V9PostRiftDivergentFillProbeTest::RunTest(const FString& P
 
 				CapturedCheckpointKeys.Add(CaptureKey);
 				FollowupRecords.Add(CaptureFollowup(RiftEvents[EventIndex], CurrentStep));
+
+				// Export global Mollweide maps at each rift followup checkpoint.
+				const FString RiftExportRoot = FPaths::Combine(
+					FPaths::ProjectSavedDir(),
+					TEXT("TectonicExports"),
+					TEXT("V9RiftFillProbe"),
+					FString::Printf(TEXT("rift_%03d_event_%02d"), RiftEvents[EventIndex].RiftStep, EventIndex));
+				ExportV6CheckpointMaps(*this, Planet, RiftExportRoot, CurrentStep);
 			}
 		}
 	}
@@ -20092,5 +20100,696 @@ bool FTectonicPlanetV6V9AdvectionOwnershipAuditTest::RunTest(const FString& Para
 	TestTrue(
 		TEXT("Advection audit reached step 400"),
 		Planet.GetPlanet().CurrentStep >= Checkpoints.Last());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetV6PaperGeometryAuthoritativePrototypeAuditTest,
+	"Aurous.TectonicPlanet.V6PaperGeometryAuthoritativePrototypeAuditTest",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetV6PaperGeometryAuthoritativePrototypeAuditTest::RunTest(const FString& Parameters)
+{
+	constexpr int32 PlateCount = 40;
+	constexpr int32 CanonicalSeed = 42;
+	constexpr int32 PrototypeFixedIntervalSteps = 25;
+	constexpr int32 CoreMinCoastHops = 3;
+	constexpr double AnchoredExpectedDriftThresholdKm = 1000.0;
+	const TArray<int32> StandardCheckpoints = { 0, 100, 200 };
+	const TArray<int32> ExtendedCheckpoints = { 0, 100, 200, 400 };
+
+	struct FTrackedSample
+	{
+		int32 SampleIndex = INDEX_NONE;
+		int32 OriginalPlateId = INDEX_NONE;
+		FVector3d OriginalPosition = FVector3d::ZeroVector;
+	};
+
+	struct FPlateCohort
+	{
+		int32 OriginalPlateId = INDEX_NONE;
+		int32 Step0TrackedCount = 0;
+		FVector3d OriginalCentroid = FVector3d::ZeroVector;
+	};
+
+	struct FAdvectionCheckpointSummary
+	{
+		int32 Step = 0;
+		int32 TrackedSampleCount = 0;
+		int32 ExpectedAvailableCount = 0;
+		int32 UnavailableDuePlateSplitCount = 0;
+		double MeanExpectedDriftKm = 0.0;
+		double P50ExpectedDriftKm = 0.0;
+		double P95ExpectedDriftKm = 0.0;
+		double WeightedExpectedCentroidDriftKm = 0.0;
+		double WeightedFootprintCentroidDriftKm = 0.0;
+		double WeightedExpectedToFootprintMismatchKm = 0.0;
+		double FractionStillOnOriginalPlate = 0.0;
+		double FractionStillContinental = 0.0;
+		double FractionStillInterior = 0.0;
+		double FractionStep0CoreOverlap = 0.0;
+		double FractionMateriallyAnchored = 0.0;
+	};
+
+	struct FPlateRegionComponentDiagnostic
+	{
+		int32 AssignedSampleCount = 0;
+		int32 ComponentCount = 0;
+		int32 LargestComponentSize = 0;
+		int32 MaxComponentsPerPlate = 0;
+		int32 MultiComponentPlateCount = 0;
+		int32 SingletonComponentCount = 0;
+		int32 TinyComponentCount = 0;
+		int32 SamplesInSingletonComponents = 0;
+		int32 SamplesInTinyComponents = 0;
+		double LargestComponentFraction = 0.0;
+		double SingletonSampleFraction = 0.0;
+		double TinyComponentSampleFraction = 0.0;
+	};
+
+	struct FCheckpointRecord
+	{
+		int32 Step = 0;
+		int32 LastSolveStep = 0;
+		FV6CheckpointSnapshot Snapshot;
+		FV9ContinentalMassDiagnostic MassDiag;
+		FAdvectionCheckpointSummary Advection;
+		FPlateRegionComponentDiagnostic RegionDiag;
+	};
+
+	struct FRunConfig
+	{
+		FString Key;
+		FString Label;
+		int32 SampleCount = 0;
+		ETectonicPlanetV6PeriodicSolveMode SolveMode = ETectonicPlanetV6PeriodicSolveMode::Phase3Authoritative;
+		int32 FixedIntervalSteps = 25;
+		bool bUseKeptProfile = false;
+		TArray<int32> Checkpoints;
+	};
+
+	struct FRunState
+	{
+		FRunConfig Config;
+		FString ExportRoot;
+		FTectonicPlanetV6 Planet;
+		TArray<FTrackedSample> TrackedSamples;
+		TArray<FPlateCohort> PlateCohorts;
+		TSet<int32> TrackedPlateIds;
+		TMap<int32, FCheckpointRecord> RecordsByStep;
+	};
+
+	const auto ComputeGeodesicDistanceKm = [](
+		const FVector3d& A,
+		const FVector3d& B,
+		const double RadiusKm)
+	{
+		if (A.IsNearlyZero() || B.IsNearlyZero())
+		{
+			return 0.0;
+		}
+
+		const double Dot = FMath::Clamp(A.GetSafeNormal().Dot(B.GetSafeNormal()), -1.0, 1.0);
+		return FMath::Acos(Dot) * RadiusKm;
+	};
+
+	const auto ComputePercentileKm = [](
+		TArray<double> Values,
+		const double Percentile)
+	{
+		if (Values.IsEmpty())
+		{
+			return 0.0;
+		}
+
+		Values.Sort();
+		const int32 Index = FMath::Clamp(
+			FMath::CeilToInt(Percentile * static_cast<double>(Values.Num())) - 1,
+			0,
+			Values.Num() - 1);
+		return Values[Index];
+	};
+
+	const auto ComputeNormalizedCentroid = [](
+		const FVector3d& Sum,
+		const int32 Count)
+	{
+		if (Count <= 0 || Sum.IsNearlyZero())
+		{
+			return FVector3d::ZeroVector;
+		}
+
+		return Sum.GetSafeNormal();
+	};
+
+	const auto ComputePlateRegionDiagnostic = [](
+		const FTectonicPlanetV6& Planet)
+	{
+		FPlateRegionComponentDiagnostic Diag;
+		const FTectonicPlanet& PlanetData = Planet.GetPlanet();
+		const int32 SampleCount = PlanetData.Samples.Num();
+		if (SampleCount == 0 || PlanetData.SampleAdjacency.Num() != SampleCount)
+		{
+			return Diag;
+		}
+
+		TArray<uint8> Visited;
+		Visited.Init(0, SampleCount);
+		TMap<int32, int32> ComponentsByPlate;
+
+		for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+		{
+			if (Visited[SampleIndex] != 0 || PlanetData.Samples[SampleIndex].PlateId == INDEX_NONE)
+			{
+				continue;
+			}
+
+			const int32 PlateId = PlanetData.Samples[SampleIndex].PlateId;
+			int32 ComponentSize = 0;
+			TArray<int32> Queue;
+			Queue.Reserve(128);
+			Queue.Add(SampleIndex);
+			Visited[SampleIndex] = 1;
+
+			for (int32 Head = 0; Head < Queue.Num(); ++Head)
+			{
+				const int32 Current = Queue[Head];
+				++ComponentSize;
+				++Diag.AssignedSampleCount;
+				if (!PlanetData.SampleAdjacency.IsValidIndex(Current))
+				{
+					continue;
+				}
+
+				for (const int32 NeighborIndex : PlanetData.SampleAdjacency[Current])
+				{
+					if (!PlanetData.Samples.IsValidIndex(NeighborIndex) ||
+						Visited[NeighborIndex] != 0 ||
+						PlanetData.Samples[NeighborIndex].PlateId != PlateId)
+					{
+						continue;
+					}
+
+					Visited[NeighborIndex] = 1;
+					Queue.Add(NeighborIndex);
+				}
+			}
+
+			++Diag.ComponentCount;
+			++ComponentsByPlate.FindOrAdd(PlateId);
+			Diag.LargestComponentSize = FMath::Max(Diag.LargestComponentSize, ComponentSize);
+			if (ComponentSize == 1)
+			{
+				++Diag.SingletonComponentCount;
+				++Diag.SamplesInSingletonComponents;
+			}
+			if (ComponentSize <= 10)
+			{
+				++Diag.TinyComponentCount;
+				Diag.SamplesInTinyComponents += ComponentSize;
+			}
+		}
+
+		for (const TPair<int32, int32>& Pair : ComponentsByPlate)
+		{
+			Diag.MaxComponentsPerPlate = FMath::Max(Diag.MaxComponentsPerPlate, Pair.Value);
+			if (Pair.Value > 1)
+			{
+				++Diag.MultiComponentPlateCount;
+			}
+		}
+
+		if (Diag.AssignedSampleCount > 0)
+		{
+			Diag.LargestComponentFraction =
+				static_cast<double>(Diag.LargestComponentSize) /
+				static_cast<double>(Diag.AssignedSampleCount);
+			Diag.SingletonSampleFraction =
+				static_cast<double>(Diag.SamplesInSingletonComponents) /
+				static_cast<double>(Diag.AssignedSampleCount);
+			Diag.TinyComponentSampleFraction =
+				static_cast<double>(Diag.SamplesInTinyComponents) /
+				static_cast<double>(Diag.AssignedSampleCount);
+		}
+
+		return Diag;
+	};
+
+	const FString ExportRoot = FPaths::Combine(
+		FPaths::ProjectSavedDir(),
+		TEXT("MapExports"),
+		TEXT("V6PaperGeometryAuthoritativePrototypeAudit"));
+	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
+	PlatformFile.CreateDirectoryTree(*ExportRoot);
+
+	const auto InitializeRun = [&PlatformFile, &ExportRoot](const FRunConfig& Config)
+	{
+		FRunState Run;
+		Run.Config = Config;
+		Run.ExportRoot = FPaths::Combine(ExportRoot, Config.Key);
+		PlatformFile.CreateDirectoryTree(*Run.ExportRoot);
+		Run.Planet = CreateInitializedPlanetV6WithConfig(
+			Config.SolveMode,
+			Config.FixedIntervalSteps,
+			INDEX_NONE,
+			Config.SampleCount,
+			PlateCount,
+			CanonicalSeed);
+		if (Config.bUseKeptProfile)
+		{
+			ApplyKeptV6TestProfile(
+				Run.Planet,
+				MakeKeptV6RuntimeProfileOptions(),
+				MakeKeptV6DiagnosticsOptions(false, false));
+		}
+		else
+		{
+			Run.Planet.ApplyKeptV6DiagnosticsProfile(MakeKeptV6DiagnosticsOptions(false, false));
+		}
+		return Run;
+	};
+
+	const auto BuildTrackedCohort = [&](
+		FRunState& Run)
+	{
+		const FTectonicPlanet& Step0Planet = Run.Planet.GetPlanet();
+		const FV9ContinentalMassDiagnostic Step0Mass = ComputeContinentalMassDiagnostic(Run.Planet);
+		TMap<int32, int32> PlateToTrackedCount;
+		TMap<int32, FVector3d> PlateToTrackedPositionSum;
+
+		Run.TrackedSamples.Reset();
+		Run.TrackedSamples.Reserve(Step0Planet.Samples.Num() / 5);
+		Run.PlateCohorts.Reset();
+		Run.TrackedPlateIds.Reset();
+
+		for (int32 SampleIndex = 0; SampleIndex < Step0Planet.Samples.Num(); ++SampleIndex)
+		{
+			const FSample& Sample = Step0Planet.Samples[SampleIndex];
+			if (Sample.PlateId == INDEX_NONE ||
+				Sample.ContinentalWeight < 0.5f ||
+				Sample.bIsBoundary ||
+				!Step0Mass.SampleCoastDistHops.IsValidIndex(SampleIndex) ||
+				Step0Mass.SampleCoastDistHops[SampleIndex] < CoreMinCoastHops)
+			{
+				continue;
+			}
+
+			FTrackedSample& Tracked = Run.TrackedSamples.AddDefaulted_GetRef();
+			Tracked.SampleIndex = SampleIndex;
+			Tracked.OriginalPlateId = Sample.PlateId;
+			Tracked.OriginalPosition = Sample.Position.GetSafeNormal();
+			PlateToTrackedCount.FindOrAdd(Sample.PlateId)++;
+			PlateToTrackedPositionSum.FindOrAdd(Sample.PlateId) += Tracked.OriginalPosition;
+		}
+
+		Run.PlateCohorts.Reserve(PlateToTrackedCount.Num());
+		for (const TPair<int32, int32>& Pair : PlateToTrackedCount)
+		{
+			FPlateCohort& Cohort = Run.PlateCohorts.AddDefaulted_GetRef();
+			Cohort.OriginalPlateId = Pair.Key;
+			Cohort.Step0TrackedCount = Pair.Value;
+			Cohort.OriginalCentroid = ComputeNormalizedCentroid(
+				PlateToTrackedPositionSum.FindRef(Pair.Key),
+				Pair.Value);
+			Run.TrackedPlateIds.Add(Pair.Key);
+		}
+
+		Run.PlateCohorts.Sort([](const FPlateCohort& Left, const FPlateCohort& Right)
+		{
+			return Left.Step0TrackedCount > Right.Step0TrackedCount;
+		});
+	};
+
+	const auto BuildAdvectionSummary = [&](
+		const FRunState& Run,
+		const int32 Step)
+	{
+		FAdvectionCheckpointSummary Summary;
+		Summary.Step = Step;
+		Summary.TrackedSampleCount = Run.TrackedSamples.Num();
+
+		const FTectonicPlanet& PlanetData = Run.Planet.GetPlanet();
+		const FV9ContinentalMassDiagnostic MassDiag = ComputeContinentalMassDiagnostic(Run.Planet);
+
+		TMap<int32, FVector3d> CurrentCorePositionSumByPlate;
+		TMap<int32, int32> CurrentCoreCountByPlate;
+		for (int32 SampleIndex = 0; SampleIndex < PlanetData.Samples.Num(); ++SampleIndex)
+		{
+			const FSample& Sample = PlanetData.Samples[SampleIndex];
+			if (!Run.TrackedPlateIds.Contains(Sample.PlateId) ||
+				Sample.ContinentalWeight < 0.5f ||
+				Sample.bIsBoundary ||
+				!MassDiag.SampleCoastDistHops.IsValidIndex(SampleIndex) ||
+				MassDiag.SampleCoastDistHops[SampleIndex] < CoreMinCoastHops)
+			{
+				continue;
+			}
+
+			CurrentCorePositionSumByPlate.FindOrAdd(Sample.PlateId) += Sample.Position.GetSafeNormal();
+			CurrentCoreCountByPlate.FindOrAdd(Sample.PlateId)++;
+		}
+
+		TArray<double> ExpectedDisplacementsKm;
+		ExpectedDisplacementsKm.Reserve(Run.TrackedSamples.Num());
+		int32 StillOnOriginalPlateCount = 0;
+		int32 StillContinentalCount = 0;
+		int32 StillInteriorCount = 0;
+		int32 Step0CoreOverlapCount = 0;
+		int32 MateriallyAnchoredCount = 0;
+		for (const FTrackedSample& Tracked : Run.TrackedSamples)
+		{
+			const FSample& CurrentSample = PlanetData.Samples[Tracked.SampleIndex];
+			const bool bStillOnOriginalPlate = CurrentSample.PlateId == Tracked.OriginalPlateId;
+			const bool bStillContinental = CurrentSample.ContinentalWeight >= 0.5f;
+			const bool bStillInterior =
+				bStillContinental &&
+				!CurrentSample.bIsBoundary &&
+				MassDiag.SampleCoastDistHops.IsValidIndex(Tracked.SampleIndex) &&
+				MassDiag.SampleCoastDistHops[Tracked.SampleIndex] >= CoreMinCoastHops;
+
+			StillOnOriginalPlateCount += bStillOnOriginalPlate ? 1 : 0;
+			StillContinentalCount += bStillContinental ? 1 : 0;
+			StillInteriorCount += bStillInterior ? 1 : 0;
+			if (bStillOnOriginalPlate && bStillInterior)
+			{
+				++Step0CoreOverlapCount;
+			}
+
+			const int32 OriginalPlateIndex = PlanetData.FindPlateArrayIndexById(Tracked.OriginalPlateId);
+			if (!PlanetData.Plates.IsValidIndex(OriginalPlateIndex))
+			{
+				++Summary.UnavailableDuePlateSplitCount;
+				continue;
+			}
+
+			const FVector3d ExpectedPosition =
+				PlanetData.Plates[OriginalPlateIndex].CumulativeRotation.RotateVector(
+					Tracked.OriginalPosition).GetSafeNormal();
+			const double ExpectedDisplacementKm = ComputeGeodesicDistanceKm(
+				Tracked.OriginalPosition,
+				ExpectedPosition,
+				PlanetData.PlanetRadiusKm);
+			ExpectedDisplacementsKm.Add(ExpectedDisplacementKm);
+			++Summary.ExpectedAvailableCount;
+
+			if (ExpectedDisplacementKm >= AnchoredExpectedDriftThresholdKm &&
+				bStillOnOriginalPlate &&
+				bStillContinental &&
+				bStillInterior)
+			{
+				++MateriallyAnchoredCount;
+			}
+		}
+
+		if (!ExpectedDisplacementsKm.IsEmpty())
+		{
+			double ExpectedSumKm = 0.0;
+			for (const double DriftKm : ExpectedDisplacementsKm)
+			{
+				ExpectedSumKm += DriftKm;
+			}
+			Summary.MeanExpectedDriftKm =
+				ExpectedSumKm / static_cast<double>(ExpectedDisplacementsKm.Num());
+			Summary.P50ExpectedDriftKm = ComputePercentileKm(ExpectedDisplacementsKm, 0.50);
+			Summary.P95ExpectedDriftKm = ComputePercentileKm(ExpectedDisplacementsKm, 0.95);
+		}
+
+		double WeightedExpectedCentroidDriftSumKm = 0.0;
+		double WeightedFootprintCentroidDriftSumKm = 0.0;
+		double WeightedExpectedToFootprintMismatchSumKm = 0.0;
+		int32 WeightedPlateSampleCount = 0;
+
+		for (const FPlateCohort& Cohort : Run.PlateCohorts)
+		{
+			const int32 PlateIndex = PlanetData.FindPlateArrayIndexById(Cohort.OriginalPlateId);
+			if (!PlanetData.Plates.IsValidIndex(PlateIndex))
+			{
+				continue;
+			}
+
+			const FVector3d ExpectedCentroid =
+				PlanetData.Plates[PlateIndex].CumulativeRotation.RotateVector(
+					Cohort.OriginalCentroid).GetSafeNormal();
+			const double ExpectedCentroidDriftKm = ComputeGeodesicDistanceKm(
+				Cohort.OriginalCentroid,
+				ExpectedCentroid,
+				PlanetData.PlanetRadiusKm);
+
+			const int32 CurrentCoreCount = CurrentCoreCountByPlate.FindRef(Cohort.OriginalPlateId);
+			if (CurrentCoreCount <= 0)
+			{
+				continue;
+			}
+
+			const FVector3d CurrentFootprintCentroid = ComputeNormalizedCentroid(
+				CurrentCorePositionSumByPlate.FindRef(Cohort.OriginalPlateId),
+				CurrentCoreCount);
+			const double ActualFootprintCentroidDriftKm = ComputeGeodesicDistanceKm(
+				Cohort.OriginalCentroid,
+				CurrentFootprintCentroid,
+				PlanetData.PlanetRadiusKm);
+			const double ExpectedToFootprintMismatchKm = ComputeGeodesicDistanceKm(
+				ExpectedCentroid,
+				CurrentFootprintCentroid,
+				PlanetData.PlanetRadiusKm);
+
+			WeightedExpectedCentroidDriftSumKm +=
+				ExpectedCentroidDriftKm * static_cast<double>(Cohort.Step0TrackedCount);
+			WeightedFootprintCentroidDriftSumKm +=
+				ActualFootprintCentroidDriftKm * static_cast<double>(Cohort.Step0TrackedCount);
+			WeightedExpectedToFootprintMismatchSumKm +=
+				ExpectedToFootprintMismatchKm * static_cast<double>(Cohort.Step0TrackedCount);
+			WeightedPlateSampleCount += Cohort.Step0TrackedCount;
+		}
+
+		if (Summary.TrackedSampleCount > 0)
+		{
+			Summary.FractionStillOnOriginalPlate =
+				static_cast<double>(StillOnOriginalPlateCount) /
+				static_cast<double>(Summary.TrackedSampleCount);
+			Summary.FractionStillContinental =
+				static_cast<double>(StillContinentalCount) /
+				static_cast<double>(Summary.TrackedSampleCount);
+			Summary.FractionStillInterior =
+				static_cast<double>(StillInteriorCount) /
+				static_cast<double>(Summary.TrackedSampleCount);
+			Summary.FractionStep0CoreOverlap =
+				static_cast<double>(Step0CoreOverlapCount) /
+				static_cast<double>(Summary.TrackedSampleCount);
+			Summary.FractionMateriallyAnchored =
+				static_cast<double>(MateriallyAnchoredCount) /
+				static_cast<double>(Summary.TrackedSampleCount);
+		}
+
+		if (WeightedPlateSampleCount > 0)
+		{
+			Summary.WeightedExpectedCentroidDriftKm =
+				WeightedExpectedCentroidDriftSumKm /
+				static_cast<double>(WeightedPlateSampleCount);
+			Summary.WeightedFootprintCentroidDriftKm =
+				WeightedFootprintCentroidDriftSumKm /
+				static_cast<double>(WeightedPlateSampleCount);
+			Summary.WeightedExpectedToFootprintMismatchKm =
+				WeightedExpectedToFootprintMismatchSumKm /
+				static_cast<double>(WeightedPlateSampleCount);
+		}
+
+		return Summary;
+	};
+
+	const auto CaptureCheckpoint = [this, &ComputePlateRegionDiagnostic, &BuildAdvectionSummary](
+		FRunState& Run,
+		const int32 Step,
+		const bool bExport)
+	{
+		if (bExport)
+		{
+			ExportV6CheckpointMaps(*this, Run.Planet, Run.ExportRoot, Step);
+			AddInfo(FString::Printf(
+				TEXT("[PaperGeometryPrototypeExport %s step=%d] dir=%s"),
+				*Run.Config.Key,
+				Step,
+				*FPaths::Combine(Run.ExportRoot, FString::Printf(TEXT("step_%03d"), Step))));
+		}
+
+		FCheckpointRecord Record;
+		Record.Step = Step;
+		Record.LastSolveStep =
+			Run.Planet.GetPeriodicSolveCount() > 0
+				? Run.Planet.GetLastSolveStats().Step
+				: 0;
+		Record.Snapshot = BuildV6CheckpointSnapshot(Run.Planet);
+		Record.MassDiag = ComputeContinentalMassDiagnostic(Run.Planet);
+		Record.Advection = BuildAdvectionSummary(Run, Step);
+		Record.RegionDiag = ComputePlateRegionDiagnostic(Run.Planet);
+		Run.RecordsByStep.Add(Step, Record);
+
+		const int32 SampleCount = Run.Planet.GetPlanet().Samples.Num();
+		const double BoundaryBandFraction =
+			SampleCount > 0
+				? static_cast<double>(Record.Snapshot.BoundaryCoherence.BoundaryBandSampleCount) /
+					static_cast<double>(SampleCount)
+				: 0.0;
+		AddInfo(FString::Printf(
+			TEXT("[PaperGeometryPrototypeCheckpoint %s step=%d last_solve_step=%d] boundary_band_fraction=%.4f coherence=%.4f leakage=%.4f churn=%.4f hit=%d miss=%d multi=%d max_components=%d region_components=%d multi_component_plates=%d singleton_region_fraction=%.4f tiny_region_fraction=%.4f expected_centroid_drift_km=%.2f footprint_centroid_drift_km=%.2f mismatch_km=%.2f step0_core_overlap=%.4f materially_anchored=%.4f caf=%.4f oceanic_fraction=%.4f largest_subaerial=%d"),
+			*Run.Config.Key,
+			Step,
+			Record.LastSolveStep,
+			BoundaryBandFraction,
+			Record.Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			Record.Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+			Record.Snapshot.OwnershipChurn.ChurnFraction,
+			Record.Snapshot.HitCount,
+			Record.Snapshot.MissCount,
+			Record.Snapshot.MultiHitCount,
+			Record.Snapshot.MaxComponentsPerPlate,
+			Record.RegionDiag.ComponentCount,
+			Record.RegionDiag.MultiComponentPlateCount,
+			Record.RegionDiag.SingletonSampleFraction,
+			Record.RegionDiag.TinyComponentSampleFraction,
+			Record.Advection.WeightedExpectedCentroidDriftKm,
+			Record.Advection.WeightedFootprintCentroidDriftKm,
+			Record.Advection.WeightedExpectedToFootprintMismatchKm,
+			Record.Advection.FractionStep0CoreOverlap,
+			Record.Advection.FractionMateriallyAnchored,
+			Record.MassDiag.ContinentalAreaFraction,
+			1.0 - Record.MassDiag.ContinentalAreaFraction,
+			Record.MassDiag.LargestSubaerialComponentSize));
+	};
+
+	const auto AdvanceToStep = [](
+		FRunState& Run,
+		const int32 TargetStep)
+	{
+		while (Run.Planet.GetPlanet().CurrentStep < TargetStep)
+		{
+			Run.Planet.AdvanceStep();
+		}
+	};
+
+	const auto CompareRunsAtStep = [this](
+		const FRunState& V9Run,
+		const FRunState& PaperRun,
+		const int32 Step)
+	{
+		const FCheckpointRecord& V9 = V9Run.RecordsByStep.FindChecked(Step);
+		const FCheckpointRecord& Paper = PaperRun.RecordsByStep.FindChecked(Step);
+		AddInfo(FString::Printf(
+			TEXT("[PaperGeometryPrototypeCompare %dk step=%d] v9_footprint_drift_km=%.2f paper_footprint_drift_km=%.2f v9_mismatch_km=%.2f paper_mismatch_km=%.2f v9_step0_core_overlap=%.4f paper_step0_core_overlap=%.4f v9_materially_anchored=%.4f paper_materially_anchored=%.4f v9_boundary_coherence=%.4f paper_boundary_coherence=%.4f v9_leakage=%.4f paper_leakage=%.4f v9_churn=%.4f paper_churn=%.4f v9_tiny_region_fraction=%.4f paper_tiny_region_fraction=%.4f v9_caf=%.4f paper_caf=%.4f v9_largest_subaerial=%d paper_largest_subaerial=%d"),
+			V9Run.Config.SampleCount / 1000,
+			Step,
+			V9.Advection.WeightedFootprintCentroidDriftKm,
+			Paper.Advection.WeightedFootprintCentroidDriftKm,
+			V9.Advection.WeightedExpectedToFootprintMismatchKm,
+			Paper.Advection.WeightedExpectedToFootprintMismatchKm,
+			V9.Advection.FractionStep0CoreOverlap,
+			Paper.Advection.FractionStep0CoreOverlap,
+			V9.Advection.FractionMateriallyAnchored,
+			Paper.Advection.FractionMateriallyAnchored,
+			V9.Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			Paper.Snapshot.BoundaryCoherence.BoundaryCoherenceScore,
+			V9.Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+			Paper.Snapshot.BoundaryCoherence.InteriorLeakageFraction,
+			V9.Snapshot.OwnershipChurn.ChurnFraction,
+			Paper.Snapshot.OwnershipChurn.ChurnFraction,
+			V9.RegionDiag.TinyComponentSampleFraction,
+			Paper.RegionDiag.TinyComponentSampleFraction,
+			V9.MassDiag.ContinentalAreaFraction,
+			Paper.MassDiag.ContinentalAreaFraction,
+			V9.MassDiag.LargestSubaerialComponentSize,
+			Paper.MassDiag.LargestSubaerialComponentSize));
+	};
+
+	const TArray<FRunConfig> RunConfigs = {
+		{
+			TEXT("100k_v9_kept"),
+			TEXT("100k V9 kept"),
+			100000,
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
+			true,
+			StandardCheckpoints
+		},
+		{
+			TEXT("100k_paper_geometry_authoritative"),
+			TEXT("100k paper geometry authoritative"),
+			100000,
+			ETectonicPlanetV6PeriodicSolveMode::PaperGeometryAuthoritativeRemeshPrototype,
+			PrototypeFixedIntervalSteps,
+			false,
+			StandardCheckpoints
+		},
+		{
+			TEXT("250k_v9_kept"),
+			TEXT("250k V9 kept"),
+			250000,
+			FTectonicPlanetV6::GetKeptV6PeriodicSolveMode(),
+			FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
+			true,
+			ExtendedCheckpoints
+		},
+		{
+			TEXT("250k_paper_geometry_authoritative"),
+			TEXT("250k paper geometry authoritative"),
+			250000,
+			ETectonicPlanetV6PeriodicSolveMode::PaperGeometryAuthoritativeRemeshPrototype,
+			PrototypeFixedIntervalSteps,
+			false,
+			ExtendedCheckpoints
+		}
+	};
+
+	TMap<FString, FRunState> RunsByKey;
+	for (const FRunConfig& Config : RunConfigs)
+	{
+		FRunState Run = InitializeRun(Config);
+		BuildTrackedCohort(Run);
+		TestTrue(
+			*FString::Printf(TEXT("%s tracked a non-empty step-0 continental interior cohort"), *Config.Key),
+			Run.TrackedSamples.Num() > 0);
+
+		CaptureCheckpoint(Run, 0, true);
+		for (int32 CheckpointIndex = 1; CheckpointIndex < Config.Checkpoints.Num(); ++CheckpointIndex)
+		{
+			const int32 TargetStep = Config.Checkpoints[CheckpointIndex];
+			AdvanceToStep(Run, TargetStep);
+			CaptureCheckpoint(Run, TargetStep, true);
+		}
+
+		for (const int32 Step : Config.Checkpoints)
+		{
+			TestTrue(
+				*FString::Printf(TEXT("%s captured checkpoint %d"), *Config.Key, Step),
+				Run.RecordsByStep.Contains(Step));
+		}
+		TestTrue(
+			*FString::Printf(TEXT("%s reached final checkpoint"), *Config.Key),
+			Run.Planet.GetPlanet().CurrentStep >= Config.Checkpoints.Last());
+
+		RunsByKey.Add(Config.Key, MoveTemp(Run));
+	}
+
+	const FRunState& Run100kV9 = RunsByKey.FindChecked(TEXT("100k_v9_kept"));
+	const FRunState& Run100kPaper = RunsByKey.FindChecked(TEXT("100k_paper_geometry_authoritative"));
+	const FRunState& Run250kV9 = RunsByKey.FindChecked(TEXT("250k_v9_kept"));
+	const FRunState& Run250kPaper = RunsByKey.FindChecked(TEXT("250k_paper_geometry_authoritative"));
+
+	for (const int32 Step : StandardCheckpoints)
+	{
+		CompareRunsAtStep(Run100kV9, Run100kPaper, Step);
+	}
+	for (const int32 Step : ExtendedCheckpoints)
+	{
+		CompareRunsAtStep(Run250kV9, Run250kPaper, Step);
+	}
+
+	AddInfo(FString::Printf(
+		TEXT("[PaperGeometryPrototypeAuditSummary] export_root=%s prototype_cadence_steps=%d v9_cadence_steps=%d seed=%d"),
+		*ExportRoot,
+		PrototypeFixedIntervalSteps,
+		FTectonicPlanetV6::GetKeptV6FixedIntervalSteps(),
+		CanonicalSeed));
+
 	return true;
 }

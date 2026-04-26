@@ -15,6 +15,7 @@ enum class ETectonicPlanetV6PeriodicSolveMode : uint8
 {
 	Phase3Authoritative,
 	ThesisRemeshSpike,
+	PaperGeometryAuthoritativeRemeshPrototype,
 	ThesisCopiedFrontierSpike,
 	ThesisCopiedFrontierProcessSpike,
 	ThesisPartitionedFrontierSpike,
@@ -1379,6 +1380,7 @@ private:
 	bool HandlePendingAutomaticRiftAfterAdvance();
 	void ApplySubmergedContinentalFringeRelaxationAfterStep();
 	void PerformThesisRemeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
+	void PerformPaperGeometryAuthoritativeRemeshPrototypeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisCopiedFrontierSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void PerformThesisPlateSubmeshSpikeSolve(ETectonicPlanetV6SolveTrigger Trigger);
 	void SetPeriodicSolveModeForTest(

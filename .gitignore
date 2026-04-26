@@ -58,3 +58,6 @@ Plugins/RealtimeMeshComponent/
 .DS_Store
 Thumbs.db
 .idea/
+
+# Claude Code agent isolation worktrees
+.claude/worktrees/

@@ -1,5 +1,18 @@
 # Procedural Tectonic Planets - Architecture Memo v9
 
+April 2026 note: this memo records why the project pivoted into `v9`, but it is no longer the current architecture position.
+
+The later advection, long-horizon, and divergent-fill audits showed that the `v9` ownership-authority model does not satisfy the actual product bar:
+
+- anchored ownership kills visible continental drift
+- aggressive ownership transfer restores drift metrics but destroys coherent plate regions and thin boundaries
+- revived oceanization can become speckled instead of opening coherent basins
+
+Use these documents as the current decision point instead:
+
+- `docs/tectonic-architecture-failure-memo-2026-04.md`
+- `docs/tectonic-minimal-acceptance-tests.md`
+
 **Based on:** Cortial et al., "Procedural Tectonic Planets" (2019), thesis follow-up, and Aurous V6/V8 experimental results  
 **Target:** Unreal Engine 5.7  
 **Date:** March 2026
