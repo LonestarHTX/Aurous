@@ -57,6 +57,10 @@ Add:
 Both are owned by `FTectonicPlanetSidecar`.
 
 Persistent ocean crust must not live as authority in `FTectonicPlanet.Samples`.
+The crust store and event log must not be `mutable`. They are written only by
+non-const sidecar mutation paths: `AdvanceStep`, explicit reset/reseed, or a
+named event API such as `ApplyDivergentSpreadingEvent`. `ProjectToPlanet` must
+not have a write path to D persistent state.
 
 Minimum persistent record:
 
@@ -75,6 +79,12 @@ Minimum persistent record:
 - parent ridge/event id
 
 All persistent D state must be included in sidecar authority hashing.
+
+Sidecar authority hashing is separate from projection hashing. D must add a
+`ComputeSidecarAuthorityHash`-style API that hashes sidecar truth: plate
+authority, carried material authority, `FSidecarOceanCrustStore`, and
+`FSidecarCrustEventLog`. `ComputeProjectionHash` remains a projection-output
+hash over `FTectonicPlanet` fields and must not become the D authority hash.
 
 ## Representation Choice
 
@@ -119,6 +129,11 @@ Inputs from C:
 - divergent boundary flags/scores
 - boundary edges; samples may be used only as debug/projection helpers
 
+D event detection must consume canonical owner-edge primitives, not projection
+classification arrays. In particular, event code must not derive persistent
+crust from `OceanFallback`, `DivergentOceanFill`, `LastDivergentBoundaryFlags`,
+or material projection misses.
+
 Baseline event threshold:
 
 - normal separation speed >= `10 mm/yr`
@@ -137,6 +152,22 @@ Event must not:
 - create crust from projection misses
 - create crust from generic ocean fallback
 - call V6/V9 remesh or recovery paths
+
+## Required Read-Only Primitives
+
+Before Slice 2 event detection, D must have read-only helpers that compute the
+event inputs from the C authority model instead of projection diagnostics:
+
+- `EnumerateOwnerEdgesSorted`: returns canonical undirected boundary edges in
+  ascending `(minSampleId, maxSampleId)` order. The result must be deterministic
+  across repeated initialization with the same seed/config.
+- `ComputeBoundaryNormalSeparationKmPerMy`: computes normal separation from
+  sidecar plate kinematics and the boundary edge geometry. Tests must recompute
+  expected spreading rates from this helper or equivalent independent math, not
+  from event records.
+
+These helpers may land in Slice 1 only if they are pure/read-only and do not
+create events, project D state, write exports, or mutate sidecar truth.
 
 ## Crust Identity Rule
 
@@ -170,6 +201,9 @@ support.
 The ridge generation id starts at zero and increments only when a previously
 matched ridge has been inactive for `RidgeGenerationGapSteps = 5` sidecar steps
 and then fires again. Shape changes alone do not increment the generation id.
+`RidgeGenerationGapSteps` is a `FTectonicSidecarConfig` value with default `5`.
+It controls event labelling/coalescing only, not crust creation, owner choice,
+or material mutation.
 
 A later ADR may introduce adaptive or periodic event cadence.
 
@@ -184,6 +218,15 @@ order. This preserves replay history.
 iteration order. Store hashing sorts crust records by `CrustId` and hashes all
 authoritative fields. This makes state equivalence deterministic even if
 storage order changes.
+
+Slice 1 tests must prove that projection output and sidecar authority are
+distinct hash subjects:
+
+- mutating an in-memory `FTectonicPlanet` projection after `ProjectToPlanet`
+  must not change sidecar authority hash
+- changing D persistent state must change sidecar authority hash
+- repeated `ProjectToPlanet` calls must not change crust store count, event log
+  count, or sidecar authority hash
 
 ## Third-Plate Intrusion
 
@@ -214,6 +257,12 @@ If D ocean crust projects onto a sample, visible projected fields may include:
 - source event id/debug classification
 
 These are projected outputs only. They must not become source of truth.
+
+D projection must never write `Sample.PlateId` or `Sample.bIsBoundary`.
+Those fields remain exclusively C projection outputs derived from nearest-center
+ownership and raw adjacency. D projection may write only material/elevation/age/
+thickness/ridge/event-debug output fields, and only in a post-material phase
+that can inspect already projected carried `ContinentalWeight`.
 
 Initial D projection must not overwrite meaningful carried continental
 material. Meaningful continental material is defined as projected carried
@@ -254,6 +303,8 @@ Examples:
 - expected creation only when normal separation speed exceeds threshold
 - expected persistent crust area from boundary length, spreading rate, and
   elapsed time with analytic relative error <= 1%
+- expected spreading rate computed from sidecar plate kinematics and boundary
+  geometry, not from `Event.SpreadingKmPerMy` or any event-reported magnitude
 - expected projected/lattice area with tolerance derived from sample spacing,
   never from an uncited fixed magic number
 - expected zero events below threshold
@@ -294,6 +345,10 @@ state model, event log, authority hash, and tests proving the new state is
 sidecar-authoritative and idempotent under projection. No event detection,
 projection, or exports in slice 1.
 
+Slice 1 may also add the read-only owner-edge and boundary-velocity primitives
+named above, but only as pure helpers with determinism tests. They must not
+create events or write D state.
+
 ## Non-Goals
 
 D1 does not implement:
@@ -327,6 +382,12 @@ Mitigation:
 Every mutation must be event-named, sidecar-owned, logged, independently tested,
 and covered by idempotence/hash tests.
 
+Mutation entry points must be named as events, for example
+`ApplyDivergentSpreadingEvent`. D source should avoid repair-shaped vocabulary
+for persistent mutation paths: `Recover`, `Repair`, `Heal`, `Backfill`,
+`Resync`, `Promote`, and `Reclassify` are not acceptable names for D crust
+creation or mutation.
+
 ## Resolved Acceptance Questions
 
 The Proposed ADR open questions were resolved before acceptance:
@@ -348,3 +409,17 @@ The Proposed ADR open questions were resolved before acceptance:
   `ContinentalWeight >= 0.5`.
 - Projected elevation seed uses age `0 My`, thickness `7 km`, and elevation
   `-1 km`; ridge elevation is paper-cited, thickness is a D1 placeholder.
+
+## Pre-Mortem Addendum
+
+The D pre-mortem after acceptance added these binding clarifications before
+Slice 1:
+
+- D sidecar authority hash is separate from projection hash.
+- D persistent store and event log are non-`mutable` and not writable from
+  `ProjectToPlanet`.
+- D projection never writes `Sample.PlateId` or `Sample.bIsBoundary`.
+- Event detection must consume sorted owner-edge primitives and sidecar
+  kinematics, not projection classifications or ocean-fill flags.
+- Analytic tests must not use event-reported magnitudes as expected values.
+- `RidgeGenerationGapSteps` is config-owned and affects labelling only.
