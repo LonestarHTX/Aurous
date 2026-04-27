@@ -53,11 +53,12 @@ Key hardening metrics:
 
 Priority order:
 
-1. Finish/merge the C cleanup and freeze documentation.
-2. Write ADR 0002 for Prototype D before implementation.
-3. Implement the first D slice as persistent crust events, likely divergent
-   ocean crust identity, age, and thickness.
-4. Keep C invariants green while D reads C signals.
+1. Implement Prototype D Slice 1 from ADR 0002: persistent state model, event
+   log, authority hash, and idempotence tests only.
+2. Keep C invariants green while D state exists.
+3. Defer event detection, D projection, and D exports until later D slices.
+4. Implement persistent divergent ocean crust identity, age, and thickness only
+   after Slice 1 passes.
 5. Track, but do not rush, extraction of C into its own class once A/B can be deprecated.
 
 Prototype C does not solve persistent ocean crust, age gradients, thickness

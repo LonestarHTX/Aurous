@@ -8,7 +8,7 @@ active Aurous tectonics path.
 | ADR | Status | Summary |
 | --- | --- | --- |
 | `0001-c-freeze-voronoi-ownership-decoupled-material.md` | Accepted | Freezes Prototype C as the ownership/projection foundation: nearest-center Voronoi ownership, raw adjacency boundaries, and decoupled material projection. |
-| `0002-d-persistent-divergent-ocean-crust.md` | Proposed | Defines Prototype D's first persistent crust slice: sidecar-owned divergent ocean crust state, event log, and acceptance questions before code lands. |
+| `0002-d-persistent-divergent-ocean-crust.md` | Accepted | Defines Prototype D's first persistent crust slice: sidecar-owned divergent ocean crust state, event log, authority hashing, and strict Slice 1 scope before event code lands. |
 
 ## Template
 

@@ -1,6 +1,6 @@
 # 0002: Persistent Divergent Ocean Crust
 
-Status: Proposed
+Status: Accepted
 Date: 2026-04-27
 Depends on: ADR 0001, Prototype C freeze
 
@@ -14,7 +14,10 @@ current geometry and had no identity, age, or thickness history.
 Prototype D starts by adding one persistent tectonic process: divergent ocean
 crust creation.
 
-No Prototype D code lands before this ADR is accepted.
+No Prototype D code landed before this ADR was accepted. After acceptance, only
+D Slice 1 may land first: persistent state model, event log, authority hash, and
+tests. No event detection, projection, exports, or ocean creation are allowed in
+Slice 1.
 
 ## Decision
 
@@ -62,9 +65,9 @@ Minimum persistent record:
 - `PlateA`, `PlateB`
 - `BirthStep`, `BirthTimeMy`
 - `LastUpdatedStep`
-- source boundary/interface sample ids or segment ids
+- source boundary edge ids and optional debug sample ids
 - ridge direction / spreading direction
-- support geometry
+- support geometry: boundary edge list plus derived parametric ribbon
 - created area
 - oceanic age
 - oceanic thickness
@@ -75,19 +78,34 @@ All persistent D state must be included in sidecar authority hashing.
 
 ## Representation Choice
 
-D1 uses per-event strip/support records.
+D1 uses per-event strip/support records represented as a boundary edge list plus
+a derived parametric ribbon.
+
+Boundary edge endpoints are stored in world-space unit sphere coordinates at the
+event `BirthStep`. They persist thereafter and do not transform with plates
+after creation. The crust is event-owned, not plate-owned.
+
+The projected ribbon support is derived from the stored birth edge list by
+sweeping each edge along the boundary-normal spreading direction by the
+cumulative spreading width:
+
+`WidthKm = NormalSeparationKmPerMy * AgeMy`
+
+The angular width is `WidthKm / PlanetRadiusKm`. Slice 2 tests must compute the
+expected analytic persistent area from boundary length, spreading rate, and
+elapsed time independently from D diagnostics.
 
 Rejected for D1:
 
+- spherical polygon support, because it is more geometry than D1 needs and
+  invites polygon repair before the event model is proven
 - per-sample annotation as authority, because it risks recreating global sample authority
+- pure parametric ribbon, because it is under-anchored without persisted birth edges
 - per-plate fragment ownership, because it prematurely answers accretion/subduction ownership questions
 - new strip plates, because plate-count growth is a later architectural decision
 
 Per-event strip/support keeps ocean crust persistent without changing C
 ownership.
-
-The exact strip/support representation is still open before this ADR can move
-to Accepted.
 
 ## Event Rule
 
@@ -99,13 +117,13 @@ Inputs from C:
 - boundary plate pair ids
 - relative plate velocity
 - divergent boundary flags/scores
-- interface samples or edges
+- boundary edges; samples may be used only as debug/projection helpers
 
 Baseline event threshold:
 
 - normal separation speed >= `10 mm/yr`
 - measured along the local boundary normal or pair separation direction
-- evaluated per boundary edge/sample and aggregated by plate pair
+- evaluated per boundary edge and aggregated by plate pair
 
 The event-isolation tests must prove no event fires below threshold.
 
@@ -133,13 +151,39 @@ No silent reattribution.
 
 ## Cadence
 
-D1 evaluates divergent events every sidecar step.
+After Slice 2 introduces event detection, D evaluates divergent events every
+sidecar step. Slice 1 does not evaluate or fire events.
 
-Events are coalesced by plate pair / ridge id so a spreading ridge extends an
-existing persistent crust record rather than creating unrelated fragments every
-step.
+Events are coalesced by:
+
+- sorted plate pair `(min(PlateA, PlateB), max(PlateA, PlateB))`
+- connected divergent boundary component id
+- ridge generation id
+
+The connected component id is the lowest canonical undirected boundary-edge key
+in the component at the component's first accepted event. Later components match
+an existing ridge if the sorted plate pair matches and the current component
+shares at least one boundary edge with the ridge's last accepted edge set, or if
+its closest edge midpoint is within `2 * SampleSpacingRad` of the stored ribbon
+support.
+
+The ridge generation id starts at zero and increments only when a previously
+matched ridge has been inactive for `RidgeGenerationGapSteps = 5` sidecar steps
+and then fires again. Shape changes alone do not increment the generation id.
 
 A later ADR may introduce adaptive or periodic event cadence.
+
+## Event Log And Hash Policy
+
+`FSidecarCrustEventLog` is append-order-sensitive. Each event hash
+canonicalizes unordered fields inside the event, including sorted plate pair and
+sorted source edge ids, then the aggregate log hash folds events in append
+order. This preserves replay history.
+
+`FSidecarOceanCrustStore` is canonical-state hashable independent of container
+iteration order. Store hashing sorts crust records by `CrustId` and hashes all
+authoritative fields. This makes state equivalence deterministic even if
+storage order changes.
 
 ## Third-Plate Intrusion
 
@@ -171,6 +215,23 @@ If D ocean crust projects onto a sample, visible projected fields may include:
 
 These are projected outputs only. They must not become source of truth.
 
+Initial D projection must not overwrite meaningful carried continental
+material. Meaningful continental material is defined as projected carried
+`ContinentalWeight >= 0.5` by default. If this becomes configurable, the config
+field is `OverlayContinentalWeightThreshold` with default `0.5`.
+
+The D projection elevation seed, once projection lands in a later slice, is:
+
+- age: `0 My`
+- thickness: `7 km`
+- elevation: `-1 km`
+
+The `-1 km` ridge elevation follows the paper parameter table value `zr`
+(`Highest oceanic ridge elevation`) in `docs/ProceduralTectonicPlanets.txt`. The
+`7 km` thickness is the existing Aurous sidecar/V6 oceanic-thickness convention
+and remains a first-pass placeholder until the cooling/thickness law is defined
+by a later ADR.
+
 ## Mandatory D Exports
 
 D acceptance exports must include:
@@ -191,7 +252,10 @@ Examples:
 
 - expected crust age = elapsed My since `BirthTimeMy`
 - expected creation only when normal separation speed exceeds threshold
-- expected crust area from boundary length, spreading rate, and elapsed time within tolerance
+- expected persistent crust area from boundary length, spreading rate, and
+  elapsed time with analytic relative error <= 1%
+- expected projected/lattice area with tolerance derived from sample spacing,
+  never from an uncited fixed magic number
 - expected zero events below threshold
 - expected `PlateId` and `bIsBoundary` from C formulas, not D diagnostics
 
@@ -263,21 +327,24 @@ Mitigation:
 Every mutation must be event-named, sidecar-owned, logged, independently tested,
 and covered by idempotence/hash tests.
 
-## Open Questions Before Accepted
+## Resolved Acceptance Questions
 
-These must be resolved before this ADR moves from Proposed to Accepted:
+The Proposed ADR open questions were resolved before acceptance:
 
-- Exact support geometry for per-event strips. Candidate representations must be
-  enumerated and compared before choosing one: spherical polygon, persistent
-  sample id set, parametric ribbon, boundary edge list, or another explicitly
-  justified representation.
-- Exact area tolerance for independent creation-area tests.
-- Exact coalescing key for ridge/event identity.
-- Event-log hash policy tied to the coalescing key: order-sensitive vs
-  sorted-by-id, per-event hash vs aggregate store hash, and which fields define
-  deterministic equality.
-- Whether D1 uses boundary samples, boundary edges, or both.
-- Whether initial D projection supports only oceanic fallback regions or can
-  overlay carried material where divergent crust exists.
-- Numerical baseline for `projected elevation seed`, or an explicit paper
-  citation and deferral if the value is not selected in D1.
+- Support geometry is boundary edge list plus derived parametric ribbon, with
+  spherical polygon, sample-id authority, pure ribbon, per-plate fragment, and
+  strip-plate representations rejected for D1.
+- Persistent birth edge endpoints are stored in world-space unit sphere
+  coordinates at `BirthStep` and do not transform with plates after creation.
+- Analytic persistent area tolerance is <= 1%; projected area tolerance must be
+  tied to sample spacing.
+- Ridge coalescing key is sorted plate pair, connected divergent boundary
+  component id, and ridge generation id.
+- Event log hashing is order-sensitive; crust store hashing is sorted by
+  `CrustId`.
+- Boundary edges are authoritative for event creation; samples are debug and
+  projection helpers only.
+- Initial D projection must not overwrite carried material with
+  `ContinentalWeight >= 0.5`.
+- Projected elevation seed uses age `0 My`, thickness `7 km`, and elevation
+  `-1 km`; ridge elevation is paper-cited, thickness is a D1 placeholder.
