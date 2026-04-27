@@ -1,5 +1,24 @@
 ## Repo Notes
 
+### Current Project Truth
+
+- Start with `docs/STATE.md`.
+- Current architecture is Prototype C: plate-authoritative sidecar, nearest-center Voronoi ownership, raw adjacency boundaries, decoupled material projection.
+- Canonical ADR: `docs/architecture/decisions/0001-c-freeze-voronoi-ownership-decoupled-material.md`.
+- V6/V9 are historical and should not be extended for new tectonic work.
+- For new D work, write an ADR first and preserve C invariants.
+
+### Push Verification
+
+- After pushing, verify the remote SHA matches local `HEAD` with `git ls-remote origin <branch>` or by checking GitHub.
+- Do not trust an agent-reported push result without remote verification.
+
+### Worktree Hygiene
+
+- Inspect with `git worktree list` before cleanup.
+- Only prune entries Git marks `prunable`.
+- Do not delete branches or worktrees unless the user explicitly asks for that destructive cleanup.
+
 ### Windows Command Hygiene
 
 - This repo is usually driven from `bash`, but many commands invoke Windows tools. Be explicit about shell boundaries.

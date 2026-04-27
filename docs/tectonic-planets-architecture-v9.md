@@ -1,3 +1,9 @@
+> **STATUS: SUPERSEDED - historical reference only.**
+> V9 ownership authority was falsified by the 2026 architecture audit and is not
+> the active tectonic path. See `docs/tectonic-architecture-failure-memo-2026-04.md`
+> for the failure analysis and `docs/architecture/decisions/0001-c-freeze-voronoi-ownership-decoupled-material.md`
+> for the current active architecture.
+
 # Procedural Tectonic Planets - Architecture Memo v9
 
 April 2026 note: this memo records why the project pivoted into `v9`, but it is no longer the current architecture position.

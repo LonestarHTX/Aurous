@@ -1,3 +1,12 @@
+/**
+ * V6/V9 ownership-authority architecture. STATUS: SUPERSEDED.
+ *
+ * This file is preserved for historical reference and regression comparisons.
+ * Do not extend it for new tectonic architecture work.
+ *
+ * Current architecture: Source/Aurous/Public/TectonicPlanetSidecar.h
+ * Failure memo: docs/tectonic-architecture-failure-memo-2026-04.md
+ */
 #pragma once
 
 #include "CoreMinimal.h"

@@ -1,3 +1,11 @@
+/**
+ * V6/V9 ownership-authority implementation. STATUS: SUPERSEDED.
+ *
+ * Preserved for historical reference and comparisons only. New tectonic work
+ * should build on the plate-authoritative sidecar path.
+ *
+ * Current architecture: docs/architecture/decisions/0001-c-freeze-voronoi-ownership-decoupled-material.md
+ */
 #include "TectonicPlanetV6.h"
 
 #include "Algo/Sort.h"

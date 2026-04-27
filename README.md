@@ -1,101 +1,99 @@
 # Aurous
 
-Procedural tectonic planet generation in Unreal Engine 5.7, based on Cortial et al., *Procedural Tectonic Planets* (2019) and the Cortial PhD thesis *Synthese de terrain a l'echelle planetaire* (2020).
+Procedural tectonic planet generation in Unreal Engine 5.7, based on Cortial
+et al., *Procedural Tectonic Planets* (2019) and the Cortial PhD thesis
+*Synthese de terrain a l'echelle planetaire* (2020).
 
-Aurous simulates the full tectonic lifecycle -- plate motion, subduction, continental collision, oceanic crust generation, and plate rifting -- on a spherical planet with up to 250,000+ sample points and 40 tectonic plates.
+## Start Here
+
+The current active architecture is Prototype C: a plate-authoritative sidecar
+with clean Voronoi ownership and decoupled material projection.
+
+Read these in order:
+
+1. `docs/STATE.md` - current project state.
+2. `docs/architecture/decisions/0001-c-freeze-voronoi-ownership-decoupled-material.md` - frozen C contract.
+3. `docs/tectonic-minimal-acceptance-tests.md` - acceptance gates.
+4. `docs/tectonic-architecture-failure-memo-2026-04.md` - why V6/V9 failed.
+5. `docs/ProceduralTectonicPlanets.txt` - source paper notes.
 
 ## Current State
 
-The tectonic simulation is complete and validated at multiple resolutions:
+Prototype C is the first accepted foundation for the active tectonics path. It
+does not claim a full tectonic lifecycle. It proves the ownership/material
+carrier problem that blocked the project:
 
-| Resolution | Samples | Per-Solve | Status |
-|-----------|---------|----------|--------|
-| Low (102 km) | 60,000 | 0.27s | Fast iteration rung |
-| Medium (78 km) | 100,000 | 0.48s | Validated fidelity rung (3 seeds) |
-| High (50 km) | 250,000 | 1.30s | Forward work rung |
+- clean, exclusive, exhaustive plate ownership from nearest rotated plate center
+- raw adjacency boundary loops without post-process drawing or repair masks
+- coherent carried material projected separately from ownership
+- no V6/V9 remesh repair authority in the C sidecar path
 
-All four tectonic processes are connected and produce geologically plausible results:
+Validated baseline: `0ff3ff0` (`Harden Prototype C freeze invariants`).
 
-- **Subduction** -- paper-aligned uplift with BFS distance fields and slab pull rotation correction
-- **Continental Collision** -- shadow tracker, coherent terrane detection, multi-event execution with radial biweight kernel
-- **Oceanic Generation** -- frontier-pair divergence fill with ridge-shaped elevation profiles
-- **Plate Rifting** -- Poisson-triggered fracture via spherical Voronoi with noise-warped boundaries
+Current validation:
+
+| Area | Status |
+| --- | --- |
+| C freeze tests | Passing |
+| A/B diagnostic tests | Passing |
+| 60k/40 C checkpoints | Exported at steps 0, 100, 200, 400 |
+| 250k/40 C smoke | Exported at step 40 |
+| Persistent ocean crust | Prototype D work |
+| Subduction/collision/rifting/uplift | Prototype D+ work |
 
 ## Architecture
 
-Aurous uses a **v9 ownership-authority model** that intentionally diverges from the paper's query-driven repartition approach. In the paper's model, every remesh re-queries all samples and assigns ownership from plate geometry. This caused 50%+ ownership churn at all tested scales (60k-500k). The v9 model makes ownership persistent by default, with re-evaluation limited to a narrow active boundary zone (~5.8% of samples).
+The active path is the plate-authoritative sidecar:
 
-Key architectural innovations beyond the paper:
+- `FTectonicPlanetSidecar` owns sidecar plate state and carried material.
+- `FTectonicPlanet` receives projected output and remains a cache/carrier for
+  visualization, diagnostics, tests, and exports.
+- Prototype C ownership is `argmax(dot(sample position, rotated plate center))`
+  with lower `PlateId` as deterministic tie-break.
+- Prototype C boundaries are exactly one-ring owner adjacency.
+- Material may disagree with owner. That mismatch is evidence, not repair input.
 
-- **Phase 1d active zone classifier** -- persistent pair-local boundary detection from convergent/divergent velocity evidence
-- **Quiet-interior field preservation** -- prevents interpolation drift of CW, elevation, and thickness for stable interior samples (the root cause of continental ribbonization in naive transfer)
-- **Selective elevation preservation** -- full restore for low-elevation continental plains, blended for mountains, allowing natural erosion of peaks while preventing continental sinking
-- **Active-band field continuity** -- clamping and previous-owner-compatible recovery at remesh boundaries under thesis-scale relief
-
-## Performance
-
-Aurous exceeds the paper's published benchmarks at all tested resolutions:
-
-| Bucket | Paper 60k | Paper 100k | Aurous 60k | Aurous 100k |
-|--------|----------|-----------|-----------|------------|
-| Subduction | 80ms | 140ms | 3ms | 6ms |
-| Collision | 20ms | 40ms | 1ms | 2ms |
-| Elevation | 90ms | 100ms | 3ms | 5ms |
-| Oceanic crust | 580ms | 1,220ms | 12ms | 23ms |
-| **Total (amortized/step)** | **190ms** | **280ms** | **25ms** | **46ms** |
-
-Key optimizations: indexed decrease-key subduction BFS (177x fewer queue operations), plate-level bounding-cap pruning (93% fewer BVH queries), cached adjacency edge distances, and diagnostic attribution gating.
-
-## Validation
-
-Step-200 metrics at 100k samples, 40 plates:
-
-| Metric | Value |
-|--------|-------|
-| Boundary coherence | 0.9726 |
-| Interior leakage | 7.3% |
-| Ownership churn | 2.1% |
-| Continental mean elevation | 1.55 km |
-| Continental p95 elevation | 3.37 km |
-| Largest subaerial continent | 31,727 samples |
-| Broad-seed survival | 82.8% |
-| Collision events (cumulative) | 16+ |
-
-## Paper Alignment
-
-All physics constants verified against Cortial thesis Table 3.2:
-
-- Timestep: 2 My | Planet radius: 6,371 km | Max plate speed: 100 mm/yr
-- Subduction uplift: u0 = 0.6 km/My with f(d), g(v), h(z) transfer functions
-- Erosion: 0.03 mm/yr | Oceanic damping: 0.04 mm/yr | Accretion: 0.3 mm/yr
-- Subduction influence: 1,800 km | Collision influence: 4,200 km
-- Elevation ceiling: 10 km | Trench depth: -10 km | Abyssal plain: -6 km
-
-Known divergences from the paper (documented and intentional):
-- Ownership-authority model instead of query-driven repartition
-- Quiet-interior field preservation (paper has no equivalent)
-- Fixed remesh cadence (16 steps) instead of adaptive
-- Ridge surge toggle available as experimental non-paper variant
+V6/V9 ownership-authority architecture is preserved as historical evidence and
+should not be extended for new tectonic work. See the failure memo for why.
 
 ## Build
 
 Requires Unreal Engine 5.7.
 
+```bat
+Engine\Build\BatchFiles\Build.bat AurousEditor Win64 Development -Project="<path>\Aurous.uproject"
 ```
-# Build from command line
-Engine/Build/BatchFiles/Build.bat AurousEditor Win64 Development -Project="<path>/Aurous.uproject"
 
-# Run tests
-UnrealEditor-Cmd.exe "<path>/Aurous.uproject" -unattended -nop4 -NullRHI -nosplash -nosound -ExecCmds="Automation RunTests Aurous.TectonicPlanet; Quit"
+Run tests with `UnrealEditor-Cmd.exe`:
+
+```bat
+UnrealEditor-Cmd.exe "<path>\Aurous.uproject" -unattended -nop4 -NullRHI -nosplash -nosound -ExecCmds="Automation RunTests Aurous.TectonicPlanet.SidecarPrototypeC; Quit"
 ```
+
+Useful automation groups:
+
+- `Aurous.TectonicPlanet.SidecarPrototypeA`
+- `Aurous.TectonicPlanet.SidecarPrototypeB`
+- `Aurous.TectonicPlanet.SidecarPrototypeC`
+- `Aurous.TectonicPlanet`
 
 ## In-Editor Usage
 
-1. Place a **Tectonic Planet V6 Preview** actor in your level
-2. Click **Generate** in the Details panel
-3. Use **Advance 1/16/100 Steps** to evolve the simulation
-4. Switch visualization: Elevation, PlateId, ContinentalWeight, BoundaryMask
-5. Toggle **Displace By Elevation** for 3D terrain relief
+For the current sidecar path:
+
+1. Place a **Tectonic Planet Sidecar C** actor in the level.
+2. Generate from the actor details or the Aurous tectonic control panel.
+3. Use the control panel to step the sidecar simulation.
+4. Inspect `PlateId`, `BoundaryMask`, `ContinentalWeight`, `MaterialSource`,
+   `MaterialOwnerMismatch`, `MaterialOverlap`, and `DivergentBoundary` outputs.
+
+The legacy V6 preview actor remains available for historical comparisons only.
+
+## Evidence
+
+Load-bearing C evidence is indexed in `docs/evidence/MANIFEST.md`. Generated
+maps live under `Saved/MapExports/SidecarPrototypeC/` and are local artifacts,
+not source-controlled truth by themselves.
 
 ## References
 

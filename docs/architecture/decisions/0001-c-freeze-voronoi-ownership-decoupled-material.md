@@ -1,6 +1,19 @@
-# ADR: Prototype C Freeze
+# 0001: Freeze Prototype C Voronoi Ownership + Decoupled Material
 
+Status: Accepted
 Date: 2026-04-27
+Baseline commit: `0ff3ff0` (`Harden Prototype C freeze invariants`)
+
+## Context
+
+Aurous repeatedly failed when global samples, remesh outputs, or recovered
+ownership fields became tectonic authority. V6/V9 could make some views look
+stable, but the stability came from ownership anchoring, recovery, or repair
+logic rather than plate-local material moving cleanly.
+
+Prototype C was built to freeze the foundation before adding tectonic processes
+back. It makes ownership deliberately boring and keeps carried material separate
+from owner assignment.
 
 ## Decision
 
@@ -121,6 +134,21 @@ Conclusion:
 `MeaningfulHitContainmentScore` is kept as a diagnostic overlap threshold. It is
 not ownership authority and does not mutate sidecar truth.
 
+## Consequences
+
+Good consequences:
+
+- ownership is exclusive and exhaustive by construction
+- boundary masks are raw topology, not recovery overlays
+- material can move coherently without being forced to agree with ownership
+- D has clean signals to consume without rewriting C ownership
+
+Costs:
+
+- C does not yet create persistent ocean crust
+- C does not yet explain uplift, subduction, collision, or rifting
+- C still shares a sidecar class with A/B diagnostic modes until later extraction
+
 ## D Extension Contract
 
 C is Data:
@@ -143,6 +171,20 @@ D may read C signals to form event candidates. D must not mutate C ownership or
 derive ownership from D material state. D persistent state must live in
 sidecar-owned crust/event stores, not in `FTectonicPlanet.Samples` as authority.
 
+## Validation And Evidence
+
+Baseline validation is indexed in `docs/evidence/MANIFEST.md`.
+
+Required acceptance evidence:
+
+- all-sample independent owner recomputation
+- all-sample independent boundary recomputation
+- projection idempotence
+- no V6/v9 contamination tokens in the C source path
+- mandatory C overlay exports
+- 60k/40 long-horizon checkpoints
+- 250k/40 smoke validity
+
 ## Internal Pre-Mortem
 
 If C fails after freeze, likely symptoms are:
@@ -161,6 +203,13 @@ Mitigations in the freeze-hardening PR:
 - explicit actor projection-mode guard
 - export-mode split for material classification and material overlap
 - ADR blocker bar for any coupling or mutation finding
+
+## Alternatives Considered
+
+- V6/V9 ownership authority: rejected after anchoring, churn, and repair-driven boundary failures.
+- Prototype A material-support diagnostic: kept as a diagnostic harness, rejected as foundation.
+- Prototype B explicit footprints: kept as projection proof, rejected as ownership foundation.
+- Immediate persistent crust events: deferred until C invariants are frozen.
 
 ## Follow-Up
 

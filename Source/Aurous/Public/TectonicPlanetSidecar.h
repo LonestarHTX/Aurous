@@ -1,3 +1,12 @@
+/**
+ * Plate-authoritative sidecar architecture.
+ *
+ * Current ADR:
+ * docs/architecture/decisions/0001-c-freeze-voronoi-ownership-decoupled-material.md
+ *
+ * Current state index: docs/STATE.md
+ * Invariants are enforced by Source/Aurous/Private/Tests/TectonicPlanetSidecarTests.cpp.
+ */
 #pragma once
 
 #include "CoreMinimal.h"

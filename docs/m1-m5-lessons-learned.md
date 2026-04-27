@@ -1,3 +1,7 @@
+> **STATUS: HISTORICAL - lessons only.**
+> These notes preserve useful implementation history, but they are not the
+> current architecture. Start from `docs/STATE.md` and ADR 0001 for active work.
+
 # M1-M5 Lessons Learned
 
 **Date:** March 17, 2026

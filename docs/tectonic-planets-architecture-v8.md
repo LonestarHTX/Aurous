@@ -1,3 +1,9 @@
+> **STATUS: SUPERSEDED - historical reference only.**
+> This architecture was falsified or superseded during the 2026 sidecar reset.
+> See `docs/tectonic-architecture-failure-memo-2026-04.md` for the failure
+> analysis and `docs/architecture/decisions/0001-c-freeze-voronoi-ownership-decoupled-material.md`
+> for the current active architecture.
+
 # Procedural Tectonic Planets - Architecture Memo v8
 
 **Based on:** Cortial et al., "Procedural Tectonic Planets" (2019) and thesis follow-up  
