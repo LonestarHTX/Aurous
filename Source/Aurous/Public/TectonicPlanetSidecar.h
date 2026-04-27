@@ -48,13 +48,14 @@ struct AUROUS_API FTectonicSidecarConfig
 	ETectonicSidecarProjectionMode ProjectionMode = ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial;
 	double RecoveryToleranceRad = -1.0;
 	// Prototype C uses this only to classify material-overlap diagnostics, never ownership.
-	double MeaningfulHitContainmentScore = 0.02;
+	double DiagnosticOverlapContainmentScore = 0.02;
 	double DivergenceMinKmPerMy = 0.5;
 	double DivergenceSpeedFraction = 0.05;
 	int32 RidgeGenerationGapSteps = 5;
 	double OverlayContinentalWeightThreshold = 0.5;
 	bool bEnableDivergentSpreadingEvents = false;
 	double DivergentSpreadingMinKmPerMy = 10.0;
+	bool bEnableDOceanCrustProjection = false;
 	bool bForceExplicitProjectionAtRestForTest = false;
 };
 
@@ -225,6 +226,10 @@ public:
 	const TArray<uint8>& GetLastMaterialOwnerMismatchFlags() const { return LastMaterialOwnerMismatchFlags; }
 	const TArray<int32>& GetLastMaterialOverlapCounts() const { return LastMaterialOverlapCounts; }
 	const TArray<uint8>& GetLastDivergentBoundaryFlags() const { return LastDivergentBoundaryFlags; }
+	const TArray<int32>& GetLastOceanCrustIds() const { return LastOceanCrustIds; }
+	const TArray<float>& GetLastOceanCrustAgesMy() const { return LastOceanCrustAgesMy; }
+	const TArray<float>& GetLastOceanCrustThicknessKm() const { return LastOceanCrustThicknessKm; }
+	const TArray<uint8>& GetLastCrustEventOverlayFlags() const { return LastCrustEventOverlayFlags; }
 	const FSidecarOceanCrustStore& GetOceanCrustStore() const { return OceanCrustStore; }
 	const FSidecarCrustEventLog& GetCrustEventLog() const { return CrustEventLog; }
 	int32 GetCurrentStep() const { return CurrentStep; }
@@ -243,6 +248,21 @@ public:
 		double& OutSeparationKmPerMy) const;
 
 private:
+	struct FVoronoiMaterialScratch
+	{
+		TArray<uint8> ExactHitFlags;
+		TArray<uint8> RecoveryFlags;
+		TArray<uint8> OceanFillFlags;
+		TArray<uint8> DivergentOceanFillFlags;
+		TArray<uint8> FabricatedFlags;
+		TArray<uint8> MaterialOwnerMismatchFlags;
+		TArray<uint8> MaterialOverlapFlags;
+		TArray<uint8> DivergentBoundaryFlags;
+		double LocalFootprintContinentalMass = 0.0;
+		double MultiHitProjectedContinentalMass = 0.0;
+		double VisibleProjectedContinentalMass = 0.0;
+	};
+
 	FTectonicSidecarConfig Config;
 	FTectonicPlanet InitialPlanet;
 	TArray<FTectonicSidecarPlate> Plates;
@@ -258,6 +278,10 @@ private:
 	mutable TArray<uint8> LastMaterialOwnerMismatchFlags;
 	mutable TArray<int32> LastMaterialOverlapCounts;
 	mutable TArray<uint8> LastDivergentBoundaryFlags;
+	mutable TArray<int32> LastOceanCrustIds;
+	mutable TArray<float> LastOceanCrustAgesMy;
+	mutable TArray<float> LastOceanCrustThicknessKm;
+	mutable TArray<uint8> LastCrustEventOverlayFlags;
 	int32 CurrentStep = 0;
 
 	void BuildPlatesFromInitialPlanet();
@@ -271,6 +295,9 @@ private:
 	void ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
 		FTectonicPlanet& OutPlanet,
 		FTectonicSidecarProjectionDiagnostics* OutDiagnostics) const;
+	void Phase1ProjectVoronoiOwnership(FTectonicPlanet& InOutPlanet) const;
+	void Phase2ProjectCarriedMaterial(FTectonicPlanet& InOutPlanet, FVoronoiMaterialScratch& Scratch) const;
+	void Phase3ProjectPersistentOceanCrust(FTectonicPlanet& InOutPlanet) const;
 	int32 FindWinningPlateIdForSample(int32 SampleIndex, const FVector3d& UnitPosition) const;
 	int32 FindNearestRotatedCenterPlateId(const FVector3d& UnitPosition) const;
 	const FTectonicSidecarPlate* FindPlateById(int32 PlateId) const;

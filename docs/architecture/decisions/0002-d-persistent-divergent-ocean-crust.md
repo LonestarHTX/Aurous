@@ -126,7 +126,7 @@ Inputs from C:
 - owner adjacency
 - boundary plate pair ids
 - relative plate velocity
-- divergent boundary flags/scores
+- divergence scores recomputed from owner-edge kinematics
 - boundary edges; samples may be used only as debug/projection helpers
 
 D event detection must consume canonical owner-edge primitives, not projection
@@ -139,6 +139,18 @@ Baseline event threshold:
 - normal separation speed >= `10 mm/yr`
 - measured along the local boundary normal or pair separation direction
 - evaluated per boundary edge and aggregated by plate pair
+
+Divergent crust creation also has a dual-divergence invariant:
+
+- the boundary edge must be locally divergent along the canonical edge normal
+- the plate pair's rotated centers must be separating above the same configured
+  threshold
+- both tests are required before creating or extending persistent crust
+
+This prevents locally divergent edge arcs on an otherwise globally convergent
+closed interface from creating ocean crust. Local edge divergence alone is a
+diagnostic signal; persistent spreading requires agreement between the edge and
+the plate-pair separation.
 
 The event-isolation tests must prove no event fires below threshold.
 
@@ -264,6 +276,18 @@ ownership and raw adjacency. D projection may write only material/elevation/age/
 thickness/ridge/event-debug output fields, and only in a post-material phase
 that can inspect already projected carried `ContinentalWeight`.
 
+D projection is gated by `bEnableDOceanCrustProjection`, default `false`, until
+the projection pass is explicitly requested by D tests or later runtime tooling.
+
+Slice 3 uses per-crust rasterization rather than per-sample global search. The
+projection function is `Phase3ProjectPersistentOceanCrust`: for each persistent
+crust record, it uses the record's canonical birth-edge sample ids and debug
+sample ids as world-space lattice anchors, expands by the one-ring sample
+adjacency, sorts/deduplicates the result, and writes D ocean fields only into
+eligible low-continental-weight projected samples. This is a projection helper,
+not authority; the persistent authority remains the crust record's birth edges,
+event log, and hash-covered fields.
+
 Initial D projection must not overwrite meaningful carried continental
 material. Meaningful continental material is defined as projected carried
 `ContinentalWeight >= 0.5` by default. If this becomes configurable, the config
@@ -274,6 +298,11 @@ The D projection elevation seed, once projection lands in a later slice, is:
 - age: `0 My`
 - thickness: `7 km`
 - elevation: `-1 km`
+
+Slice 3 keeps these as constant placeholder projection values. Tests must assert
+projected thickness in `[6.9, 7.1] km` and projected elevation in
+`[-1.1, -0.9] km`; cooling-law thickness/elevation evolution is deferred to a
+separate ADR.
 
 The `-1 km` ridge elevation follows the paper parameter table value `zr`
 (`Highest oceanic ridge elevation`) in `docs/ProceduralTectonicPlanets.txt`. The
@@ -300,6 +329,7 @@ diagnostics.
 Examples:
 
 - expected crust age = elapsed My since `BirthTimeMy`
+- expected projected crust age = (`CurrentStep - BirthStep`) * `DeltaTimeMy`
 - expected creation only when normal separation speed exceeds threshold
 - expected persistent crust area from boundary length, spreading rate, and
   elapsed time with analytic relative error <= 1%
@@ -321,7 +351,8 @@ New D gates:
 - divergent boundary creates nonzero persistent ocean crust
 - crust identity persists at `R+1`, `R+10`, and `R+25`
 - crust age increases with elapsed time
-- crust thickness/elevation remain finite and bounded
+- projected crust thickness remains in `[6.9, 7.1] km`
+- projected crust elevation remains in `[-1.1, -0.9] km`
 - no ocean crust is created when divergence is disabled
 - no ocean crust is created below threshold
 - no ocean crust is created from projection misses or fallback

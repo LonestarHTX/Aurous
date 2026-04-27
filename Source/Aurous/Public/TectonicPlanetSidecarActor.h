@@ -114,7 +114,7 @@ protected:
 	double RecoveryToleranceRad = -1.0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Sidecar C|Projection", meta = (ClampMin = "0.0"))
-	double MeaningfulHitContainmentScore = 0.02;
+	double DiagnosticOverlapContainmentScore = 0.02;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Sidecar C|Projection", meta = (ClampMin = "0.0"))
 	double DivergenceMinKmPerMy = 0.5;

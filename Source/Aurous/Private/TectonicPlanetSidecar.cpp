@@ -80,21 +80,6 @@ namespace
 		double VisibleProjectedContinentalMass = 0.0;
 	};
 
-	struct FSidecarVoronoiMaterialScratch
-	{
-		TArray<uint8> ExactHitFlags;
-		TArray<uint8> RecoveryFlags;
-		TArray<uint8> OceanFillFlags;
-		TArray<uint8> DivergentOceanFillFlags;
-		TArray<uint8> FabricatedFlags;
-		TArray<uint8> MaterialOwnerMismatchFlags;
-		TArray<uint8> MaterialOverlapFlags;
-		TArray<uint8> DivergentBoundaryFlags;
-		double LocalFootprintContinentalMass = 0.0;
-		double MultiHitProjectedContinentalMass = 0.0;
-		double VisibleProjectedContinentalMass = 0.0;
-	};
-
 	double AngularDistanceRad(const FVector3d& A, const FVector3d& B)
 	{
 		const double Dot = FVector3d::DotProduct(A.GetSafeNormal(), B.GetSafeNormal());
@@ -1211,6 +1196,10 @@ void FTectonicPlanetSidecar::Initialize(const FTectonicSidecarConfig& InConfig)
 	LastMaterialOwnerMismatchFlags.Reset();
 	LastMaterialOverlapCounts.Reset();
 	LastDivergentBoundaryFlags.Reset();
+	LastOceanCrustIds.Reset();
+	LastOceanCrustAgesMy.Reset();
+	LastOceanCrustThicknessKm.Reset();
+	LastCrustEventOverlayFlags.Reset();
 	OceanCrustStore.Reset();
 	CrustEventLog.Reset();
 
@@ -1327,13 +1316,14 @@ uint32 FTectonicPlanetSidecar::ComputeSidecarAuthorityHash() const
 	Hash = HashSidecarValue(Hash, Config.bForceZeroAngularSpeeds ? 1u : 0u);
 	Hash = HashSidecarValue(Hash, static_cast<uint32>(Config.ProjectionMode));
 	HashSidecarDouble(Hash, Config.RecoveryToleranceRad);
-	HashSidecarDouble(Hash, Config.MeaningfulHitContainmentScore);
+	HashSidecarDouble(Hash, Config.DiagnosticOverlapContainmentScore);
 	HashSidecarDouble(Hash, Config.DivergenceMinKmPerMy);
 	HashSidecarDouble(Hash, Config.DivergenceSpeedFraction);
 	HashSidecarInt32(Hash, Config.RidgeGenerationGapSteps);
 	HashSidecarDouble(Hash, Config.OverlayContinentalWeightThreshold);
 	Hash = HashSidecarValue(Hash, Config.bEnableDivergentSpreadingEvents ? 1u : 0u);
 	HashSidecarDouble(Hash, Config.DivergentSpreadingMinKmPerMy);
+	Hash = HashSidecarValue(Hash, Config.bEnableDOceanCrustProjection ? 1u : 0u);
 	Hash = HashSidecarValue(Hash, Config.bForceExplicitProjectionAtRestForTest ? 1u : 0u);
 	HashSidecarInt32(Hash, CurrentStep);
 
@@ -2003,12 +1993,12 @@ void FTectonicPlanetSidecar::ProjectExplicitFootprintsToPlanet(
 
 		if (!Hits.IsEmpty())
 		{
-			int32 MeaningfulHitCount = 0;
+			int32 DiagnosticOverlapHitCount = 0;
 			FSidecarFootprintHit BestHit;
 			for (const FSidecarFootprintHit& Hit : Hits)
 			{
 				Scratch.MultiHitProjectedContinentalMass += SampleAreaUnit * Hit.ContinentalWeight;
-				MeaningfulHitCount += Hit.ContainmentScore >= Config.MeaningfulHitContainmentScore ? 1 : 0;
+				DiagnosticOverlapHitCount += Hit.ContainmentScore >= Config.DiagnosticOverlapContainmentScore ? 1 : 0;
 				if (IsBetterFootprintHit(Hit, BestHit))
 				{
 					BestHit = Hit;
@@ -2018,7 +2008,7 @@ void FTectonicPlanetSidecar::ProjectExplicitFootprintsToPlanet(
 			ApplyFootprintHitToSample(BestHit, ProjectedSample);
 			Scratch.ExactHitFlags[SampleIndex] = 1;
 			Scratch.VisibleProjectedContinentalMass += SampleAreaUnit * BestHit.ContinentalWeight;
-			if (MeaningfulHitCount > 1)
+			if (DiagnosticOverlapHitCount > 1)
 			{
 				Scratch.OverlapFlags[SampleIndex] = 1;
 			}
@@ -2188,42 +2178,12 @@ void FTectonicPlanetSidecar::ProjectExplicitFootprintsToPlanet(
 	}
 }
 
-void FTectonicPlanetSidecar::ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
-	FTectonicPlanet& OutPlanet,
-	FTectonicSidecarProjectionDiagnostics* OutDiagnostics) const
+void FTectonicPlanetSidecar::Phase1ProjectVoronoiOwnership(FTectonicPlanet& InOutPlanet) const
 {
-	OutPlanet = InitialPlanet;
-	OutPlanet.CurrentStep = CurrentStep;
-
-	const int32 SampleCount = OutPlanet.Samples.Num();
-	ResetLastProjectionDebug(SampleCount);
-
-	FSidecarVoronoiMaterialScratch Scratch;
-	Scratch.ExactHitFlags.Init(0, SampleCount);
-	Scratch.RecoveryFlags.Init(0, SampleCount);
-	Scratch.OceanFillFlags.Init(0, SampleCount);
-	Scratch.DivergentOceanFillFlags.Init(0, SampleCount);
-	Scratch.FabricatedFlags.Init(0, SampleCount);
-	Scratch.MaterialOwnerMismatchFlags.Init(0, SampleCount);
-	Scratch.MaterialOverlapFlags.Init(0, SampleCount);
-	Scratch.DivergentBoundaryFlags.Init(0, SampleCount);
-
-	for (const FTectonicSidecarPlate& Plate : Plates)
-	{
-		Scratch.LocalFootprintContinentalMass += Plate.InitialFootprintContinentalMass;
-	}
-
-	TArray<TUniquePtr<FSidecarFootprintRuntime>> Runtimes;
-	BuildFootprintRuntimes(Plates, Runtimes);
-	FSidecarProjectedMaterialGrid ProjectedMaterialGrid;
-	BuildProjectedMaterialGrid(Plates, ProjectedMaterialGrid);
-
-	const double SampleAreaUnit = SampleCount > 0 ? (4.0 * PI) / static_cast<double>(SampleCount) : 0.0;
 	const int32 FallbackPlateId = !Plates.IsEmpty() ? Plates[0].PlateId : INDEX_NONE;
-
-	for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	for (int32 SampleIndex = 0; SampleIndex < InOutPlanet.Samples.Num(); ++SampleIndex)
 	{
-		FSample& ProjectedSample = OutPlanet.Samples[SampleIndex];
+		FSample& ProjectedSample = InOutPlanet.Samples[SampleIndex];
 		const FVector3d UnitPosition = ProjectedSample.Position.GetSafeNormal();
 		const int32 OwnerPlateId = FindNearestRotatedCenterPlateId(UnitPosition);
 
@@ -2234,6 +2194,25 @@ void FTectonicPlanetSidecar::ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
 		ProjectedSample.OrogenyType = EOrogenyType::None;
 		ProjectedSample.TerraneId = INDEX_NONE;
 		ProjectedSample.bIsBoundary = false;
+	}
+}
+
+void FTectonicPlanetSidecar::Phase2ProjectCarriedMaterial(
+	FTectonicPlanet& InOutPlanet,
+	FVoronoiMaterialScratch& Scratch) const
+{
+	const int32 SampleCount = InOutPlanet.Samples.Num();
+	TArray<TUniquePtr<FSidecarFootprintRuntime>> Runtimes;
+	BuildFootprintRuntimes(Plates, Runtimes);
+	FSidecarProjectedMaterialGrid ProjectedMaterialGrid;
+	BuildProjectedMaterialGrid(Plates, ProjectedMaterialGrid);
+
+	const double SampleAreaUnit = SampleCount > 0 ? (4.0 * PI) / static_cast<double>(SampleCount) : 0.0;
+
+	for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	{
+		FSample& ProjectedSample = InOutPlanet.Samples[SampleIndex];
+		const FVector3d UnitPosition = ProjectedSample.Position.GetSafeNormal();
 
 		TArray<FSidecarFootprintHit, TInlineAllocator<8>> Hits;
 		for (const TUniquePtr<FSidecarFootprintRuntime>& RuntimePtr : Runtimes)
@@ -2276,7 +2255,7 @@ void FTectonicPlanetSidecar::ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
 		int32 MaterialSourcePlateId = INDEX_NONE;
 		uint8 MaterialClassification =
 			static_cast<uint8>(ETectonicSidecarMaterialClassification::None);
-		int32 MeaningfulHitCount = 0;
+		int32 DiagnosticOverlapHitCount = 0;
 
 		if (!Hits.IsEmpty())
 		{
@@ -2284,7 +2263,7 @@ void FTectonicPlanetSidecar::ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
 			for (const FSidecarFootprintHit& Hit : Hits)
 			{
 				Scratch.MultiHitProjectedContinentalMass += SampleAreaUnit * Hit.ContinentalWeight;
-				MeaningfulHitCount += Hit.ContainmentScore >= Config.MeaningfulHitContainmentScore ? 1 : 0;
+				DiagnosticOverlapHitCount += Hit.ContainmentScore >= Config.DiagnosticOverlapContainmentScore ? 1 : 0;
 				if (IsBetterVisibleMaterialHit(Hit, BestHit))
 				{
 					BestHit = Hit;
@@ -2297,7 +2276,7 @@ void FTectonicPlanetSidecar::ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
 				static_cast<uint8>(ETectonicSidecarMaterialClassification::ExactFootprint);
 			Scratch.ExactHitFlags[SampleIndex] = 1;
 			Scratch.VisibleProjectedContinentalMass += SampleAreaUnit * BestHit.ContinentalWeight;
-			if (MeaningfulHitCount > 1)
+			if (DiagnosticOverlapHitCount > 1)
 			{
 				Scratch.MaterialOverlapFlags[SampleIndex] = 1;
 			}
@@ -2374,7 +2353,7 @@ void FTectonicPlanetSidecar::ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
 		}
 		if (LastMaterialOverlapCounts.IsValidIndex(SampleIndex))
 		{
-			LastMaterialOverlapCounts[SampleIndex] = MeaningfulHitCount;
+			LastMaterialOverlapCounts[SampleIndex] = DiagnosticOverlapHitCount;
 		}
 
 		const bool bOwnerMismatch =
@@ -2393,6 +2372,129 @@ void FTectonicPlanetSidecar::ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
 			Scratch.FabricatedFlags[SampleIndex] = 1;
 		}
 	}
+}
+
+void FTectonicPlanetSidecar::Phase3ProjectPersistentOceanCrust(FTectonicPlanet& InOutPlanet) const
+{
+	if (!Config.bEnableDOceanCrustProjection || OceanCrustStore.Records.IsEmpty())
+	{
+		return;
+	}
+
+	const double CurrentTimeMy = static_cast<double>(CurrentStep) * Config.DeltaTimeMy;
+	for (const FSidecarOceanCrustRecord& Record : OceanCrustStore.Records)
+	{
+		TArray<int32> CandidateSamples = Record.DebugSampleIds;
+		for (const FSidecarOceanCrustBirthEdge& BirthEdge : Record.BirthEdges)
+		{
+			if (BirthEdge.Key.IsValid())
+			{
+				CandidateSamples.Add(BirthEdge.Key.SampleA);
+				CandidateSamples.Add(BirthEdge.Key.SampleB);
+			}
+		}
+
+		const int32 SeedCount = CandidateSamples.Num();
+		for (int32 CandidateIndex = 0; CandidateIndex < SeedCount; ++CandidateIndex)
+		{
+			const int32 SeedSampleIndex = CandidateSamples[CandidateIndex];
+			if (!InOutPlanet.SampleAdjacency.IsValidIndex(SeedSampleIndex))
+			{
+				continue;
+			}
+			for (const int32 NeighborIndex : InOutPlanet.SampleAdjacency[SeedSampleIndex])
+			{
+				CandidateSamples.Add(NeighborIndex);
+			}
+		}
+
+		Algo::Sort(CandidateSamples);
+		int32 WriteIndex = 0;
+		for (int32 ReadIndex = 0; ReadIndex < CandidateSamples.Num(); ++ReadIndex)
+		{
+			const int32 SampleIndex = CandidateSamples[ReadIndex];
+			if (!InOutPlanet.Samples.IsValidIndex(SampleIndex))
+			{
+				continue;
+			}
+			if (WriteIndex == 0 || CandidateSamples[WriteIndex - 1] != SampleIndex)
+			{
+				CandidateSamples[WriteIndex++] = SampleIndex;
+			}
+		}
+		CandidateSamples.SetNum(WriteIndex);
+
+		const float ProjectedAgeMy = static_cast<float>(FMath::Max(0.0, CurrentTimeMy - Record.BirthTimeMy));
+		const float ProjectedThicknessKm = static_cast<float>(Record.ThicknessKm);
+		const float ProjectedElevationKm = static_cast<float>(Record.ElevationSeedKm);
+		for (const int32 SampleIndex : CandidateSamples)
+		{
+			FSample& Sample = InOutPlanet.Samples[SampleIndex];
+			if (Sample.ContinentalWeight >= static_cast<float>(Config.OverlayContinentalWeightThreshold))
+			{
+				continue;
+			}
+
+			Sample.ContinentalWeight = 0.0f;
+			Sample.Thickness = ProjectedThicknessKm;
+			Sample.Age = ProjectedAgeMy;
+			Sample.Elevation = ProjectedElevationKm;
+			Sample.RidgeDirection = Record.RidgeDirection;
+			Sample.FoldDirection = FVector3d::ZeroVector;
+			Sample.OrogenyType = EOrogenyType::None;
+			Sample.TerraneId = INDEX_NONE;
+			Sample.SubductionDistanceKm = -1.0f;
+
+			if (LastOceanCrustIds.IsValidIndex(SampleIndex))
+			{
+				LastOceanCrustIds[SampleIndex] = Record.CrustId;
+			}
+			if (LastOceanCrustAgesMy.IsValidIndex(SampleIndex))
+			{
+				LastOceanCrustAgesMy[SampleIndex] = ProjectedAgeMy;
+			}
+			if (LastOceanCrustThicknessKm.IsValidIndex(SampleIndex))
+			{
+				LastOceanCrustThicknessKm[SampleIndex] = ProjectedThicknessKm;
+			}
+			if (LastCrustEventOverlayFlags.IsValidIndex(SampleIndex))
+			{
+				LastCrustEventOverlayFlags[SampleIndex] = 1;
+			}
+		}
+	}
+}
+
+void FTectonicPlanetSidecar::ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
+	FTectonicPlanet& OutPlanet,
+	FTectonicSidecarProjectionDiagnostics* OutDiagnostics) const
+{
+	OutPlanet = InitialPlanet;
+	OutPlanet.CurrentStep = CurrentStep;
+
+	const int32 SampleCount = OutPlanet.Samples.Num();
+	ResetLastProjectionDebug(SampleCount);
+
+	FVoronoiMaterialScratch Scratch;
+	Scratch.ExactHitFlags.Init(0, SampleCount);
+	Scratch.RecoveryFlags.Init(0, SampleCount);
+	Scratch.OceanFillFlags.Init(0, SampleCount);
+	Scratch.DivergentOceanFillFlags.Init(0, SampleCount);
+	Scratch.FabricatedFlags.Init(0, SampleCount);
+	Scratch.MaterialOwnerMismatchFlags.Init(0, SampleCount);
+	Scratch.MaterialOverlapFlags.Init(0, SampleCount);
+	Scratch.DivergentBoundaryFlags.Init(0, SampleCount);
+
+	// Phase 1: C ownership remains pure nearest-center Voronoi.
+	Phase1ProjectVoronoiOwnership(OutPlanet);
+
+	for (const FTectonicSidecarPlate& Plate : Plates)
+	{
+		Scratch.LocalFootprintContinentalMass += Plate.InitialFootprintContinentalMass;
+	}
+
+	// Phase 2: carried material projects onto the already-owned output samples.
+	Phase2ProjectCarriedMaterial(OutPlanet, Scratch);
 
 	RecomputeProjectedBoundariesAndPlateMembers(OutPlanet);
 
@@ -2415,6 +2517,9 @@ void FTectonicPlanetSidecar::ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
 			}
 		}
 	}
+
+	// Phase 3: persistent D ocean crust overlays only material fields after C material projection.
+	Phase3ProjectPersistentOceanCrust(OutPlanet);
 
 	if (OutDiagnostics != nullptr)
 	{
@@ -3208,4 +3313,8 @@ void FTectonicPlanetSidecar::ResetLastProjectionDebug(const int32 SampleCount) c
 	LastMaterialOwnerMismatchFlags.Init(0, SampleCount);
 	LastMaterialOverlapCounts.Init(0, SampleCount);
 	LastDivergentBoundaryFlags.Init(0, SampleCount);
+	LastOceanCrustIds.Init(INDEX_NONE, SampleCount);
+	LastOceanCrustAgesMy.Init(0.0f, SampleCount);
+	LastOceanCrustThicknessKm.Init(0.0f, SampleCount);
+	LastCrustEventOverlayFlags.Init(0, SampleCount);
 }

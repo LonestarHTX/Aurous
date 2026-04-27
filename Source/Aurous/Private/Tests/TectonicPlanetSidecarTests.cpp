@@ -246,13 +246,14 @@ namespace
 		MixHashUInt32(Hash, Config.bForceZeroAngularSpeeds ? 1u : 0u);
 		MixHashUInt32(Hash, static_cast<uint32>(Config.ProjectionMode));
 		MixHashDouble(Hash, Config.RecoveryToleranceRad);
-		MixHashDouble(Hash, Config.MeaningfulHitContainmentScore);
+		MixHashDouble(Hash, Config.DiagnosticOverlapContainmentScore);
 		MixHashDouble(Hash, Config.DivergenceMinKmPerMy);
 		MixHashDouble(Hash, Config.DivergenceSpeedFraction);
 		MixHashInt32(Hash, Config.RidgeGenerationGapSteps);
 		MixHashDouble(Hash, Config.OverlayContinentalWeightThreshold);
 		MixHashUInt32(Hash, Config.bEnableDivergentSpreadingEvents ? 1u : 0u);
 		MixHashDouble(Hash, Config.DivergentSpreadingMinKmPerMy);
+		MixHashUInt32(Hash, Config.bEnableDOceanCrustProjection ? 1u : 0u);
 		MixHashUInt32(Hash, Config.bForceExplicitProjectionAtRestForTest ? 1u : 0u);
 		MixHashInt32(Hash, Sidecar.GetCurrentStep());
 		const FTectonicPlanet& InitialPlanet = Sidecar.GetInitialPlanet();
@@ -330,6 +331,136 @@ namespace
 		MixHashUInt32(Hash, Sidecar.GetOceanCrustStore().ComputeCanonicalHash());
 		MixHashUInt32(Hash, Sidecar.GetCrustEventLog().ComputeAppendOrderHash());
 		return Hash;
+	}
+
+	uint32 HashProjectionDiagnosticsForTest(const FTectonicSidecarProjectionDiagnostics& D)
+	{
+		uint32 Hash = 2166136261u;
+		MixHashInt32(Hash, D.Step);
+		MixHashInt32(Hash, D.SampleCount);
+		MixHashInt32(Hash, D.PlateCount);
+		MixHashUInt32(Hash, D.ProjectionHash);
+		MixHashDouble(Hash, D.LocalContinentalMass);
+		MixHashDouble(Hash, D.ProjectedContinentalMass);
+		MixHashDouble(Hash, D.MaterialMassRelativeError);
+		MixHashDouble(Hash, D.LocalFootprintContinentalMass);
+		MixHashDouble(Hash, D.MultiHitProjectedContinentalMass);
+		MixHashDouble(Hash, D.VisibleProjectedContinentalMass);
+		MixHashDouble(Hash, D.FootprintMassRelativeError);
+		MixHashDouble(Hash, D.FabricatedMaterialFraction);
+		MixHashDouble(Hash, D.GapFraction);
+		MixHashDouble(Hash, D.DivergentGapFraction);
+		MixHashDouble(Hash, D.NonDivergentGapFraction);
+		MixHashDouble(Hash, D.OverlapFraction);
+		MixHashDouble(Hash, D.OceanFillFraction);
+		MixHashDouble(Hash, D.LargestDivergentGapComponentFraction);
+		MixHashDouble(Hash, D.PlateBoundaryFraction);
+		MixHashDouble(Hash, D.DivergentBoundaryFraction);
+		MixHashInt32(Hash, D.ExactFootprintHitSampleCount);
+		MixHashInt32(Hash, D.RecoveredFootprintSampleCount);
+		MixHashInt32(Hash, D.GapSampleCount);
+		MixHashInt32(Hash, D.DivergentGapSampleCount);
+		MixHashInt32(Hash, D.NonDivergentGapSampleCount);
+		MixHashInt32(Hash, D.OverlapSampleCount);
+		MixHashInt32(Hash, D.OceanFillSampleCount);
+		MixHashInt32(Hash, D.FabricatedMaterialSampleCount);
+		MixHashInt32(Hash, D.ClassifiedSampleCount);
+		MixHashInt32(Hash, D.OutOfSupportSampleCount);
+		MixHashDouble(Hash, D.OutOfSupportFraction);
+		MixHashDouble(Hash, D.MaxSupportDistanceKm);
+		MixHashDouble(Hash, D.MeanSupportDistanceKm);
+		MixHashDouble(Hash, D.MeanProjectedLocalCoreDriftKm);
+		MixHashDouble(Hash, D.MaxProjectedLocalCoreDriftKm);
+		MixHashDouble(Hash, D.MeanKinematicDriftKm);
+		MixHashDouble(Hash, D.MeanProjectedDriftKm);
+		MixHashDouble(Hash, D.MeanDriftMismatchKm);
+		MixHashDouble(Hash, D.MaxDriftMismatchKm);
+		MixHashInt32(Hash, D.DriftPlateCount);
+		MixHashDouble(Hash, D.BoundaryFraction);
+		MixHashDouble(Hash, D.LargePlateMeanDominantComponentFraction);
+		MixHashDouble(Hash, D.TinyComponentFraction);
+		MixHashInt32(Hash, D.RegionComponentCount);
+		MixHashInt32(Hash, D.MultiComponentPlateCount);
+		MixHashDouble(Hash, D.ColdStartPlateMismatchFraction);
+		MixHashDouble(Hash, D.ColdStartContinentalMeanAbsError);
+		MixHashDouble(Hash, D.ColdStartBoundaryFractionDelta);
+		MixHashDouble(Hash, D.OwnershipGapFraction);
+		MixHashDouble(Hash, D.OwnershipOverlapFraction);
+		MixHashDouble(Hash, D.OwnerFragmentationFraction);
+		MixHashDouble(Hash, D.BoundaryNoiseFraction);
+		MixHashDouble(Hash, D.CarriedContinentalMassRelativeError);
+		MixHashDouble(Hash, D.MaterialFabricatedFraction);
+		MixHashDouble(Hash, D.MaterialOwnerMismatchFraction);
+		MixHashDouble(Hash, D.MaterialOverlapFraction);
+		MixHashDouble(Hash, D.HighCWFragmentationDelta);
+		MixHashInt32(Hash, D.OwnershipGapSampleCount);
+		MixHashInt32(Hash, D.OwnershipOverlapSampleCount);
+		MixHashInt32(Hash, D.OwnerFragmentedSampleCount);
+		MixHashInt32(Hash, D.BoundaryNoiseSampleCount);
+		MixHashInt32(Hash, D.MaterialOwnerMismatchSampleCount);
+		MixHashInt32(Hash, D.MaterialOverlapSupportSampleCount);
+		return Hash;
+	}
+
+	bool CheckProjectedSampleArraysEqual(
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const FTectonicPlanet& A,
+		const FTectonicPlanet& B)
+	{
+		if (A.Samples.Num() != B.Samples.Num())
+		{
+			Test.AddError(FString::Printf(TEXT("%s sample count mismatch %d != %d"), *Label, A.Samples.Num(), B.Samples.Num()));
+			return false;
+		}
+		for (int32 SampleIndex = 0; SampleIndex < A.Samples.Num(); ++SampleIndex)
+		{
+			const FSample& SA = A.Samples[SampleIndex];
+			const FSample& SB = B.Samples[SampleIndex];
+			const bool bEqual =
+				(SA.Position - SB.Position).SizeSquared() <= 1.0e-24 &&
+				SA.PlateId == SB.PlateId &&
+				SA.ContinentalWeight == SB.ContinentalWeight &&
+				SA.Elevation == SB.Elevation &&
+				SA.Thickness == SB.Thickness &&
+				SA.Age == SB.Age &&
+				(SA.RidgeDirection - SB.RidgeDirection).SizeSquared() <= 1.0e-24 &&
+				(SA.FoldDirection - SB.FoldDirection).SizeSquared() <= 1.0e-24 &&
+				SA.OrogenyType == SB.OrogenyType &&
+				SA.TerraneId == SB.TerraneId &&
+				SA.SubductionDistanceKm == SB.SubductionDistanceKm &&
+				SA.bIsBoundary == SB.bIsBoundary;
+			if (!bEqual)
+			{
+				Test.AddError(FString::Printf(
+					TEXT("%s sample %d differed PlateId %d/%d CW %.9f/%.9f Elev %.9f/%.9f Thick %.9f/%.9f Age %.9f/%.9f Boundary %d/%d RidgeDelta %.12g FoldDelta %.12g Subduction %.9f/%.9f Orogeny %d/%d Terrane %d/%d PosRad %.12g"),
+					*Label,
+					SampleIndex,
+					SA.PlateId,
+					SB.PlateId,
+					SA.ContinentalWeight,
+					SB.ContinentalWeight,
+					SA.Elevation,
+					SB.Elevation,
+					SA.Thickness,
+					SB.Thickness,
+					SA.Age,
+					SB.Age,
+					SA.bIsBoundary ? 1 : 0,
+					SB.bIsBoundary ? 1 : 0,
+					(SA.RidgeDirection - SB.RidgeDirection).Size(),
+					(SA.FoldDirection - SB.FoldDirection).Size(),
+					SA.SubductionDistanceKm,
+					SB.SubductionDistanceKm,
+					static_cast<int32>(SA.OrogenyType),
+					static_cast<int32>(SB.OrogenyType),
+					SA.TerraneId,
+					SB.TerraneId,
+					(SA.Position - SB.Position).Size()));
+				return false;
+			}
+		}
+		return true;
 	}
 
 	const FTectonicSidecarPlate* FindSidecarPlateByIdForTest(
@@ -613,6 +744,32 @@ namespace
 		return true;
 	}
 
+	bool ExportScalarOverlayFromFloats(
+		FAutomationTestBase& Test,
+		const FString& Prefix,
+		const FTectonicPlanet& Planet,
+		const TArray<float>& Values,
+		const float MinValue,
+		const float MaxValue,
+		const FString& OutputPath)
+	{
+		FString Error;
+		if (!TectonicMollweideExporter::ExportScalarOverlay(
+			Planet,
+			Values,
+			MinValue,
+			MaxValue,
+			OutputPath,
+			SidecarTestExportWidth,
+			SidecarTestExportHeight,
+			Error))
+		{
+			Test.AddError(FString::Printf(TEXT("[%s] scalar overlay failed path=%s error=%s"), *Prefix, *OutputPath, *Error));
+			return false;
+		}
+		return true;
+	}
+
 	bool ExportScalarOverlayFromBytes(
 		FAutomationTestBase& Test,
 		const FString& Prefix,
@@ -704,6 +861,77 @@ namespace
 			if (!PlatformFile.FileExists(*OverlayPath))
 			{
 				Test.AddError(FString::Printf(TEXT("[%s] missing mandatory sidecar overlay %s"), *Prefix, *OverlayPath));
+				bExported = false;
+			}
+		}
+		return bExported;
+	}
+
+	bool ExportSidecarDOverlays(
+		FAutomationTestBase& Test,
+		const FTectonicPlanetSidecar& Sidecar,
+		const FTectonicPlanet& Planet,
+		const FString& OutputDirectory)
+	{
+		const FString Prefix = TEXT("SidecarPrototypeD");
+		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+		PlatformFile.CreateDirectoryTree(*OutputDirectory);
+
+		bool bExported = true;
+		bExported &= ExportScalarOverlayFromInts(
+			Test,
+			Prefix,
+			Planet,
+			Sidecar.GetLastOceanCrustIds(),
+			-1.0f,
+			FMath::Max(1.0f, static_cast<float>(Sidecar.GetOceanCrustStore().NextCrustId)),
+			FPaths::Combine(OutputDirectory, TEXT("OceanCrustId.png")));
+		bExported &= ExportScalarOverlayFromFloats(
+			Test,
+			Prefix,
+			Planet,
+			Sidecar.GetLastOceanCrustAgesMy(),
+			0.0f,
+			FMath::Max(1.0f, static_cast<float>(Planet.CurrentStep * Sidecar.GetConfig().DeltaTimeMy)),
+			FPaths::Combine(OutputDirectory, TEXT("OceanCrustAge.png")));
+		bExported &= ExportScalarOverlayFromFloats(
+			Test,
+			Prefix,
+			Planet,
+			Sidecar.GetLastOceanCrustThicknessKm(),
+			0.0f,
+			10.0f,
+			FPaths::Combine(OutputDirectory, TEXT("OceanCrustThickness.png")));
+		bExported &= ExportScalarOverlayFromBytes(
+			Test,
+			Prefix,
+			Planet,
+			Sidecar.GetLastCrustEventOverlayFlags(),
+			0.0f,
+			1.0f,
+			FPaths::Combine(OutputDirectory, TEXT("CrustEventOverlay.png")));
+		bExported &= ExportScalarOverlayFromBytes(
+			Test,
+			Prefix,
+			Planet,
+			Sidecar.GetLastDivergentBoundaryFlags(),
+			0.0f,
+			1.0f,
+			FPaths::Combine(OutputDirectory, TEXT("DivergentBoundary.png")));
+
+		const TCHAR* MandatoryOverlayNames[] = {
+			TEXT("OceanCrustAge.png"),
+			TEXT("OceanCrustThickness.png"),
+			TEXT("OceanCrustId.png"),
+			TEXT("CrustEventOverlay.png"),
+			TEXT("DivergentBoundary.png")
+		};
+		for (const TCHAR* OverlayName : MandatoryOverlayNames)
+		{
+			const FString OverlayPath = FPaths::Combine(OutputDirectory, OverlayName);
+			if (!PlatformFile.FileExists(*OverlayPath))
+			{
+				Test.AddError(FString::Printf(TEXT("[%s] missing mandatory D overlay %s"), *Prefix, *OverlayPath));
 				bExported = false;
 			}
 		}
@@ -1364,7 +1592,7 @@ namespace
 				TEXT("LastDivergentBoundaryFlags"),
 				TEXT("OceanFallback"),
 				TEXT("DivergentOceanFill"),
-				TEXT("MeaningfulHitContainmentScore"),
+				TEXT("DiagnosticOverlapContainmentScore"),
 				TEXT("QueryOwnership"),
 				TEXT("Repair"),
 				TEXT("Recover"),
@@ -2041,6 +2269,7 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 		MakeSidecarConfig(ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial);
 	TestEqual(TEXT("Prototype D config ridge generation gap defaults to 5 steps"), Config.RidgeGenerationGapSteps, 5);
 	TestEqual(TEXT("Prototype D config overlay continental threshold defaults to 0.5"), Config.OverlayContinentalWeightThreshold, 0.5);
+	TestEqual(TEXT("Prototype D ocean crust projection defaults off"), Config.bEnableDOceanCrustProjection, false);
 
 	FTectonicPlanetSidecar EmptyA;
 	FTectonicPlanetSidecar EmptyB;
@@ -2053,6 +2282,45 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 		TEXT("Prototype D empty authority hash is deterministic across identical configs"),
 		EmptyA.ComputeSidecarAuthorityHash(),
 		EmptyB.ComputeSidecarAuthorityHash());
+
+	{
+		FTectonicPlanet EmptyProjectedA;
+		FTectonicPlanet EmptyProjectedB;
+		FTectonicSidecarProjectionDiagnostics EmptyDiagnosticsA;
+		FTectonicSidecarProjectionDiagnostics EmptyDiagnosticsB;
+		const uint32 EmptyAuthorityBeforeProjection = EmptyA.ComputeSidecarAuthorityHash();
+		EmptyA.ProjectToPlanet(EmptyProjectedA, &EmptyDiagnosticsA);
+		EmptyA.ProjectToPlanet(EmptyProjectedB, &EmptyDiagnosticsB);
+		CheckProjectedSampleArraysEqual(*this, TEXT("Prototype D empty Phase3/Slice2 baseline"), EmptyProjectedA, EmptyProjectedB);
+		TestEqual(
+			TEXT("Prototype D empty Phase3/Slice2 diagnostics struct equality"),
+			HashProjectionDiagnosticsForTest(EmptyDiagnosticsA),
+			HashProjectionDiagnosticsForTest(EmptyDiagnosticsB));
+		TestEqual(
+			TEXT("Prototype D empty Phase3/Slice2 authority hash equality"),
+			EmptyAuthorityBeforeProjection,
+			EmptyA.ComputeSidecarAuthorityHash());
+		TestEqual(
+			TEXT("Prototype D empty Phase3/Slice2 projection hash equality"),
+			EmptyDiagnosticsA.ProjectionHash,
+			EmptyDiagnosticsB.ProjectionHash);
+
+		int32 NonBackgroundCrustIds = 0;
+		int32 NonBackgroundCrustAges = 0;
+		int32 NonBackgroundCrustThickness = 0;
+		int32 NonBackgroundCrustEvents = 0;
+		for (int32 SampleIndex = 0; SampleIndex < EmptyProjectedA.Samples.Num(); ++SampleIndex)
+		{
+			NonBackgroundCrustIds += EmptyA.GetLastOceanCrustIds()[SampleIndex] != INDEX_NONE ? 1 : 0;
+			NonBackgroundCrustAges += EmptyA.GetLastOceanCrustAgesMy()[SampleIndex] != 0.0f ? 1 : 0;
+			NonBackgroundCrustThickness += EmptyA.GetLastOceanCrustThicknessKm()[SampleIndex] != 0.0f ? 1 : 0;
+			NonBackgroundCrustEvents += EmptyA.GetLastCrustEventOverlayFlags()[SampleIndex] != 0 ? 1 : 0;
+		}
+		TestEqual(TEXT("Prototype D empty ocean crust id overlay is uniform background"), NonBackgroundCrustIds, 0);
+		TestEqual(TEXT("Prototype D empty ocean crust age overlay is uniform background"), NonBackgroundCrustAges, 0);
+		TestEqual(TEXT("Prototype D empty ocean crust thickness overlay is uniform background"), NonBackgroundCrustThickness, 0);
+		TestEqual(TEXT("Prototype D empty crust event overlay is uniform background"), NonBackgroundCrustEvents, 0);
+	}
 
 	{
 		FTectonicPlanetSidecar MotionOnly;
@@ -2287,6 +2555,7 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 	{
 		FTectonicSidecarConfig EventConfig = Config;
 		EventConfig.bEnableDivergentSpreadingEvents = true;
+		EventConfig.bEnableDOceanCrustProjection = true;
 		EventConfig.DivergentSpreadingMinKmPerMy = 10.0;
 
 		FTectonicSidecarConfig ExpectedConfig = EventConfig;
@@ -2371,8 +2640,12 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 		const uint32 AuthorityBeforeProjection = EventSidecar.ComputeSidecarAuthorityHash();
 		const int32 CrustCountBeforeProjection = EventSidecar.GetOceanCrustStore().Num();
 		const int32 EventCountBeforeProjection = EventSidecar.GetCrustEventLog().Num();
+		FTectonicPlanet BaselineProjected;
+		FTectonicSidecarProjectionDiagnostics BaselineProjectionDiagnostics;
+		ExpectedSidecar.ProjectToPlanet(BaselineProjected, &BaselineProjectionDiagnostics);
 		FTectonicPlanet Projected;
-		EventSidecar.ProjectToPlanet(Projected);
+		FTectonicSidecarProjectionDiagnostics ProjectedDiagnostics;
+		EventSidecar.ProjectToPlanet(Projected, &ProjectedDiagnostics);
 		TestEqual(TEXT("Prototype D runtime projection remains idempotent with D state"),
 			AuthorityBeforeProjection,
 			EventSidecar.ComputeSidecarAuthorityHash());
@@ -2382,6 +2655,70 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 		TestEqual(TEXT("Prototype D runtime projection preserves event count"),
 			EventCountBeforeProjection,
 			EventSidecar.GetCrustEventLog().Num());
+
+		int32 ProjectedCrustSampleCount = 0;
+		for (int32 SampleIndex = 0; SampleIndex < Projected.Samples.Num(); ++SampleIndex)
+		{
+			const FSample& BaselineSample = BaselineProjected.Samples[SampleIndex];
+			const FSample& ProjectedSample = Projected.Samples[SampleIndex];
+			TestEqual(TEXT("Prototype D projection never changes PlateId"),
+				ProjectedSample.PlateId,
+				BaselineSample.PlateId);
+			TestEqual(TEXT("Prototype D projection never changes bIsBoundary"),
+				ProjectedSample.bIsBoundary,
+				BaselineSample.bIsBoundary);
+			if (BaselineSample.ContinentalWeight >= static_cast<float>(EventConfig.OverlayContinentalWeightThreshold))
+			{
+				TestEqual(TEXT("Prototype D projection does not overwrite high-CW continental material"),
+					ProjectedSample.ContinentalWeight,
+					BaselineSample.ContinentalWeight);
+				TestEqual(TEXT("Prototype D projection does not overwrite high-CW elevation"),
+					ProjectedSample.Elevation,
+					BaselineSample.Elevation);
+				TestEqual(TEXT("Prototype D projection does not overwrite high-CW thickness"),
+					ProjectedSample.Thickness,
+					BaselineSample.Thickness);
+				TestEqual(TEXT("Prototype D projection does not overwrite high-CW age"),
+					ProjectedSample.Age,
+					BaselineSample.Age);
+			}
+
+			if (EventSidecar.GetLastOceanCrustIds().IsValidIndex(SampleIndex) &&
+				EventSidecar.GetLastOceanCrustIds()[SampleIndex] != INDEX_NONE)
+			{
+				++ProjectedCrustSampleCount;
+				const int32 CrustId = EventSidecar.GetLastOceanCrustIds()[SampleIndex];
+				const FSidecarOceanCrustRecord* Record =
+					FindCrustRecordByIdForTest(EventSidecar.GetOceanCrustStore(), CrustId);
+				TestTrue(TEXT("Prototype D projected crust id resolves to persistent record"), Record != nullptr);
+				if (Record != nullptr)
+				{
+					const double ExpectedAgeMy =
+						static_cast<double>(EventSidecar.GetCurrentStep() - Record->BirthStep) *
+						EventConfig.DeltaTimeMy;
+					TestTrue(TEXT("Prototype D projected age matches independent step math"),
+						FMath::Abs(static_cast<double>(ProjectedSample.Age) - ExpectedAgeMy) <= 1.0e-6);
+					TestTrue(TEXT("Prototype D age overlay matches independent step math"),
+						FMath::Abs(static_cast<double>(EventSidecar.GetLastOceanCrustAgesMy()[SampleIndex]) - ExpectedAgeMy) <= 1.0e-6);
+					TestTrue(TEXT("Prototype D projected thickness uses Slice 2 placeholder bounds"),
+						ProjectedSample.Thickness >= 6.9f && ProjectedSample.Thickness <= 7.1f);
+					TestTrue(TEXT("Prototype D thickness overlay uses Slice 2 placeholder bounds"),
+						EventSidecar.GetLastOceanCrustThicknessKm()[SampleIndex] >= 6.9f &&
+						EventSidecar.GetLastOceanCrustThicknessKm()[SampleIndex] <= 7.1f);
+					TestTrue(TEXT("Prototype D projected elevation uses Slice 2 placeholder bounds"),
+						ProjectedSample.Elevation >= -1.1f && ProjectedSample.Elevation <= -0.9f);
+				}
+			}
+		}
+		TestTrue(TEXT("Prototype D projection marks nonblank persistent ocean crust samples"),
+			ProjectedCrustSampleCount > 0);
+
+		const FString DOverlayDirectory = FPaths::Combine(
+			BuildSidecarExportRoot(TEXT("SidecarPrototypeD")),
+			TEXT("slice3_projection"),
+			FString::Printf(TEXT("step_%03d"), EventSidecar.GetCurrentStep()));
+		TestTrue(TEXT("Prototype D mandatory overlays export"),
+			ExportSidecarDOverlays(*this, EventSidecar, Projected, DOverlayDirectory));
 
 		FTectonicPlanetSidecar DeterminismA;
 		FTectonicPlanetSidecar DeterminismB;

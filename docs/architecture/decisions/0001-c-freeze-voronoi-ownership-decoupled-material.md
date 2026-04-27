@@ -109,7 +109,7 @@ does not create persistent ocean material or mutate sidecar truth. If D creates
 ocean crust, it must do so through a named persistent event, not this projection
 classification.
 
-### `MeaningfulHitContainmentScore`
+### `DiagnosticOverlapContainmentScore`
 
 Where read:
 
@@ -131,7 +131,7 @@ What it does not touch:
 
 Conclusion:
 
-`MeaningfulHitContainmentScore` is kept as a diagnostic overlap threshold. It is
+`DiagnosticOverlapContainmentScore` is kept as a diagnostic overlap threshold. It is
 not ownership authority and does not mutate sidecar truth.
 
 ## Consequences

@@ -119,6 +119,27 @@ namespace
 			OutError);
 	}
 
+	bool ExportScalarOverlayFromFloats(
+		const FTectonicPlanet& Planet,
+		const TArray<float>& Values,
+		const float MinValue,
+		const float MaxValue,
+		const FString& OutputPath,
+		const int32 Width,
+		const int32 Height,
+		FString& OutError)
+	{
+		return TectonicMollweideExporter::ExportScalarOverlay(
+			Planet,
+			Values,
+			MinValue,
+			MaxValue,
+			OutputPath,
+			Width,
+			Height,
+			OutError);
+	}
+
 	bool ExportScalarOverlayFromBytes(
 		const FTectonicPlanet& Planet,
 		const TArray<uint8>& Values,
@@ -179,7 +200,7 @@ FTectonicSidecarConfig ATectonicPlanetSidecarActor::BuildSidecarConfig() const
 	Config.bForceZeroAngularSpeeds = bForceZeroAngularSpeeds;
 	Config.ProjectionMode = ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial;
 	Config.RecoveryToleranceRad = RecoveryToleranceRad;
-	Config.MeaningfulHitContainmentScore = MeaningfulHitContainmentScore;
+	Config.DiagnosticOverlapContainmentScore = DiagnosticOverlapContainmentScore;
 	Config.DivergenceMinKmPerMy = DivergenceMinKmPerMy;
 	Config.DivergenceSpeedFraction = DivergenceSpeedFraction;
 	return Config;
@@ -487,6 +508,59 @@ bool ATectonicPlanetSidecarActor::ExportCurrentMaps(
 			0.0f,
 			1.0f,
 			FPaths::Combine(OutDirectory, TEXT("DivergentBoundary.png")),
+			Width,
+			Height,
+			OutError))
+		{
+			return false;
+		}
+
+		const float CrustIdMax = FMath::Max(1.0f, static_cast<float>(Sidecar.GetOceanCrustStore().NextCrustId));
+		if (!ExportScalarOverlayFromInts(
+			ProjectedPlanet,
+			Sidecar.GetLastOceanCrustIds(),
+			-1.0f,
+			CrustIdMax,
+			FPaths::Combine(OutDirectory, TEXT("OceanCrustId.png")),
+			Width,
+			Height,
+			OutError))
+		{
+			return false;
+		}
+
+		if (!ExportScalarOverlayFromFloats(
+			ProjectedPlanet,
+			Sidecar.GetLastOceanCrustAgesMy(),
+			0.0f,
+			FMath::Max(1.0f, static_cast<float>(ProjectedPlanet.CurrentStep * Sidecar.GetConfig().DeltaTimeMy)),
+			FPaths::Combine(OutDirectory, TEXT("OceanCrustAge.png")),
+			Width,
+			Height,
+			OutError))
+		{
+			return false;
+		}
+
+		if (!ExportScalarOverlayFromFloats(
+			ProjectedPlanet,
+			Sidecar.GetLastOceanCrustThicknessKm(),
+			0.0f,
+			10.0f,
+			FPaths::Combine(OutDirectory, TEXT("OceanCrustThickness.png")),
+			Width,
+			Height,
+			OutError))
+		{
+			return false;
+		}
+
+		if (!ExportScalarOverlayFromBytes(
+			ProjectedPlanet,
+			Sidecar.GetLastCrustEventOverlayFlags(),
+			0.0f,
+			1.0f,
+			FPaths::Combine(OutDirectory, TEXT("CrustEventOverlay.png")),
 			Width,
 			Height,
 			OutError))
