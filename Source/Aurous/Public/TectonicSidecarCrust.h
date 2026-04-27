@@ -56,6 +56,7 @@ struct AUROUS_API FSidecarDivergentSpreadingEventInput
 {
 	int32 PlateA = INDEX_NONE;
 	int32 PlateB = INDEX_NONE;
+	FSidecarBoundaryEdgeKey ComponentId;
 	int32 RidgeGenerationId = 0;
 	int32 ParentEventId = INDEX_NONE;
 	TArray<FSidecarOceanCrustBirthEdge> BirthEdges;
@@ -72,12 +73,16 @@ struct AUROUS_API FSidecarOceanCrustRecord
 	int32 CrustId = INDEX_NONE;
 	int32 PlateA = INDEX_NONE;
 	int32 PlateB = INDEX_NONE;
+	FSidecarBoundaryEdgeKey ComponentId;
 	int32 BirthStep = 0;
 	double BirthTimeMy = 0.0;
 	int32 LastUpdatedStep = 0;
+	int32 LastAcceptedStep = INDEX_NONE;
 	int32 RidgeGenerationId = 0;
 	int32 ParentEventId = INDEX_NONE;
 	TArray<FSidecarOceanCrustBirthEdge> BirthEdges;
+	TArray<FSidecarBoundaryEdgeKey> LastAcceptedSourceEdges;
+	TArray<FVector3d> LastAcceptedEdgeMidpoints;
 	TArray<int32> DebugSampleIds;
 	FVector3d RidgeDirection = FVector3d::ZeroVector;
 	double CreatedAreaKm2 = 0.0;
@@ -95,6 +100,7 @@ struct AUROUS_API FSidecarCrustEventRecord
 	int32 CrustId = INDEX_NONE;
 	int32 PlateA = INDEX_NONE;
 	int32 PlateB = INDEX_NONE;
+	FSidecarBoundaryEdgeKey ComponentId;
 	int32 Step = 0;
 	double TimeMy = 0.0;
 	int32 RidgeGenerationId = 0;
@@ -125,3 +131,14 @@ struct AUROUS_API FSidecarCrustEventLog
 	int32 Num() const { return Events.Num(); }
 	uint32 ComputeAppendOrderHash() const;
 };
+
+AUROUS_API bool ApplyDivergentSpreadingEvent(
+	FSidecarOceanCrustStore& InOutStore,
+	FSidecarCrustEventLog& InOutEventLog,
+	const FSidecarDivergentSpreadingEventInput& Input,
+	int32 CurrentStep,
+	double CurrentTimeMy,
+	int32 RidgeGenerationGapSteps,
+	double CoalescingToleranceRad,
+	int32* OutCrustId = nullptr,
+	int32* OutEventId = nullptr);

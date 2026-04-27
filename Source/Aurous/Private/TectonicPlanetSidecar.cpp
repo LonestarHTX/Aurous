@@ -133,6 +133,57 @@ namespace
 			(Plate.AngularSpeedRadPerMy * PlanetRadiusKm);
 	}
 
+	bool ComputeBoundaryLowToHighDirection(
+		const FTectonicSidecarPlate& LowPlate,
+		const FTectonicSidecarPlate& HighPlate,
+		const FSidecarOwnerEdge& OwnerEdge,
+		FVector3d& OutDirection)
+	{
+		const FVector3d QueryPoint = NormalizeOrFallback(OwnerEdge.Midpoint, OwnerEdge.SampleAPosition);
+		const FVector3d LowCenter =
+			LowPlate.WorldFromLocal.RotateVector(LowPlate.InitialCenter).GetSafeNormal();
+		const FVector3d HighCenter =
+			HighPlate.WorldFromLocal.RotateVector(HighPlate.InitialCenter).GetSafeNormal();
+		const FVector3d CenterDirection = ProjectOntoTangent(HighCenter - LowCenter, QueryPoint);
+		OutDirection = CenterDirection.GetSafeNormal();
+		if (OutDirection.IsNearlyZero())
+		{
+			const FVector3d EdgeTangent = ProjectOntoTangent(
+				OwnerEdge.SampleBPosition - OwnerEdge.SampleAPosition,
+				QueryPoint).GetSafeNormal();
+			OutDirection = FVector3d::CrossProduct(QueryPoint, EdgeTangent).GetSafeNormal();
+			if (OutDirection.Dot(CenterDirection) < 0.0)
+			{
+				OutDirection *= -1.0;
+			}
+		}
+		return !OutDirection.IsNearlyZero();
+	}
+
+	bool ComputePlateCenterSeparationKmPerMy(
+		const FTectonicSidecarPlate& LowPlate,
+		const FTectonicSidecarPlate& HighPlate,
+		const double PlanetRadiusKm,
+		double& OutSeparationKmPerMy)
+	{
+		OutSeparationKmPerMy = 0.0;
+		const FVector3d LowCenter =
+			LowPlate.WorldFromLocal.RotateVector(LowPlate.InitialCenter).GetSafeNormal();
+		const FVector3d HighCenter =
+			HighPlate.WorldFromLocal.RotateVector(HighPlate.InitialCenter).GetSafeNormal();
+		const FVector3d QueryPoint = NormalizeOrFallback(LowCenter + HighCenter, LowCenter);
+		const FVector3d LowToHigh = ProjectOntoTangent(HighCenter - LowCenter, QueryPoint).GetSafeNormal();
+		if (LowToHigh.IsNearlyZero())
+		{
+			return false;
+		}
+
+		const FVector3d LowVelocity = ComputeSidecarSurfaceVelocity(LowPlate, QueryPoint, PlanetRadiusKm);
+		const FVector3d HighVelocity = ComputeSidecarSurfaceVelocity(HighPlate, QueryPoint, PlanetRadiusKm);
+		OutSeparationKmPerMy = (HighVelocity - LowVelocity).Dot(LowToHigh);
+		return true;
+	}
+
 	FVector3d ComputePlanarBarycentric(
 		const FVector3d& A,
 		const FVector3d& B,
@@ -1223,6 +1274,10 @@ void FTectonicPlanetSidecar::AdvanceStep()
 	}
 
 	++CurrentStep;
+	if (Config.bEnableDivergentSpreadingEvents)
+	{
+		ApplyDivergentSpreadingEventsForCurrentStep();
+	}
 }
 
 void FTectonicPlanetSidecar::AdvanceSteps(const int32 StepCount)
@@ -1277,6 +1332,8 @@ uint32 FTectonicPlanetSidecar::ComputeSidecarAuthorityHash() const
 	HashSidecarDouble(Hash, Config.DivergenceSpeedFraction);
 	HashSidecarInt32(Hash, Config.RidgeGenerationGapSteps);
 	HashSidecarDouble(Hash, Config.OverlayContinentalWeightThreshold);
+	Hash = HashSidecarValue(Hash, Config.bEnableDivergentSpreadingEvents ? 1u : 0u);
+	HashSidecarDouble(Hash, Config.DivergentSpreadingMinKmPerMy);
 	Hash = HashSidecarValue(Hash, Config.bForceExplicitProjectionAtRestForTest ? 1u : 0u);
 	HashSidecarInt32(Hash, CurrentStep);
 
@@ -1395,15 +1452,6 @@ bool FTectonicPlanetSidecar::ApplyDivergentSpreadingEventForTest(
 	int32* OutCrustId,
 	int32* OutEventId)
 {
-	if (OutCrustId != nullptr)
-	{
-		*OutCrustId = INDEX_NONE;
-	}
-	if (OutEventId != nullptr)
-	{
-		*OutEventId = INDEX_NONE;
-	}
-
 	if (Input.PlateA == INDEX_NONE ||
 		Input.PlateB == INDEX_NONE ||
 		Input.PlateA == Input.PlateB ||
@@ -1414,91 +1462,17 @@ bool FTectonicPlanetSidecar::ApplyDivergentSpreadingEventForTest(
 		return false;
 	}
 
-	const int32 LowPlateId = FMath::Min(Input.PlateA, Input.PlateB);
-	const int32 HighPlateId = FMath::Max(Input.PlateA, Input.PlateB);
-
-	TArray<FSidecarOceanCrustBirthEdge> BirthEdges = Input.BirthEdges;
-	for (FSidecarOceanCrustBirthEdge& Edge : BirthEdges)
-	{
-		Edge.Key = FSidecarBoundaryEdgeKey::Make(Edge.Key.SampleA, Edge.Key.SampleB);
-		if (!Edge.Key.IsValid())
-		{
-			return false;
-		}
-		Edge.EndpointA = NormalizeOrFallback(Edge.EndpointA, FVector3d(1.0, 0.0, 0.0));
-		Edge.EndpointB = NormalizeOrFallback(Edge.EndpointB, Edge.EndpointA);
-		const FVector3d EdgeNormalFallback = NormalizeOrFallback(
-			FVector3d::CrossProduct(Edge.EndpointA, Edge.EndpointB),
-			MakeTangentFallback(Edge.EndpointA));
-		Edge.BoundaryNormal = NormalizeOrFallback(Edge.BoundaryNormal, EdgeNormalFallback);
-	}
-	Algo::Sort(BirthEdges, [](const FSidecarOceanCrustBirthEdge& A, const FSidecarOceanCrustBirthEdge& B)
-	{
-		return A.Key < B.Key;
-	});
-
-	TArray<int32> DebugSampleIds = Input.DebugSampleIds;
-	Algo::Sort(DebugSampleIds);
-
-	TArray<FSidecarBoundaryEdgeKey> SourceEdges;
-	SourceEdges.Reserve(BirthEdges.Num());
-	double MeanNormalSeparationKmPerMy = 0.0;
-	for (const FSidecarOceanCrustBirthEdge& Edge : BirthEdges)
-	{
-		if (SourceEdges.IsEmpty() || !(SourceEdges.Last() == Edge.Key))
-		{
-			SourceEdges.Add(Edge.Key);
-		}
-		MeanNormalSeparationKmPerMy += Edge.NormalSeparationKmPerMy;
-	}
-	MeanNormalSeparationKmPerMy /= static_cast<double>(BirthEdges.Num());
-
-	const int32 CrustId = OceanCrustStore.NextCrustId++;
-	const int32 EventId = CrustEventLog.NextEventId++;
 	const double CurrentTimeMy = static_cast<double>(CurrentStep) * Config.DeltaTimeMy;
-
-	FSidecarOceanCrustRecord CrustRecord;
-	CrustRecord.CrustId = CrustId;
-	CrustRecord.PlateA = LowPlateId;
-	CrustRecord.PlateB = HighPlateId;
-	CrustRecord.BirthStep = CurrentStep;
-	CrustRecord.BirthTimeMy = CurrentTimeMy;
-	CrustRecord.LastUpdatedStep = CurrentStep;
-	CrustRecord.RidgeGenerationId = Input.RidgeGenerationId;
-	CrustRecord.ParentEventId = Input.ParentEventId;
-	CrustRecord.BirthEdges = BirthEdges;
-	CrustRecord.DebugSampleIds = DebugSampleIds;
-	CrustRecord.RidgeDirection = NormalizeOrFallback(Input.RidgeDirection, BirthEdges[0].BoundaryNormal);
-	CrustRecord.CreatedAreaKm2 = Input.CreatedAreaKm2;
-	CrustRecord.AgeMy = Input.OceanicAgeMy;
-	CrustRecord.ThicknessKm = Input.OceanicThicknessKm;
-	CrustRecord.ElevationSeedKm = Input.ElevationSeedKm;
-	OceanCrustStore.Records.Add(CrustRecord);
-
-	FSidecarCrustEventRecord EventRecord;
-	EventRecord.EventId = EventId;
-	EventRecord.EventType = ETectonicSidecarCrustEventType::DivergentSpreading;
-	EventRecord.CrustId = CrustId;
-	EventRecord.PlateA = LowPlateId;
-	EventRecord.PlateB = HighPlateId;
-	EventRecord.Step = CurrentStep;
-	EventRecord.TimeMy = CurrentTimeMy;
-	EventRecord.RidgeGenerationId = Input.RidgeGenerationId;
-	EventRecord.ParentEventId = Input.ParentEventId;
-	EventRecord.SourceEdges = SourceEdges;
-	EventRecord.CreatedAreaKm2 = Input.CreatedAreaKm2;
-	EventRecord.NormalSeparationKmPerMy = MeanNormalSeparationKmPerMy;
-	CrustEventLog.Events.Add(EventRecord);
-
-	if (OutCrustId != nullptr)
-	{
-		*OutCrustId = CrustId;
-	}
-	if (OutEventId != nullptr)
-	{
-		*OutEventId = EventId;
-	}
-	return true;
+	return ApplyDivergentSpreadingEvent(
+		OceanCrustStore,
+		CrustEventLog,
+		Input,
+		CurrentStep,
+		CurrentTimeMy,
+		Config.RidgeGenerationGapSteps,
+		0.0,
+		OutCrustId,
+		OutEventId);
 }
 
 TArray<FSidecarOwnerEdge> FTectonicPlanetSidecar::EnumerateOwnerEdgesSorted() const
@@ -1577,32 +1551,264 @@ bool FTectonicPlanetSidecar::ComputeBoundaryNormalSeparationKmPerMy(
 		return false;
 	}
 
-	const FVector3d QueryPoint = NormalizeOrFallback(OwnerEdge.Midpoint, OwnerEdge.SampleAPosition);
-	const FVector3d LowCenter =
-		LowPlate->WorldFromLocal.RotateVector(LowPlate->InitialCenter).GetSafeNormal();
-	const FVector3d HighCenter =
-		HighPlate->WorldFromLocal.RotateVector(HighPlate->InitialCenter).GetSafeNormal();
-	FVector3d LowToHigh = ProjectOntoTangent(HighCenter - LowCenter, QueryPoint).GetSafeNormal();
-	if (LowToHigh.IsNearlyZero())
-	{
-		const FVector3d EdgeTangent = ProjectOntoTangent(
-			OwnerEdge.SampleBPosition - OwnerEdge.SampleAPosition,
-			QueryPoint).GetSafeNormal();
-		LowToHigh = FVector3d::CrossProduct(QueryPoint, EdgeTangent).GetSafeNormal();
-		if (LowToHigh.Dot(ProjectOntoTangent(HighCenter - LowCenter, QueryPoint)) < 0.0)
-		{
-			LowToHigh *= -1.0;
-		}
-	}
-	if (LowToHigh.IsNearlyZero())
+	FVector3d LowToHigh = FVector3d::ZeroVector;
+	if (!ComputeBoundaryLowToHighDirection(*LowPlate, *HighPlate, OwnerEdge, LowToHigh))
 	{
 		return false;
 	}
 
+	const FVector3d QueryPoint = NormalizeOrFallback(OwnerEdge.Midpoint, OwnerEdge.SampleAPosition);
 	const FVector3d LowVelocity = ComputeSidecarSurfaceVelocity(*LowPlate, QueryPoint, Config.PlanetRadiusKm);
 	const FVector3d HighVelocity = ComputeSidecarSurfaceVelocity(*HighPlate, QueryPoint, Config.PlanetRadiusKm);
 	OutSeparationKmPerMy = (HighVelocity - LowVelocity).Dot(LowToHigh);
 	return true;
+}
+
+void FTectonicPlanetSidecar::ApplyDivergentSpreadingEventsForCurrentStep()
+{
+	struct FAcceptedDivergentEdge
+	{
+		FSidecarOwnerEdge OwnerEdge;
+		FVector3d BoundaryNormal = FVector3d::ZeroVector;
+		double NormalSeparationKmPerMy = 0.0;
+		double EdgeLengthKm = 0.0;
+		double CreatedAreaKm2 = 0.0;
+	};
+
+	struct FEndpointRef
+	{
+		int32 SampleId = INDEX_NONE;
+		int32 LocalEdgeIndex = INDEX_NONE;
+	};
+
+	struct FEdgeComponent
+	{
+		int32 LowPlateId = INDEX_NONE;
+		int32 HighPlateId = INDEX_NONE;
+		FSidecarBoundaryEdgeKey ComponentId;
+		TArray<int32> LocalEdgeIndices;
+	};
+
+	const double CurrentTimeMy = static_cast<double>(CurrentStep) * Config.DeltaTimeMy;
+	for (FSidecarOceanCrustRecord& Record : OceanCrustStore.Records)
+	{
+		Record.AgeMy = FMath::Max(0.0, CurrentTimeMy - Record.BirthTimeMy);
+	}
+
+	TArray<FAcceptedDivergentEdge> AcceptedEdges;
+	const TArray<FSidecarOwnerEdge> OwnerEdges = EnumerateOwnerEdgesSorted();
+	for (const FSidecarOwnerEdge& OwnerEdge : OwnerEdges)
+	{
+		double NormalSeparationKmPerMy = 0.0;
+		if (!ComputeBoundaryNormalSeparationKmPerMy(OwnerEdge, NormalSeparationKmPerMy) ||
+			NormalSeparationKmPerMy < Config.DivergentSpreadingMinKmPerMy)
+		{
+			continue;
+		}
+
+		const FTectonicSidecarPlate* LowPlate = FindPlateById(OwnerEdge.LowPlateId);
+		const FTectonicSidecarPlate* HighPlate = FindPlateById(OwnerEdge.HighPlateId);
+		if (LowPlate == nullptr || HighPlate == nullptr)
+		{
+			continue;
+		}
+		double PairSeparationKmPerMy = 0.0;
+		if (!ComputePlateCenterSeparationKmPerMy(
+				*LowPlate,
+				*HighPlate,
+				Config.PlanetRadiusKm,
+				PairSeparationKmPerMy) ||
+			PairSeparationKmPerMy < Config.DivergentSpreadingMinKmPerMy)
+		{
+			continue;
+		}
+
+		FVector3d BoundaryNormal = FVector3d::ZeroVector;
+		if (!ComputeBoundaryLowToHighDirection(*LowPlate, *HighPlate, OwnerEdge, BoundaryNormal))
+		{
+			continue;
+		}
+
+		FAcceptedDivergentEdge AcceptedEdge;
+		AcceptedEdge.OwnerEdge = OwnerEdge;
+		AcceptedEdge.BoundaryNormal = BoundaryNormal;
+		AcceptedEdge.NormalSeparationKmPerMy = NormalSeparationKmPerMy;
+		AcceptedEdge.EdgeLengthKm = OwnerEdge.LengthRad * Config.PlanetRadiusKm;
+		AcceptedEdge.CreatedAreaKm2 =
+			AcceptedEdge.EdgeLengthKm *
+			NormalSeparationKmPerMy *
+			Config.DeltaTimeMy;
+		if (AcceptedEdge.CreatedAreaKm2 > 0.0)
+		{
+			AcceptedEdges.Add(AcceptedEdge);
+		}
+	}
+
+	Algo::Sort(AcceptedEdges, [](const FAcceptedDivergentEdge& A, const FAcceptedDivergentEdge& B)
+	{
+		if (A.OwnerEdge.LowPlateId != B.OwnerEdge.LowPlateId)
+		{
+			return A.OwnerEdge.LowPlateId < B.OwnerEdge.LowPlateId;
+		}
+		if (A.OwnerEdge.HighPlateId != B.OwnerEdge.HighPlateId)
+		{
+			return A.OwnerEdge.HighPlateId < B.OwnerEdge.HighPlateId;
+		}
+		return A.OwnerEdge.Key < B.OwnerEdge.Key;
+	});
+
+	int32 BlockStart = 0;
+	const double CoalescingToleranceRad =
+		2.0 * FMath::Sqrt((4.0 * PI) / FMath::Max(1.0, static_cast<double>(Config.SampleCount)));
+	while (BlockStart < AcceptedEdges.Num())
+	{
+		int32 BlockEnd = BlockStart + 1;
+		while (BlockEnd < AcceptedEdges.Num() &&
+			AcceptedEdges[BlockEnd].OwnerEdge.LowPlateId == AcceptedEdges[BlockStart].OwnerEdge.LowPlateId &&
+			AcceptedEdges[BlockEnd].OwnerEdge.HighPlateId == AcceptedEdges[BlockStart].OwnerEdge.HighPlateId)
+		{
+			++BlockEnd;
+		}
+
+		const int32 BlockCount = BlockEnd - BlockStart;
+		TArray<int32> Parent;
+		Parent.SetNumUninitialized(BlockCount);
+		for (int32 Index = 0; Index < BlockCount; ++Index)
+		{
+			Parent[Index] = Index;
+		}
+
+		auto FindRoot = [&Parent](int32 Index)
+		{
+			while (Parent[Index] != Index)
+			{
+				Parent[Index] = Parent[Parent[Index]];
+				Index = Parent[Index];
+			}
+			return Index;
+		};
+
+		auto UnionRoots = [&Parent, &FindRoot](const int32 A, const int32 B)
+		{
+			const int32 RootA = FindRoot(A);
+			const int32 RootB = FindRoot(B);
+			if (RootA == RootB)
+			{
+				return;
+			}
+			if (RootA < RootB)
+			{
+				Parent[RootB] = RootA;
+			}
+			else
+			{
+				Parent[RootA] = RootB;
+			}
+		};
+
+		TArray<FEndpointRef> EndpointRefs;
+		EndpointRefs.Reserve(BlockCount * 2);
+		for (int32 LocalIndex = 0; LocalIndex < BlockCount; ++LocalIndex)
+		{
+			const FSidecarBoundaryEdgeKey& Key = AcceptedEdges[BlockStart + LocalIndex].OwnerEdge.Key;
+			EndpointRefs.Add({ Key.SampleA, LocalIndex });
+			EndpointRefs.Add({ Key.SampleB, LocalIndex });
+		}
+		Algo::Sort(EndpointRefs, [](const FEndpointRef& A, const FEndpointRef& B)
+		{
+			if (A.SampleId != B.SampleId)
+			{
+				return A.SampleId < B.SampleId;
+			}
+			return A.LocalEdgeIndex < B.LocalEdgeIndex;
+		});
+
+		int32 EndpointStart = 0;
+		while (EndpointStart < EndpointRefs.Num())
+		{
+			int32 EndpointEnd = EndpointStart + 1;
+			while (EndpointEnd < EndpointRefs.Num() &&
+				EndpointRefs[EndpointEnd].SampleId == EndpointRefs[EndpointStart].SampleId)
+			{
+				++EndpointEnd;
+			}
+			for (int32 EndpointIndex = EndpointStart + 1; EndpointIndex < EndpointEnd; ++EndpointIndex)
+			{
+				UnionRoots(EndpointRefs[EndpointStart].LocalEdgeIndex, EndpointRefs[EndpointIndex].LocalEdgeIndex);
+			}
+			EndpointStart = EndpointEnd;
+		}
+
+		TArray<int32> RootToComponentIndex;
+		RootToComponentIndex.Init(INDEX_NONE, BlockCount);
+		TArray<FEdgeComponent> Components;
+		for (int32 LocalIndex = 0; LocalIndex < BlockCount; ++LocalIndex)
+		{
+			const int32 Root = FindRoot(LocalIndex);
+			int32& ComponentIndex = RootToComponentIndex[Root];
+			if (ComponentIndex == INDEX_NONE)
+			{
+				ComponentIndex = Components.Num();
+				FEdgeComponent Component;
+				Component.LowPlateId = AcceptedEdges[BlockStart + LocalIndex].OwnerEdge.LowPlateId;
+				Component.HighPlateId = AcceptedEdges[BlockStart + LocalIndex].OwnerEdge.HighPlateId;
+				Component.ComponentId = AcceptedEdges[BlockStart + LocalIndex].OwnerEdge.Key;
+				Components.Add(Component);
+			}
+			FEdgeComponent& Component = Components[ComponentIndex];
+			if (AcceptedEdges[BlockStart + LocalIndex].OwnerEdge.Key < Component.ComponentId)
+			{
+				Component.ComponentId = AcceptedEdges[BlockStart + LocalIndex].OwnerEdge.Key;
+			}
+			Component.LocalEdgeIndices.Add(LocalIndex);
+		}
+
+		Algo::Sort(Components, [](const FEdgeComponent& A, const FEdgeComponent& B)
+		{
+			return A.ComponentId < B.ComponentId;
+		});
+
+		for (const FEdgeComponent& Component : Components)
+		{
+			FSidecarDivergentSpreadingEventInput EventInput;
+			EventInput.PlateA = Component.LowPlateId;
+			EventInput.PlateB = Component.HighPlateId;
+			EventInput.ComponentId = Component.ComponentId;
+			EventInput.RidgeGenerationId = 0;
+			FVector3d WeightedRidgeDirection = FVector3d::ZeroVector;
+
+			for (const int32 LocalEdgeIndex : Component.LocalEdgeIndices)
+			{
+				const FAcceptedDivergentEdge& AcceptedEdge = AcceptedEdges[BlockStart + LocalEdgeIndex];
+				FSidecarOceanCrustBirthEdge BirthEdge;
+				BirthEdge.Key = AcceptedEdge.OwnerEdge.Key;
+				BirthEdge.EndpointA = AcceptedEdge.OwnerEdge.SampleAPosition;
+				BirthEdge.EndpointB = AcceptedEdge.OwnerEdge.SampleBPosition;
+				BirthEdge.BoundaryNormal = AcceptedEdge.BoundaryNormal;
+				BirthEdge.LengthKm = AcceptedEdge.EdgeLengthKm;
+				BirthEdge.NormalSeparationKmPerMy = AcceptedEdge.NormalSeparationKmPerMy;
+				EventInput.BirthEdges.Add(BirthEdge);
+				EventInput.DebugSampleIds.Add(AcceptedEdge.OwnerEdge.Key.SampleA);
+				EventInput.DebugSampleIds.Add(AcceptedEdge.OwnerEdge.Key.SampleB);
+				EventInput.CreatedAreaKm2 += AcceptedEdge.CreatedAreaKm2;
+				WeightedRidgeDirection += AcceptedEdge.BoundaryNormal * AcceptedEdge.CreatedAreaKm2;
+			}
+
+			EventInput.RidgeDirection = NormalizeOrFallback(
+				WeightedRidgeDirection,
+				EventInput.BirthEdges[0].BoundaryNormal);
+			ApplyDivergentSpreadingEvent(
+				OceanCrustStore,
+				CrustEventLog,
+				EventInput,
+				CurrentStep,
+				CurrentTimeMy,
+				Config.RidgeGenerationGapSteps,
+				CoalescingToleranceRad);
+		}
+
+		BlockStart = BlockEnd;
+	}
 }
 
 void FTectonicPlanetSidecar::ProjectToPlanet(

@@ -53,6 +53,8 @@ struct AUROUS_API FTectonicSidecarConfig
 	double DivergenceSpeedFraction = 0.05;
 	int32 RidgeGenerationGapSteps = 5;
 	double OverlayContinentalWeightThreshold = 0.5;
+	bool bEnableDivergentSpreadingEvents = false;
+	double DivergentSpreadingMinKmPerMy = 10.0;
 	bool bForceExplicitProjectionAtRestForTest = false;
 };
 
@@ -287,4 +289,5 @@ private:
 		const TArray<double>& NearestSupportDistancesRad,
 		FTectonicSidecarProjectionDiagnostics& OutDiagnostics) const;
 	void ResetLastProjectionDebug(int32 SampleCount) const;
+	void ApplyDivergentSpreadingEventsForCurrentStep();
 };

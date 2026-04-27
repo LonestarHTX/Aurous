@@ -251,6 +251,8 @@ namespace
 		MixHashDouble(Hash, Config.DivergenceSpeedFraction);
 		MixHashInt32(Hash, Config.RidgeGenerationGapSteps);
 		MixHashDouble(Hash, Config.OverlayContinentalWeightThreshold);
+		MixHashUInt32(Hash, Config.bEnableDivergentSpreadingEvents ? 1u : 0u);
+		MixHashDouble(Hash, Config.DivergentSpreadingMinKmPerMy);
 		MixHashUInt32(Hash, Config.bForceExplicitProjectionAtRestForTest ? 1u : 0u);
 		MixHashInt32(Hash, Sidecar.GetCurrentStep());
 		const FTectonicPlanet& InitialPlanet = Sidecar.GetInitialPlanet();
@@ -1164,6 +1166,7 @@ namespace
 		FSidecarDivergentSpreadingEventInput Input;
 		Input.PlateA = PlateA;
 		Input.PlateB = PlateB;
+		Input.ComponentId = Edge.Key;
 		Input.RidgeGenerationId = 7;
 		Input.BirthEdges.Add(BirthEdge);
 		Input.DebugSampleIds = { Edge.Key.SampleB, Edge.Key.SampleA };
@@ -1173,6 +1176,95 @@ namespace
 		Input.OceanicThicknessKm = 7.0;
 		Input.ElevationSeedKm = -1.0;
 		return Input;
+	}
+
+	double ComputePlateCenterSeparationKmPerMyForTest(
+		const FTectonicPlanetSidecar& Sidecar,
+		int32 LowPlateId,
+		int32 HighPlateId);
+
+	double ComputeExpectedDivergentAreaKm2ForTest(const FTectonicPlanetSidecar& Sidecar)
+	{
+		double AreaKm2 = 0.0;
+		const FTectonicSidecarConfig& Config = Sidecar.GetConfig();
+		for (const FSidecarOwnerEdge& Edge : Sidecar.EnumerateOwnerEdgesSorted())
+		{
+			double NormalSeparationKmPerMy = 0.0;
+			const double PairSeparationKmPerMy = ComputePlateCenterSeparationKmPerMyForTest(
+				Sidecar,
+				Edge.LowPlateId,
+				Edge.HighPlateId);
+			if (PairSeparationKmPerMy >= Config.DivergentSpreadingMinKmPerMy &&
+				Sidecar.ComputeBoundaryNormalSeparationKmPerMy(Edge, NormalSeparationKmPerMy) &&
+				NormalSeparationKmPerMy >= Config.DivergentSpreadingMinKmPerMy)
+			{
+				AreaKm2 +=
+					Edge.LengthRad *
+					Config.PlanetRadiusKm *
+					NormalSeparationKmPerMy *
+					Config.DeltaTimeMy;
+			}
+		}
+		return AreaKm2;
+	}
+
+	double SumEventAreaForStep(const FSidecarCrustEventLog& EventLog, const int32 Step)
+	{
+		double AreaKm2 = 0.0;
+		for (const FSidecarCrustEventRecord& Event : EventLog.Events)
+		{
+			if (Event.Step == Step)
+			{
+				AreaKm2 += Event.CreatedAreaKm2;
+			}
+		}
+		return AreaKm2;
+	}
+
+	const FSidecarOceanCrustRecord* FindCrustRecordByIdForTest(
+		const FSidecarOceanCrustStore& Store,
+		const int32 CrustId)
+	{
+		for (const FSidecarOceanCrustRecord& Record : Store.Records)
+		{
+			if (Record.CrustId == CrustId)
+			{
+				return &Record;
+			}
+		}
+		return nullptr;
+	}
+
+	double ComputePlateCenterSeparationKmPerMyForTest(
+		const FTectonicPlanetSidecar& Sidecar,
+		const int32 LowPlateId,
+		const int32 HighPlateId)
+	{
+		const FTectonicSidecarPlate* LowPlate = FindSidecarPlateByIdForTest(Sidecar, LowPlateId);
+		const FTectonicSidecarPlate* HighPlate = FindSidecarPlateByIdForTest(Sidecar, HighPlateId);
+		if (LowPlate == nullptr || HighPlate == nullptr)
+		{
+			return 0.0;
+		}
+
+		const FVector3d LowCenter =
+			LowPlate->WorldFromLocal.RotateVector(LowPlate->InitialCenter).GetSafeNormal();
+		const FVector3d HighCenter =
+			HighPlate->WorldFromLocal.RotateVector(HighPlate->InitialCenter).GetSafeNormal();
+		const FVector3d QueryPoint = NormalizeOrFallbackForTest(LowCenter + HighCenter, LowCenter);
+		const FVector3d LowToHigh = ProjectOntoTangentForTest(HighCenter - LowCenter, QueryPoint).GetSafeNormal();
+		if (LowToHigh.IsNearlyZero())
+		{
+			return 0.0;
+		}
+
+		const FVector3d LowVelocity =
+			FVector3d::CrossProduct(LowPlate->RotationAxis.GetSafeNormal(), QueryPoint) *
+			(LowPlate->AngularSpeedRadPerMy * Sidecar.GetConfig().PlanetRadiusKm);
+		const FVector3d HighVelocity =
+			FVector3d::CrossProduct(HighPlate->RotationAxis.GetSafeNormal(), QueryPoint) *
+			(HighPlate->AngularSpeedRadPerMy * Sidecar.GetConfig().PlanetRadiusKm);
+		return (HighVelocity - LowVelocity).Dot(LowToHigh);
 	}
 
 	bool CheckPrototypeDSourceHygieneGate(FAutomationTestBase& Test)
@@ -1244,6 +1336,52 @@ namespace
 		{
 			Test.AddError(TEXT("Prototype D source hygiene found repair-shaped Apply API in sidecar header"));
 			bPassed = false;
+		}
+
+		const FString SidecarCppPath = FPaths::Combine(
+			FPaths::ProjectDir(),
+			TEXT("Source/Aurous/Private/TectonicPlanetSidecar.cpp"));
+		FString SidecarCpp;
+		if (!FFileHelper::LoadFileToString(SidecarCpp, *SidecarCppPath))
+		{
+			Test.AddError(TEXT("Prototype D source hygiene could not read TectonicPlanetSidecar.cpp"));
+			return false;
+		}
+		const FString StartMarker = TEXT("void FTectonicPlanetSidecar::ApplyDivergentSpreadingEventsForCurrentStep()");
+		const FString EndMarker = TEXT("void FTectonicPlanetSidecar::ProjectToPlanet");
+		const int32 StartIndex = SidecarCpp.Find(StartMarker);
+		const int32 EndIndex = SidecarCpp.Find(EndMarker);
+		if (StartIndex == INDEX_NONE || EndIndex == INDEX_NONE || EndIndex <= StartIndex)
+		{
+			Test.AddError(TEXT("Prototype D source hygiene could not isolate event detection region"));
+			bPassed = false;
+		}
+		else
+		{
+			const FString DetectionRegion = SidecarCpp.Mid(StartIndex, EndIndex - StartIndex);
+			const TCHAR* DetectionForbiddenTokens[] =
+			{
+				TEXT("LastDivergentBoundaryFlags"),
+				TEXT("OceanFallback"),
+				TEXT("DivergentOceanFill"),
+				TEXT("MeaningfulHitContainmentScore"),
+				TEXT("QueryOwnership"),
+				TEXT("Repair"),
+				TEXT("Recover"),
+				TEXT("Backfill"),
+				TEXT("Promote"),
+				TEXT("Reclassify")
+			};
+			for (const TCHAR* Token : DetectionForbiddenTokens)
+			{
+				if (DetectionRegion.Contains(Token))
+				{
+					Test.AddError(FString::Printf(
+						TEXT("Prototype D detection hygiene found forbidden token '%s'"),
+						Token));
+					bPassed = false;
+				}
+			}
 		}
 
 		return bPassed;
@@ -2122,6 +2260,194 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 		AddInfo(FString::Printf(TEXT("[SidecarPrototypeDBoundaryVelocity] zero_relative_km_per_my=%.6f"), PerpendicularSpeedKmPerMy));
 		TestTrue(TEXT("Prototype D boundary velocity helper reports approximately zero perpendicular/zero-relative speed"),
 			FMath::Abs(PerpendicularSpeedKmPerMy) <= 1.0e-6);
+	}
+
+	{
+		FTectonicSidecarConfig Default250kConfig = MakeSidecarConfig(
+			ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial,
+			250000,
+			40);
+		FTectonicPlanetSidecar Default250kSidecar;
+		Default250kSidecar.Initialize(Default250kConfig);
+		const int32 DefaultCheckpoints[] = { 0, 10, 25, 40 };
+		for (const int32 Checkpoint : DefaultCheckpoints)
+		{
+			AdvanceToStep(Default250kSidecar, Checkpoint);
+			TestEqual(
+				FString::Printf(TEXT("Prototype D default-off 250k checkpoint %d creates zero crust"), Checkpoint),
+				Default250kSidecar.GetOceanCrustStore().Num(),
+				0);
+			TestEqual(
+				FString::Printf(TEXT("Prototype D default-off 250k checkpoint %d appends zero events"), Checkpoint),
+				Default250kSidecar.GetCrustEventLog().Num(),
+				0);
+		}
+	}
+
+	{
+		FTectonicSidecarConfig EventConfig = Config;
+		EventConfig.bEnableDivergentSpreadingEvents = true;
+		EventConfig.DivergentSpreadingMinKmPerMy = 10.0;
+
+		FTectonicSidecarConfig ExpectedConfig = EventConfig;
+		ExpectedConfig.bEnableDivergentSpreadingEvents = false;
+
+		FTectonicPlanetSidecar EventSidecar;
+		FTectonicPlanetSidecar ExpectedSidecar;
+		EventSidecar.Initialize(EventConfig);
+		ExpectedSidecar.Initialize(ExpectedConfig);
+
+		int32 PlateA = INDEX_NONE;
+		int32 PlateB = INDEX_NONE;
+		FVector3d CenterA = FVector3d::ZeroVector;
+		FVector3d CenterB = FVector3d::ZeroVector;
+		FVector3d BoundaryPoint = FVector3d::ZeroVector;
+		TestTrue(TEXT("Prototype D runtime found controlled divergent pair"),
+			FindStrongBoundaryPlatePair(EventSidecar, PlateA, PlateB, CenterA, CenterB, BoundaryPoint));
+		ConfigureControlledPair(EventSidecar, PlateA, PlateB, CenterA, CenterB, BoundaryPoint, true);
+		ConfigureControlledPair(ExpectedSidecar, PlateA, PlateB, CenterA, CenterB, BoundaryPoint, true);
+
+		TArray<int32> InitialCrustIds;
+		double PreviousTotalAreaKm2 = 0.0;
+		const int32 RuntimeCheckpoints[] = { 1, 10, 25 };
+		int32 NextCheckpointIndex = 0;
+		for (int32 Step = 1; Step <= 25; ++Step)
+		{
+			ExpectedSidecar.AdvanceStep();
+			const double ExpectedStepAreaKm2 = ComputeExpectedDivergentAreaKm2ForTest(ExpectedSidecar);
+
+			EventSidecar.AdvanceStep();
+			const double ActualStepAreaKm2 = SumEventAreaForStep(EventSidecar.GetCrustEventLog(), EventSidecar.GetCurrentStep());
+			const double AreaToleranceKm2 = FMath::Max(1.0e-6, ExpectedStepAreaKm2 * 0.01);
+			TestTrue(
+				FString::Printf(TEXT("Prototype D runtime analytic area step %d expected=%.6f actual=%.6f tolerance=%.6f"),
+					Step,
+					ExpectedStepAreaKm2,
+					ActualStepAreaKm2,
+					AreaToleranceKm2),
+				FMath::Abs(ExpectedStepAreaKm2 - ActualStepAreaKm2) <= AreaToleranceKm2);
+
+			if (Step == 1)
+			{
+				TestTrue(TEXT("Prototype D runtime divergent pair creates persistent crust at R+1"),
+					EventSidecar.GetOceanCrustStore().Num() > 0);
+				TestTrue(TEXT("Prototype D runtime divergent pair appends event records at R+1"),
+					EventSidecar.GetCrustEventLog().Num() > 0);
+				for (const FSidecarOceanCrustRecord& Record : EventSidecar.GetOceanCrustStore().Records)
+				{
+					InitialCrustIds.Add(Record.CrustId);
+				}
+			}
+
+			if (NextCheckpointIndex < UE_ARRAY_COUNT(RuntimeCheckpoints) &&
+				Step == RuntimeCheckpoints[NextCheckpointIndex])
+			{
+				double TotalAreaKm2 = 0.0;
+				for (const FSidecarOceanCrustRecord& Record : EventSidecar.GetOceanCrustStore().Records)
+				{
+					TotalAreaKm2 += Record.CreatedAreaKm2;
+					const double ExpectedAgeMy =
+						static_cast<double>(EventSidecar.GetCurrentStep() - Record.BirthStep) *
+						EventConfig.DeltaTimeMy;
+					TestTrue(
+						FString::Printf(TEXT("Prototype D runtime crust age matches current step at R+%d"), Step),
+						FMath::Abs(Record.AgeMy - ExpectedAgeMy) <= 1.0e-6);
+				}
+				TestTrue(
+					FString::Printf(TEXT("Prototype D runtime cumulative crust area is monotonic at R+%d"), Step),
+					TotalAreaKm2 + 1.0e-6 >= PreviousTotalAreaKm2);
+				PreviousTotalAreaKm2 = TotalAreaKm2;
+
+				for (const int32 CrustId : InitialCrustIds)
+				{
+					TestTrue(
+						FString::Printf(TEXT("Prototype D runtime initial crust id %d persists at R+%d"), CrustId, Step),
+						FindCrustRecordByIdForTest(EventSidecar.GetOceanCrustStore(), CrustId) != nullptr);
+				}
+				++NextCheckpointIndex;
+			}
+		}
+
+		const uint32 AuthorityBeforeProjection = EventSidecar.ComputeSidecarAuthorityHash();
+		const int32 CrustCountBeforeProjection = EventSidecar.GetOceanCrustStore().Num();
+		const int32 EventCountBeforeProjection = EventSidecar.GetCrustEventLog().Num();
+		FTectonicPlanet Projected;
+		EventSidecar.ProjectToPlanet(Projected);
+		TestEqual(TEXT("Prototype D runtime projection remains idempotent with D state"),
+			AuthorityBeforeProjection,
+			EventSidecar.ComputeSidecarAuthorityHash());
+		TestEqual(TEXT("Prototype D runtime projection preserves crust count"),
+			CrustCountBeforeProjection,
+			EventSidecar.GetOceanCrustStore().Num());
+		TestEqual(TEXT("Prototype D runtime projection preserves event count"),
+			EventCountBeforeProjection,
+			EventSidecar.GetCrustEventLog().Num());
+
+		FTectonicPlanetSidecar DeterminismA;
+		FTectonicPlanetSidecar DeterminismB;
+		DeterminismA.Initialize(EventConfig);
+		DeterminismB.Initialize(EventConfig);
+		ConfigureControlledPair(DeterminismA, PlateA, PlateB, CenterA, CenterB, BoundaryPoint, true);
+		ConfigureControlledPair(DeterminismB, PlateA, PlateB, CenterA, CenterB, BoundaryPoint, true);
+		DeterminismA.AdvanceSteps(25);
+		DeterminismB.AdvanceSteps(25);
+		TestEqual(TEXT("Prototype D runtime deterministic crust store hash"),
+			DeterminismA.GetOceanCrustStore().ComputeCanonicalHash(),
+			DeterminismB.GetOceanCrustStore().ComputeCanonicalHash());
+		TestEqual(TEXT("Prototype D runtime deterministic event log hash"),
+			DeterminismA.GetCrustEventLog().ComputeAppendOrderHash(),
+			DeterminismB.GetCrustEventLog().ComputeAppendOrderHash());
+	}
+
+	{
+		FTectonicSidecarConfig BelowThresholdConfig = Config;
+		BelowThresholdConfig.bEnableDivergentSpreadingEvents = true;
+		BelowThresholdConfig.DivergentSpreadingMinKmPerMy = 1000000.0;
+		FTectonicPlanetSidecar Sidecar;
+		Sidecar.Initialize(BelowThresholdConfig);
+		int32 PlateA = INDEX_NONE;
+		int32 PlateB = INDEX_NONE;
+		FVector3d CenterA = FVector3d::ZeroVector;
+		FVector3d CenterB = FVector3d::ZeroVector;
+		FVector3d BoundaryPoint = FVector3d::ZeroVector;
+		TestTrue(TEXT("Prototype D below-threshold found boundary pair"),
+			FindStrongBoundaryPlatePair(Sidecar, PlateA, PlateB, CenterA, CenterB, BoundaryPoint));
+		ConfigureControlledPair(Sidecar, PlateA, PlateB, CenterA, CenterB, BoundaryPoint, true);
+		Sidecar.AdvanceSteps(1);
+		TestEqual(TEXT("Prototype D below-threshold divergent motion creates zero crust"), Sidecar.GetOceanCrustStore().Num(), 0);
+		TestEqual(TEXT("Prototype D below-threshold divergent motion appends zero events"), Sidecar.GetCrustEventLog().Num(), 0);
+	}
+
+	{
+		FTectonicSidecarConfig EventConfig = MakeSidecarConfig(
+			ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial,
+			60000,
+			2);
+		EventConfig.bEnableDivergentSpreadingEvents = true;
+		FTectonicPlanetSidecar Sidecar;
+		Sidecar.Initialize(EventConfig);
+		int32 PlateA = INDEX_NONE;
+		int32 PlateB = INDEX_NONE;
+		FVector3d CenterA = FVector3d::ZeroVector;
+		FVector3d CenterB = FVector3d::ZeroVector;
+		FVector3d BoundaryPoint = FVector3d::ZeroVector;
+		TestTrue(TEXT("Prototype D convergent negative-control found boundary pair"),
+			FindStrongBoundaryPlatePair(Sidecar, PlateA, PlateB, CenterA, CenterB, BoundaryPoint));
+		ConfigureControlledPair(Sidecar, PlateA, PlateB, CenterA, CenterB, BoundaryPoint, false);
+		Sidecar.AdvanceSteps(1);
+		TestEqual(TEXT("Prototype D convergent motion creates zero crust"), Sidecar.GetOceanCrustStore().Num(), 0);
+		TestEqual(TEXT("Prototype D convergent motion appends zero events"), Sidecar.GetCrustEventLog().Num(), 0);
+	}
+
+	{
+		FTectonicSidecarConfig EventConfig = Config;
+		EventConfig.bEnableDivergentSpreadingEvents = true;
+		FTectonicPlanetSidecar Sidecar;
+		Sidecar.Initialize(EventConfig);
+		ZeroAllPlateKinematics(Sidecar);
+		Sidecar.AdvanceSteps(1);
+		TestEqual(TEXT("Prototype D zero-relative motion creates zero crust"), Sidecar.GetOceanCrustStore().Num(), 0);
+		TestEqual(TEXT("Prototype D zero-relative motion appends zero events"), Sidecar.GetCrustEventLog().Num(), 0);
 	}
 
 	return true;
