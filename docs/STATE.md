@@ -65,6 +65,33 @@ Prototype C does not solve persistent ocean crust, age gradients, thickness
 accumulation, subduction, collision, rifting, uplift, erosion, or long-horizon
 land/ocean balance.
 
+## Reproduce The C Baseline
+
+1. Build `AurousEditor`.
+2. Run automation group `Aurous.TectonicPlanet.SidecarPrototypeC`.
+3. For visual evidence, export maps with the Sidecar C actor or control panel.
+4. Expected local artifact roots:
+   - `Saved/Logs/SidecarPrototypeC_FreezeHardening.log`
+   - `Saved/MapExports/SidecarPrototypeC/60k40/`
+   - `Saved/MapExports/SidecarPrototypeC/250k40_smoke/`
+5. Compare runtime and metrics against the validation table above.
+6. Verify mandatory overlays listed in `docs/evidence/MANIFEST.md`.
+
+`Saved/` is gitignored. These artifacts are local reproducibility evidence, not
+committed repository files.
+
+## Repository Hygiene Snapshot
+
+Last checked: 2026-04-27.
+
+- Remote heads: `main`, `v5-m2b`, `codex/sidecar-c-actor-control-panel`.
+- Local branches also include historical/stale `master`, `v5-m0a`, `v5-m2a`,
+  `claude/*`, and active `codex/sidecar-c-actor-control-panel`.
+- Active worktrees: main repo, `claude/relaxed-easley-255895`,
+  `claude/stoic-edison-882d64`.
+- Recommendation: treat `main` as canonical unless the user decides otherwise;
+  do not delete local or remote branches without an explicit cleanup request.
+
 ## Falsified Or Superseded Directions
 
 - V6/V9 ownership-authority: falsified by the April 2026 architecture failure memo.

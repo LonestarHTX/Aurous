@@ -4,6 +4,10 @@ This manifest indexes validation artifacts that matter for the current tectonic
 architecture. It does not make generated images authoritative by themselves;
 acceptance still comes from tests and raw diagnostics.
 
+`Saved/` is gitignored by `.gitignore`, and `git ls-files Saved/` should be
+empty. Evidence paths under `Saved/MapExports/` and `Saved/Logs/` are local
+reproducibility artifacts, not committed files.
+
 ## Load-Bearing Evidence
 
 | Evidence | Commit | Location | What It Supports |
@@ -59,3 +63,5 @@ accepted ADR, failure memo, or `docs/STATE.md`.
 - New D evidence should be added here in the same PR that updates `docs/STATE.md`.
 - PNGs are secondary evidence. Tests and raw diagnostics are the acceptance source.
 - Filled/rasterized exports must not be used alone to prove raw C invariants.
+- If a future run needs to preserve artifacts beyond the local machine, archive
+  them explicitly outside `Saved/` and add that archive path here.

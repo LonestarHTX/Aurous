@@ -3,6 +3,7 @@
 #include "Misc/FileHelper.h"
 #include "HAL/PlatformFile.h"
 #include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/Paths.h"
 #include "TectonicMollweideExporter.h"
 #include "TectonicPlanetSidecar.h"
@@ -13,6 +14,7 @@ namespace
 	constexpr int32 SidecarTestExportHeight = 1024;
 	constexpr double ControlledPairSpeedKmPerMy = 80.0;
 	constexpr int32 PrototypeCResolutionCompareStep = 40;
+	constexpr double PrototypeCRuntimeBudgetSeconds = 90.0;
 
 	FString BuildSidecarExportRoot(const FString& RunId)
 	{
@@ -1372,6 +1374,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 {
+	const double TestStartSeconds = FPlatformTime::Seconds();
 	const FString RunId = TEXT("SidecarPrototypeC");
 	const FString ExportRoot = BuildSidecarExportRoot(RunId);
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
@@ -1747,6 +1750,15 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 		CheckPrototypeCOwnershipGate(*this, TEXT("250k40_smoke"), Diagnostics, BaselineDiagnostics.BoundaryFraction);
 		ExportSidecarCCheckpointMaps(*this, Sidecar, Projected, ExportRoot, 40, TEXT("250k40_smoke"));
 	}
+
+	const double ElapsedSeconds = FPlatformTime::Seconds() - TestStartSeconds;
+	AddInfo(FString::Printf(
+		TEXT("[SidecarPrototypeCRuntime] elapsed_seconds=%.2f budget_seconds=%.2f"),
+		ElapsedSeconds,
+		PrototypeCRuntimeBudgetSeconds));
+	TestTrue(
+		FString::Printf(TEXT("Prototype C automation runtime stays under %.0f seconds"), PrototypeCRuntimeBudgetSeconds),
+		ElapsedSeconds <= PrototypeCRuntimeBudgetSeconds);
 
 	return true;
 }
