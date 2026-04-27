@@ -282,16 +282,21 @@ the projection pass is explicitly requested by D tests or later runtime tooling.
 Slice 3 uses per-crust rasterization rather than per-sample global search. The
 projection function is `Phase3ProjectPersistentOceanCrust`: for each persistent
 crust record, it uses the record's canonical birth-edge sample ids and debug
-sample ids as world-space lattice anchors, expands by the one-ring sample
+sample ids as world-space lattice anchors, expands by one-ring sample
 adjacency, sorts/deduplicates the result, and writes D ocean fields only into
-eligible low-continental-weight projected samples. This is a projection helper,
-not authority; the persistent authority remains the crust record's birth edges,
-event log, and hash-covered fields.
+eligible low-continental-weight projected samples that are not C
+material/owner mismatch samples. This is a projection helper, not authority; the
+persistent authority remains the crust record's birth edges, event log, and
+hash-covered fields.
 
 Initial D projection must not overwrite meaningful carried continental
 material. Meaningful continental material is defined as projected carried
 `ContinentalWeight >= 0.5` by default. If this becomes configurable, the config
 field is `OverlayContinentalWeightThreshold` with default `0.5`.
+
+Initial D projection treats `MaterialOwnerMismatch` as a diagnostic exclusion
+zone. D events may still exist as persistent records, but mismatch fields must
+not become a projection authority for ocean crust.
 
 The D projection elevation seed, once projection lands in a later slice, is:
 
@@ -356,7 +361,9 @@ New D gates:
 - no ocean crust is created when divergence is disabled
 - no ocean crust is created below threshold
 - no ocean crust is created from projection misses or fallback
-- basin corridor is spatially coherent, not speckled
+- basin corridors are spatially coherent, not speckled; Slice 4 measures this
+  with a tiny-component sample fraction, not a single-largest-component gate, so
+  early independent ridge corridors and late merged ridge networks can both pass
 - all D mutations appear in an event log
 - `ProjectToPlanet` remains idempotent with respect to sidecar truth
 

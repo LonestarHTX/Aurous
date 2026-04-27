@@ -80,6 +80,23 @@ land/ocean balance.
 `Saved/` is gitignored. These artifacts are local reproducibility evidence, not
 committed repository files.
 
+## Reproduce The D Visual Gate
+
+1. Build `AurousEditor`.
+2. Run automation group `Aurous.TectonicPlanet.SidecarPrototypeDVisualGate`.
+3. Expected local artifact roots:
+   - `Saved/MapExports/SidecarPrototypeD/visual_60k40/step_000/`
+   - `Saved/MapExports/SidecarPrototypeD/visual_60k40/step_100/`
+   - `Saved/MapExports/SidecarPrototypeD/visual_60k40/step_200/`
+   - `Saved/MapExports/SidecarPrototypeD/visual_60k40/step_400/`
+   - `Saved/MapExports/SidecarPrototypeD/visual_60k40_below_threshold/`
+4. Generate review sheets with `$aurous-overlay-contactsheet` for each
+   checkpoint directory.
+5. Compare checkpoint drift with `$aurous-diagnostic-diff`, especially
+   `step_100 -> step_200` and `step_200 -> step_400`.
+6. Answer the Slice 4 visual checklist in
+   `docs/process/prototype-d-slice-4-visual-check.md`.
+
 ## Repository Hygiene Snapshot
 
 Last checked: 2026-04-27.

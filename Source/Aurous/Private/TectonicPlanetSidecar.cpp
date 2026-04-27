@@ -2434,6 +2434,11 @@ void FTectonicPlanetSidecar::Phase3ProjectPersistentOceanCrust(FTectonicPlanet& 
 			{
 				continue;
 			}
+			if (LastMaterialOwnerMismatchFlags.IsValidIndex(SampleIndex) &&
+				LastMaterialOwnerMismatchFlags[SampleIndex] != 0)
+			{
+				continue;
+			}
 
 			Sample.ContinentalWeight = 0.0f;
 			Sample.Thickness = ProjectedThicknessKm;

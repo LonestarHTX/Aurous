@@ -938,6 +938,433 @@ namespace
 		return bExported;
 	}
 
+	const FSidecarOceanCrustRecord* FindCrustRecordByIdForTest(
+		const FSidecarOceanCrustStore& Store,
+		const int32 CrustId);
+
+	bool ExportSidecarDVisualGateMaps(
+		FAutomationTestBase& Test,
+		const FTectonicPlanetSidecar& Sidecar,
+		const FTectonicPlanet& Planet,
+		const int32 Step,
+		const FString& Label)
+	{
+		const FString ExportRoot = BuildSidecarExportRoot(TEXT("SidecarPrototypeD"));
+		const FString OutputDirectory = FPaths::Combine(
+			ExportRoot,
+			Label,
+			FString::Printf(TEXT("step_%03d"), Step));
+
+		bool bExported = ExportSidecarCCheckpointMaps(Test, Sidecar, Planet, ExportRoot, Step, Label);
+		bExported &= ExportSidecarDOverlays(Test, Sidecar, Planet, OutputDirectory);
+		return bExported;
+	}
+
+	double SumOceanCrustAreaKm2(const FSidecarOceanCrustStore& Store)
+	{
+		double AreaKm2 = 0.0;
+		for (const FSidecarOceanCrustRecord& Record : Store.Records)
+		{
+			AreaKm2 += Record.CreatedAreaKm2;
+		}
+		return AreaKm2;
+	}
+
+	int32 SumOceanCrustBirthEdgeCount(const FSidecarOceanCrustStore& Store)
+	{
+		int32 BirthEdgeCount = 0;
+		for (const FSidecarOceanCrustRecord& Record : Store.Records)
+		{
+			BirthEdgeCount += Record.BirthEdges.Num();
+		}
+		return BirthEdgeCount;
+	}
+
+	TArray<int32> CollectSortedCrustIds(const FSidecarOceanCrustStore& Store)
+	{
+		TArray<int32> CrustIds;
+		CrustIds.Reserve(Store.Records.Num());
+		for (const FSidecarOceanCrustRecord& Record : Store.Records)
+		{
+			if (Record.CrustId != INDEX_NONE)
+			{
+				CrustIds.Add(Record.CrustId);
+			}
+		}
+		CrustIds.Sort();
+		return CrustIds;
+	}
+
+	bool CheckCrustIdsPersist(
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const TArray<int32>& PreviousCrustIds,
+		const TArray<int32>& CurrentCrustIds)
+	{
+		int32 MissingCount = 0;
+		int32 FirstMissingId = INDEX_NONE;
+		for (const int32 PreviousCrustId : PreviousCrustIds)
+		{
+			if (!CurrentCrustIds.Contains(PreviousCrustId))
+			{
+				++MissingCount;
+				if (FirstMissingId == INDEX_NONE)
+				{
+					FirstMissingId = PreviousCrustId;
+				}
+			}
+		}
+
+		Test.TestEqual(
+			FString::Printf(TEXT("%s previous CrustIds persist without silent disappearance"), *Label),
+			MissingCount,
+			0);
+		if (MissingCount > 0)
+		{
+			Test.AddError(FString::Printf(TEXT("%s first missing CrustId=%d"), *Label, FirstMissingId));
+		}
+		return MissingCount == 0;
+	}
+
+	bool CheckDProjectionPreservesOwnershipAndBoundaries(
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const FTectonicPlanet& Projected,
+		const FTectonicPlanet& BaselineProjected)
+	{
+		if (Projected.Samples.Num() != BaselineProjected.Samples.Num())
+		{
+			Test.AddError(FString::Printf(
+				TEXT("%s projected/baseline sample count mismatch %d != %d"),
+				*Label,
+				Projected.Samples.Num(),
+				BaselineProjected.Samples.Num()));
+			return false;
+		}
+
+		int32 PlateMismatchCount = 0;
+		int32 BoundaryMismatchCount = 0;
+		int32 FirstPlateMismatch = INDEX_NONE;
+		int32 FirstBoundaryMismatch = INDEX_NONE;
+		for (int32 SampleIndex = 0; SampleIndex < Projected.Samples.Num(); ++SampleIndex)
+		{
+			const FSample& ProjectedSample = Projected.Samples[SampleIndex];
+			const FSample& BaselineSample = BaselineProjected.Samples[SampleIndex];
+			if (ProjectedSample.PlateId != BaselineSample.PlateId)
+			{
+				++PlateMismatchCount;
+				if (FirstPlateMismatch == INDEX_NONE)
+				{
+					FirstPlateMismatch = SampleIndex;
+				}
+			}
+			if (ProjectedSample.bIsBoundary != BaselineSample.bIsBoundary)
+			{
+				++BoundaryMismatchCount;
+				if (FirstBoundaryMismatch == INDEX_NONE)
+				{
+					FirstBoundaryMismatch = SampleIndex;
+				}
+			}
+		}
+
+		Test.TestEqual(
+			FString::Printf(TEXT("%s D projection preserves PlateId versus no-event baseline"), *Label),
+			PlateMismatchCount,
+			0);
+		Test.TestEqual(
+			FString::Printf(TEXT("%s D projection preserves bIsBoundary versus no-event baseline"), *Label),
+			BoundaryMismatchCount,
+			0);
+		if (PlateMismatchCount > 0)
+		{
+			Test.AddError(FString::Printf(TEXT("%s first PlateId mismatch sample=%d projected=%d baseline=%d"),
+				*Label,
+				FirstPlateMismatch,
+				Projected.Samples[FirstPlateMismatch].PlateId,
+				BaselineProjected.Samples[FirstPlateMismatch].PlateId));
+		}
+		if (BoundaryMismatchCount > 0)
+		{
+			Test.AddError(FString::Printf(TEXT("%s first boundary mismatch sample=%d projected=%d baseline=%d"),
+				*Label,
+				FirstBoundaryMismatch,
+				Projected.Samples[FirstBoundaryMismatch].bIsBoundary ? 1 : 0,
+				BaselineProjected.Samples[FirstBoundaryMismatch].bIsBoundary ? 1 : 0));
+		}
+		return PlateMismatchCount == 0 && BoundaryMismatchCount == 0;
+	}
+
+	bool CheckDProjectionPreservesHighCWMaterial(
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const FTectonicPlanet& Projected,
+		const FTectonicPlanet& BaselineProjected,
+		const double OverlayContinentalWeightThreshold)
+	{
+		if (Projected.Samples.Num() != BaselineProjected.Samples.Num())
+		{
+			Test.AddError(FString::Printf(
+				TEXT("%s projected/baseline sample count mismatch %d != %d"),
+				*Label,
+				Projected.Samples.Num(),
+				BaselineProjected.Samples.Num()));
+			return false;
+		}
+
+		int32 HighCWOverwriteCount = 0;
+		int32 FirstOverwriteIndex = INDEX_NONE;
+		const float Threshold = static_cast<float>(OverlayContinentalWeightThreshold);
+		for (int32 SampleIndex = 0; SampleIndex < Projected.Samples.Num(); ++SampleIndex)
+		{
+			const FSample& ProjectedSample = Projected.Samples[SampleIndex];
+			const FSample& BaselineSample = BaselineProjected.Samples[SampleIndex];
+			if (BaselineSample.ContinentalWeight < Threshold)
+			{
+				continue;
+			}
+			if (ProjectedSample.ContinentalWeight != BaselineSample.ContinentalWeight ||
+				ProjectedSample.Elevation != BaselineSample.Elevation ||
+				ProjectedSample.Thickness != BaselineSample.Thickness ||
+				ProjectedSample.Age != BaselineSample.Age)
+			{
+				++HighCWOverwriteCount;
+				if (FirstOverwriteIndex == INDEX_NONE)
+				{
+					FirstOverwriteIndex = SampleIndex;
+				}
+			}
+		}
+
+		Test.TestEqual(
+			FString::Printf(TEXT("%s D projection preserves all high-CW carried material samples"), *Label),
+			HighCWOverwriteCount,
+			0);
+		if (HighCWOverwriteCount > 0)
+		{
+			Test.AddError(FString::Printf(
+				TEXT("%s first high-CW overwrite sample=%d baseline CW=%.6f projected CW=%.6f"),
+				*Label,
+				FirstOverwriteIndex,
+				BaselineProjected.Samples[FirstOverwriteIndex].ContinentalWeight,
+				Projected.Samples[FirstOverwriteIndex].ContinentalWeight));
+		}
+		return HighCWOverwriteCount == 0;
+	}
+
+	struct FDVisualProjectionStats
+	{
+		int32 ProjectedCrustSampleCount = 0;
+		int32 CrustComponentCount = 0;
+		int32 TinyCrustComponentMaxSize = 10;
+		int32 TinyCrustComponentCount = 0;
+		int32 TinyCrustComponentSampleCount = 0;
+		double TinyCrustComponentSampleFraction = 0.0;
+		int32 LargestCrustComponentSize = 0;
+		int32 SecondLargestCrustComponentSize = 0;
+		int32 ThirdLargestCrustComponentSize = 0;
+		double LargestCrustComponentFraction = 0.0;
+		double Top3CrustComponentFraction = 0.0;
+		double CrustComponentsPerThousandSamples = 0.0;
+		int32 InvalidCrustIdCount = 0;
+		int32 NonFiniteDFieldCount = 0;
+		int32 AgeMismatchCount = 0;
+		int32 ThicknessOutOfBoundsCount = 0;
+		int32 ElevationOutOfBoundsCount = 0;
+		int32 HighCWOverlapCount = 0;
+		int32 HighCWOverwriteCount = 0;
+		int32 MaterialMismatchOverlapCount = 0;
+		double MaterialMismatchOverlapFraction = 0.0;
+		double MeanAgeMy = 0.0;
+		double MaxAgeMy = 0.0;
+	};
+
+	FDVisualProjectionStats ComputeDVisualProjectionStats(
+		const FTectonicPlanetSidecar& Sidecar,
+		const FTectonicPlanet& Projected,
+		const FTectonicPlanet& BaselineProjected)
+	{
+		FDVisualProjectionStats Stats;
+		if (Projected.Samples.Num() != BaselineProjected.Samples.Num())
+		{
+			Stats.InvalidCrustIdCount = 1;
+			return Stats;
+		}
+
+		TArray<uint8> CrustFlags;
+		CrustFlags.SetNumZeroed(Projected.Samples.Num());
+
+		const TArray<int32>& CrustIds = Sidecar.GetLastOceanCrustIds();
+		const TArray<float>& CrustAgesMy = Sidecar.GetLastOceanCrustAgesMy();
+		const TArray<float>& CrustThicknessKm = Sidecar.GetLastOceanCrustThicknessKm();
+		const TArray<uint8>& MaterialMismatchFlags = Sidecar.GetLastMaterialOwnerMismatchFlags();
+		const double DeltaTimeMy = Sidecar.GetConfig().DeltaTimeMy;
+		const float OverlayContinentalWeightThreshold =
+			static_cast<float>(Sidecar.GetConfig().OverlayContinentalWeightThreshold);
+		double TotalAgeMy = 0.0;
+
+		for (int32 SampleIndex = 0; SampleIndex < Projected.Samples.Num(); ++SampleIndex)
+		{
+			const int32 CrustId =
+				CrustIds.IsValidIndex(SampleIndex) ? CrustIds[SampleIndex] : INDEX_NONE;
+			if (CrustId == INDEX_NONE)
+			{
+				continue;
+			}
+
+			CrustFlags[SampleIndex] = 1;
+			++Stats.ProjectedCrustSampleCount;
+
+			const FSample& ProjectedSample = Projected.Samples[SampleIndex];
+			const FSample& BaselineSample = BaselineProjected.Samples[SampleIndex];
+			const FSidecarOceanCrustRecord* Record =
+				FindCrustRecordByIdForTest(Sidecar.GetOceanCrustStore(), CrustId);
+			if (Record == nullptr)
+			{
+				++Stats.InvalidCrustIdCount;
+				continue;
+			}
+
+			const bool bProjectedFieldsFinite =
+				FMath::IsFinite(ProjectedSample.Age) &&
+				FMath::IsFinite(ProjectedSample.Thickness) &&
+				FMath::IsFinite(ProjectedSample.Elevation);
+			const bool bOverlayFieldsFinite =
+				CrustAgesMy.IsValidIndex(SampleIndex) &&
+				CrustThicknessKm.IsValidIndex(SampleIndex) &&
+				FMath::IsFinite(CrustAgesMy[SampleIndex]) &&
+				FMath::IsFinite(CrustThicknessKm[SampleIndex]);
+			if (!bProjectedFieldsFinite || !bOverlayFieldsFinite)
+			{
+				++Stats.NonFiniteDFieldCount;
+			}
+
+			const double ExpectedAgeMy =
+				static_cast<double>(Sidecar.GetCurrentStep() - Record->BirthStep) * DeltaTimeMy;
+			if (FMath::Abs(static_cast<double>(ProjectedSample.Age) - ExpectedAgeMy) > 1.0e-4 ||
+				!CrustAgesMy.IsValidIndex(SampleIndex) ||
+				FMath::Abs(static_cast<double>(CrustAgesMy[SampleIndex]) - ExpectedAgeMy) > 1.0e-4)
+			{
+				++Stats.AgeMismatchCount;
+			}
+			if (ProjectedSample.Thickness < 6.9f || ProjectedSample.Thickness > 7.1f ||
+				!CrustThicknessKm.IsValidIndex(SampleIndex) ||
+				CrustThicknessKm[SampleIndex] < 6.9f || CrustThicknessKm[SampleIndex] > 7.1f)
+			{
+				++Stats.ThicknessOutOfBoundsCount;
+			}
+			if (ProjectedSample.Elevation < -1.1f || ProjectedSample.Elevation > -0.9f)
+			{
+				++Stats.ElevationOutOfBoundsCount;
+			}
+			if (BaselineSample.ContinentalWeight >= OverlayContinentalWeightThreshold)
+			{
+				++Stats.HighCWOverlapCount;
+				if (ProjectedSample.ContinentalWeight != BaselineSample.ContinentalWeight ||
+					ProjectedSample.Elevation != BaselineSample.Elevation ||
+					ProjectedSample.Thickness != BaselineSample.Thickness ||
+					ProjectedSample.Age != BaselineSample.Age)
+				{
+					++Stats.HighCWOverwriteCount;
+				}
+			}
+			if (MaterialMismatchFlags.IsValidIndex(SampleIndex) && MaterialMismatchFlags[SampleIndex] != 0)
+			{
+				++Stats.MaterialMismatchOverlapCount;
+			}
+
+			TotalAgeMy += static_cast<double>(ProjectedSample.Age);
+			Stats.MaxAgeMy = FMath::Max(Stats.MaxAgeMy, static_cast<double>(ProjectedSample.Age));
+		}
+
+		if (Stats.ProjectedCrustSampleCount > 0)
+		{
+			Stats.MeanAgeMy = TotalAgeMy / static_cast<double>(Stats.ProjectedCrustSampleCount);
+			Stats.MaterialMismatchOverlapFraction =
+				static_cast<double>(Stats.MaterialMismatchOverlapCount) /
+				static_cast<double>(Stats.ProjectedCrustSampleCount);
+		}
+
+		TArray<uint8> Visited;
+		Visited.SetNumZeroed(Projected.Samples.Num());
+		TArray<int32> Stack;
+		TArray<int32> ComponentSizes;
+		for (int32 SampleIndex = 0; SampleIndex < Projected.Samples.Num(); ++SampleIndex)
+		{
+			if (CrustFlags[SampleIndex] == 0 || Visited[SampleIndex] != 0)
+			{
+				continue;
+			}
+
+			int32 ComponentSize = 0;
+			Stack.Reset();
+			Stack.Add(SampleIndex);
+			Visited[SampleIndex] = 1;
+			while (!Stack.IsEmpty())
+			{
+				const int32 CurrentSampleIndex = Stack.Pop(EAllowShrinking::No);
+				++ComponentSize;
+				if (!Projected.SampleAdjacency.IsValidIndex(CurrentSampleIndex))
+				{
+					continue;
+				}
+				for (const int32 NeighborIndex : Projected.SampleAdjacency[CurrentSampleIndex])
+				{
+					if (CrustFlags.IsValidIndex(NeighborIndex) &&
+						CrustFlags[NeighborIndex] != 0 &&
+						Visited[NeighborIndex] == 0)
+					{
+						Visited[NeighborIndex] = 1;
+						Stack.Add(NeighborIndex);
+					}
+				}
+			}
+			Stats.LargestCrustComponentSize =
+				FMath::Max(Stats.LargestCrustComponentSize, ComponentSize);
+			ComponentSizes.Add(ComponentSize);
+		}
+
+		if (Stats.ProjectedCrustSampleCount > 0)
+		{
+			ComponentSizes.Sort([](const int32 A, const int32 B)
+			{
+				return A > B;
+			});
+			Stats.CrustComponentCount = ComponentSizes.Num();
+			Stats.LargestCrustComponentSize =
+				ComponentSizes.IsValidIndex(0) ? ComponentSizes[0] : 0;
+			Stats.SecondLargestCrustComponentSize =
+				ComponentSizes.IsValidIndex(1) ? ComponentSizes[1] : 0;
+			Stats.ThirdLargestCrustComponentSize =
+				ComponentSizes.IsValidIndex(2) ? ComponentSizes[2] : 0;
+			Stats.LargestCrustComponentFraction =
+				static_cast<double>(Stats.LargestCrustComponentSize) /
+				static_cast<double>(Stats.ProjectedCrustSampleCount);
+			const int32 Top3ComponentSampleCount =
+				Stats.LargestCrustComponentSize +
+				Stats.SecondLargestCrustComponentSize +
+				Stats.ThirdLargestCrustComponentSize;
+			Stats.Top3CrustComponentFraction =
+				static_cast<double>(Top3ComponentSampleCount) /
+				static_cast<double>(Stats.ProjectedCrustSampleCount);
+			Stats.CrustComponentsPerThousandSamples =
+				1000.0 * static_cast<double>(Stats.CrustComponentCount) /
+				static_cast<double>(Stats.ProjectedCrustSampleCount);
+			for (const int32 ComponentSize : ComponentSizes)
+			{
+				if (ComponentSize <= Stats.TinyCrustComponentMaxSize)
+				{
+					++Stats.TinyCrustComponentCount;
+					Stats.TinyCrustComponentSampleCount += ComponentSize;
+				}
+			}
+			Stats.TinyCrustComponentSampleFraction =
+				static_cast<double>(Stats.TinyCrustComponentSampleCount) /
+				static_cast<double>(Stats.ProjectedCrustSampleCount);
+		}
+		return Stats;
+	}
+
 	bool CheckSidecarADiagnosticGate(
 		FAutomationTestBase& Test,
 		const FTectonicSidecarProjectionDiagnostics& D)
@@ -2785,6 +3212,298 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 		Sidecar.AdvanceSteps(1);
 		TestEqual(TEXT("Prototype D zero-relative motion creates zero crust"), Sidecar.GetOceanCrustStore().Num(), 0);
 		TestEqual(TEXT("Prototype D zero-relative motion appends zero events"), Sidecar.GetCrustEventLog().Num(), 0);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetSidecarPrototypeDVisualGateTest,
+	"Aurous.TectonicPlanet.SidecarPrototypeDVisualGate",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetSidecarPrototypeDVisualGateTest::RunTest(const FString& Parameters)
+{
+	CheckPrototypeDSourceHygieneGate(*this);
+
+	FTectonicSidecarConfig EventConfig = MakeSidecarConfig(
+		ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial,
+		60000,
+		40);
+	EventConfig.bEnableDivergentSpreadingEvents = true;
+	EventConfig.bEnableDOceanCrustProjection = true;
+	EventConfig.DivergentSpreadingMinKmPerMy = 10.0;
+
+	FTectonicSidecarConfig BaselineConfig = EventConfig;
+	BaselineConfig.bEnableDivergentSpreadingEvents = false;
+
+	FTectonicPlanetSidecar EventSidecar;
+	FTectonicPlanetSidecar BaselineSidecar;
+	EventSidecar.Initialize(EventConfig);
+	BaselineSidecar.Initialize(BaselineConfig);
+
+	const int32 Checkpoints[] = { 0, 100, 200, 400 };
+	double Step0BoundaryFraction = 0.0;
+	double PreviousTotalAreaKm2 = 0.0;
+	int32 PreviousCrustRecordCount = 0;
+	int32 PreviousEventCount = 0;
+	TArray<int32> PreviousCrustIds;
+
+	for (const int32 Checkpoint : Checkpoints)
+	{
+		AdvanceToStep(EventSidecar, Checkpoint);
+		AdvanceToStep(BaselineSidecar, Checkpoint);
+
+		const uint32 AuthorityHashBeforeProjection = EventSidecar.ComputeSidecarAuthorityHash();
+		const int32 CrustCountBeforeProjection = EventSidecar.GetOceanCrustStore().Num();
+		const int32 EventCountBeforeProjection = EventSidecar.GetCrustEventLog().Num();
+
+		FTectonicPlanet BaselineProjected;
+		FTectonicSidecarProjectionDiagnostics BaselineDiagnostics;
+		BaselineSidecar.ProjectToPlanet(BaselineProjected, &BaselineDiagnostics);
+
+		FTectonicPlanet Projected;
+		FTectonicSidecarProjectionDiagnostics Diagnostics;
+		EventSidecar.ProjectToPlanet(Projected, &Diagnostics);
+
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d projection preserves sidecar authority hash"), Checkpoint),
+			AuthorityHashBeforeProjection,
+			EventSidecar.ComputeSidecarAuthorityHash());
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d projection preserves crust count"), Checkpoint),
+			CrustCountBeforeProjection,
+			EventSidecar.GetOceanCrustStore().Num());
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d projection preserves event count"), Checkpoint),
+			EventCountBeforeProjection,
+			EventSidecar.GetCrustEventLog().Num());
+
+		if (Checkpoint == 0)
+		{
+			Step0BoundaryFraction = Diagnostics.BoundaryFraction;
+		}
+
+		const FString Label = FString::Printf(TEXT("visual_60k40_step_%03d"), Checkpoint);
+		CheckPrototypeCProjectionValidity(*this, Label, Projected, Diagnostics);
+		CheckPrototypeCIndependentOwnershipAndBoundaries(*this, Label, EventSidecar, Projected);
+		CheckPrototypeCOwnershipGate(*this, Label, Diagnostics, Step0BoundaryFraction);
+		CheckDProjectionPreservesOwnershipAndBoundaries(*this, Label, Projected, BaselineProjected);
+		CheckDProjectionPreservesHighCWMaterial(
+			*this,
+			Label,
+			Projected,
+			BaselineProjected,
+			EventConfig.OverlayContinentalWeightThreshold);
+
+		const FDVisualProjectionStats Stats =
+			ComputeDVisualProjectionStats(EventSidecar, Projected, BaselineProjected);
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d projected crust ids resolve"), Checkpoint),
+			Stats.InvalidCrustIdCount,
+			0);
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d projected D fields are finite"), Checkpoint),
+			Stats.NonFiniteDFieldCount,
+			0);
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d projected D ages match independent step math"), Checkpoint),
+			Stats.AgeMismatchCount,
+			0);
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d projected D thickness remains in placeholder bounds"), Checkpoint),
+			Stats.ThicknessOutOfBoundsCount,
+			0);
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d projected D elevation remains in placeholder bounds"), Checkpoint),
+			Stats.ElevationOutOfBoundsCount,
+			0);
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d D crust avoids high-CW material samples"), Checkpoint),
+			Stats.HighCWOverlapCount,
+			0);
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d D projection does not overwrite high-CW material"), Checkpoint),
+			Stats.HighCWOverwriteCount,
+			0);
+		TestTrue(
+			FString::Printf(TEXT("Prototype D visual step %d material-owner mismatch overlap %.4f <= 0.1000"),
+				Checkpoint,
+				Stats.MaterialMismatchOverlapFraction),
+			Stats.MaterialMismatchOverlapFraction <= 0.10);
+
+		if (Checkpoint == 0)
+		{
+			TestEqual(TEXT("Prototype D visual step 0 has no projected D crust"), Stats.ProjectedCrustSampleCount, 0);
+			TestEqual(TEXT("Prototype D visual step 0 has no crust records"), EventSidecar.GetOceanCrustStore().Num(), 0);
+			TestEqual(TEXT("Prototype D visual step 0 has no event records"), EventSidecar.GetCrustEventLog().Num(), 0);
+		}
+		else
+		{
+			TestTrue(
+				FString::Printf(TEXT("Prototype D visual step %d projects nonzero D crust samples"), Checkpoint),
+				Stats.ProjectedCrustSampleCount > 0);
+			TestTrue(
+				FString::Printf(TEXT("Prototype D visual step %d tiny crust component sample fraction %.4f <= 0.1000"),
+					Checkpoint,
+					Stats.TinyCrustComponentSampleFraction),
+				Stats.TinyCrustComponentSampleFraction <= 0.10);
+		}
+
+		TestTrue(
+			FString::Printf(TEXT("Prototype D visual step %d crust record count monotonic"), Checkpoint),
+			EventSidecar.GetOceanCrustStore().Num() >= PreviousCrustRecordCount);
+		TestTrue(
+			FString::Printf(TEXT("Prototype D visual step %d event log count monotonic"), Checkpoint),
+			EventSidecar.GetCrustEventLog().Num() >= PreviousEventCount);
+		const int32 EventCap = EventSidecar.GetCurrentStep() * 4 * EventConfig.PlateCount;
+		TestTrue(
+			FString::Printf(TEXT("Prototype D visual step %d event log count %d <= cap %d"),
+				Checkpoint,
+				EventSidecar.GetCrustEventLog().Num(),
+				EventCap),
+			EventSidecar.GetCrustEventLog().Num() <= EventCap);
+		TestTrue(
+			FString::Printf(TEXT("Prototype D visual step %d crust store count <= event log count"), Checkpoint),
+			EventSidecar.GetOceanCrustStore().Num() <= EventSidecar.GetCrustEventLog().Num());
+
+		const double TotalAreaKm2 = SumOceanCrustAreaKm2(EventSidecar.GetOceanCrustStore());
+		TestTrue(
+			FString::Printf(TEXT("Prototype D visual step %d total persistent crust area is finite"), Checkpoint),
+			FMath::IsFinite(TotalAreaKm2));
+		if (Checkpoint == 0)
+		{
+			TestTrue(TEXT("Prototype D visual step 0 persistent crust area is zero"), TotalAreaKm2 <= 0.0);
+		}
+		else
+		{
+			TestTrue(
+				FString::Printf(TEXT("Prototype D visual step %d persistent crust area is positive"), Checkpoint),
+				TotalAreaKm2 > 0.0);
+			TestTrue(
+				FString::Printf(TEXT("Prototype D visual step %d persistent crust area is monotonic"), Checkpoint),
+				TotalAreaKm2 + 1.0e-6 >= PreviousTotalAreaKm2);
+		}
+
+		const TArray<int32> CurrentCrustIds = CollectSortedCrustIds(EventSidecar.GetOceanCrustStore());
+		CheckCrustIdsPersist(*this, Label, PreviousCrustIds, CurrentCrustIds);
+		PreviousCrustIds = CurrentCrustIds;
+		PreviousTotalAreaKm2 = TotalAreaKm2;
+		PreviousCrustRecordCount = EventSidecar.GetOceanCrustStore().Num();
+		PreviousEventCount = EventSidecar.GetCrustEventLog().Num();
+
+		TestTrue(
+			FString::Printf(TEXT("Prototype D visual step %d exports review maps"), Checkpoint),
+			ExportSidecarDVisualGateMaps(*this, EventSidecar, Projected, Checkpoint, TEXT("visual_60k40")));
+
+		AddInfo(FString::Printf(
+			TEXT("[SidecarPrototypeDVisualGate] label=visual_60k40 step=%d birth_edges=%d crust_samples=%d component_count=%d components_per_1000=%.3f top_components=%d,%d,%d largest_component_fraction=%.5f top3_component_fraction=%.5f tiny_component_max=%d tiny_component_count=%d tiny_component_samples=%d tiny_component_fraction=%.5f crust_records=%d events=%d mismatch_overlap_fraction=%.5f area_km2=%.3f mean_age_my=%.3f max_age_my=%.3f"),
+			Checkpoint,
+			SumOceanCrustBirthEdgeCount(EventSidecar.GetOceanCrustStore()),
+			Stats.ProjectedCrustSampleCount,
+			Stats.CrustComponentCount,
+			Stats.CrustComponentsPerThousandSamples,
+			Stats.LargestCrustComponentSize,
+			Stats.SecondLargestCrustComponentSize,
+			Stats.ThirdLargestCrustComponentSize,
+			Stats.LargestCrustComponentFraction,
+			Stats.Top3CrustComponentFraction,
+			Stats.TinyCrustComponentMaxSize,
+			Stats.TinyCrustComponentCount,
+			Stats.TinyCrustComponentSampleCount,
+			Stats.TinyCrustComponentSampleFraction,
+			EventSidecar.GetOceanCrustStore().Num(),
+			EventSidecar.GetCrustEventLog().Num(),
+			Stats.MaterialMismatchOverlapFraction,
+			TotalAreaKm2,
+			Stats.MeanAgeMy,
+			Stats.MaxAgeMy));
+	}
+
+	{
+		FTectonicSidecarConfig BelowThresholdConfig = EventConfig;
+		BelowThresholdConfig.DivergentSpreadingMinKmPerMy = 1000000.0;
+		FTectonicPlanetSidecar BelowThresholdSidecar;
+		BelowThresholdSidecar.Initialize(BelowThresholdConfig);
+
+		double BelowThresholdStep0BoundaryFraction = 0.0;
+		for (const int32 Checkpoint : Checkpoints)
+		{
+			AdvanceToStep(BelowThresholdSidecar, Checkpoint);
+
+			FTectonicPlanet Projected;
+			FTectonicSidecarProjectionDiagnostics Diagnostics;
+			const uint32 AuthorityHashBeforeProjection = BelowThresholdSidecar.ComputeSidecarAuthorityHash();
+			BelowThresholdSidecar.ProjectToPlanet(Projected, &Diagnostics);
+			TestEqual(
+				FString::Printf(TEXT("Prototype D below-threshold visual step %d projection preserves authority"), Checkpoint),
+				AuthorityHashBeforeProjection,
+				BelowThresholdSidecar.ComputeSidecarAuthorityHash());
+
+			if (Checkpoint == 0)
+			{
+				BelowThresholdStep0BoundaryFraction = Diagnostics.BoundaryFraction;
+			}
+
+			const FString Label = FString::Printf(TEXT("visual_60k40_below_threshold_step_%03d"), Checkpoint);
+			CheckPrototypeCProjectionValidity(*this, Label, Projected, Diagnostics);
+			CheckPrototypeCIndependentOwnershipAndBoundaries(*this, Label, BelowThresholdSidecar, Projected);
+			CheckPrototypeCOwnershipGate(*this, Label, Diagnostics, BelowThresholdStep0BoundaryFraction);
+			TestEqual(
+				FString::Printf(TEXT("Prototype D below-threshold visual step %d creates zero crust records"), Checkpoint),
+				BelowThresholdSidecar.GetOceanCrustStore().Num(),
+				0);
+			TestEqual(
+				FString::Printf(TEXT("Prototype D below-threshold visual step %d creates zero event records"), Checkpoint),
+				BelowThresholdSidecar.GetCrustEventLog().Num(),
+				0);
+
+			int32 NonBackgroundCrustIds = 0;
+			int32 NonBackgroundCrustAges = 0;
+			int32 NonBackgroundCrustThickness = 0;
+			int32 NonBackgroundCrustEvents = 0;
+			for (int32 SampleIndex = 0; SampleIndex < Projected.Samples.Num(); ++SampleIndex)
+			{
+				NonBackgroundCrustIds +=
+					BelowThresholdSidecar.GetLastOceanCrustIds().IsValidIndex(SampleIndex) &&
+					BelowThresholdSidecar.GetLastOceanCrustIds()[SampleIndex] != INDEX_NONE ? 1 : 0;
+				NonBackgroundCrustAges +=
+					BelowThresholdSidecar.GetLastOceanCrustAgesMy().IsValidIndex(SampleIndex) &&
+					BelowThresholdSidecar.GetLastOceanCrustAgesMy()[SampleIndex] != 0.0f ? 1 : 0;
+				NonBackgroundCrustThickness +=
+					BelowThresholdSidecar.GetLastOceanCrustThicknessKm().IsValidIndex(SampleIndex) &&
+					BelowThresholdSidecar.GetLastOceanCrustThicknessKm()[SampleIndex] != 0.0f ? 1 : 0;
+				NonBackgroundCrustEvents +=
+					BelowThresholdSidecar.GetLastCrustEventOverlayFlags().IsValidIndex(SampleIndex) &&
+					BelowThresholdSidecar.GetLastCrustEventOverlayFlags()[SampleIndex] != 0 ? 1 : 0;
+			}
+			TestEqual(
+				FString::Printf(TEXT("Prototype D below-threshold visual step %d projects zero crust samples"), Checkpoint),
+				NonBackgroundCrustIds,
+				0);
+			TestEqual(
+				FString::Printf(TEXT("Prototype D below-threshold visual step %d age overlay remains background"), Checkpoint),
+				NonBackgroundCrustAges,
+				0);
+			TestEqual(
+				FString::Printf(TEXT("Prototype D below-threshold visual step %d thickness overlay remains background"), Checkpoint),
+				NonBackgroundCrustThickness,
+				0);
+			TestEqual(
+				FString::Printf(TEXT("Prototype D below-threshold visual step %d event overlay remains background"), Checkpoint),
+				NonBackgroundCrustEvents,
+				0);
+			TestTrue(
+				FString::Printf(TEXT("Prototype D below-threshold visual step %d exports uniform review maps"), Checkpoint),
+				ExportSidecarDVisualGateMaps(*this, BelowThresholdSidecar, Projected, Checkpoint, TEXT("visual_60k40_below_threshold")));
+
+			AddInfo(FString::Printf(
+				TEXT("[SidecarPrototypeDVisualGateBelowThreshold] label=visual_60k40_below_threshold step=%d crust_samples=%d crust_records=%d events=%d"),
+				Checkpoint,
+				NonBackgroundCrustIds,
+				BelowThresholdSidecar.GetOceanCrustStore().Num(),
+				BelowThresholdSidecar.GetCrustEventLog().Num()));
+		}
 	}
 
 	return true;
