@@ -249,6 +249,8 @@ namespace
 		MixHashDouble(Hash, Config.MeaningfulHitContainmentScore);
 		MixHashDouble(Hash, Config.DivergenceMinKmPerMy);
 		MixHashDouble(Hash, Config.DivergenceSpeedFraction);
+		MixHashInt32(Hash, Config.RidgeGenerationGapSteps);
+		MixHashDouble(Hash, Config.OverlayContinentalWeightThreshold);
 		MixHashUInt32(Hash, Config.bForceExplicitProjectionAtRestForTest ? 1u : 0u);
 		MixHashInt32(Hash, Sidecar.GetCurrentStep());
 		const FTectonicPlanet& InitialPlanet = Sidecar.GetInitialPlanet();
@@ -323,6 +325,8 @@ namespace
 				}
 			}
 		}
+		MixHashUInt32(Hash, Sidecar.GetOceanCrustStore().ComputeCanonicalHash());
+		MixHashUInt32(Hash, Sidecar.GetCrustEventLog().ComputeAppendOrderHash());
 		return Hash;
 	}
 
@@ -1121,6 +1125,129 @@ namespace
 		Sidecar.SetPlateKinematicsForTest(PlateA, AxisA, AngularSpeedRadPerMy);
 		Sidecar.SetPlateKinematicsForTest(PlateB, AxisB, AngularSpeedRadPerMy);
 	}
+
+	bool FindOwnerEdgeForPair(
+		const FTectonicPlanetSidecar& Sidecar,
+		const int32 PlateA,
+		const int32 PlateB,
+		FSidecarOwnerEdge& OutEdge)
+	{
+		const int32 LowPlateId = FMath::Min(PlateA, PlateB);
+		const int32 HighPlateId = FMath::Max(PlateA, PlateB);
+		for (const FSidecarOwnerEdge& Edge : Sidecar.EnumerateOwnerEdgesSorted())
+		{
+			if (Edge.LowPlateId == LowPlateId && Edge.HighPlateId == HighPlateId)
+			{
+				OutEdge = Edge;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	FSidecarDivergentSpreadingEventInput MakeDivergentEventInputForTest(
+		const FSidecarOwnerEdge& Edge,
+		const int32 PlateA,
+		const int32 PlateB,
+		const double NormalSeparationKmPerMy)
+	{
+		FSidecarOceanCrustBirthEdge BirthEdge;
+		BirthEdge.Key = Edge.Key;
+		BirthEdge.EndpointA = Edge.SampleAPosition * 2.0;
+		BirthEdge.EndpointB = Edge.SampleBPosition * 3.0;
+		BirthEdge.BoundaryNormal = NormalizeOrFallbackForTest(
+			FVector3d::CrossProduct(Edge.Midpoint, Edge.SampleBPosition - Edge.SampleAPosition),
+			MakeTangentFallbackForTest(Edge.Midpoint));
+		BirthEdge.LengthKm = Edge.LengthRad * 6371.0;
+		BirthEdge.NormalSeparationKmPerMy = NormalSeparationKmPerMy;
+
+		FSidecarDivergentSpreadingEventInput Input;
+		Input.PlateA = PlateA;
+		Input.PlateB = PlateB;
+		Input.RidgeGenerationId = 7;
+		Input.BirthEdges.Add(BirthEdge);
+		Input.DebugSampleIds = { Edge.Key.SampleB, Edge.Key.SampleA };
+		Input.RidgeDirection = BirthEdge.BoundaryNormal;
+		Input.CreatedAreaKm2 = 123.0;
+		Input.OceanicAgeMy = 0.0;
+		Input.OceanicThicknessKm = 7.0;
+		Input.ElevationSeedKm = -1.0;
+		return Input;
+	}
+
+	bool CheckPrototypeDSourceHygieneGate(FAutomationTestBase& Test)
+	{
+		const TCHAR* SourcePaths[] =
+		{
+			TEXT("Source/Aurous/Public/TectonicSidecarCrust.h"),
+			TEXT("Source/Aurous/Private/TectonicSidecarCrust.cpp")
+		};
+		const TCHAR* ForbiddenTokens[] =
+		{
+			TEXT("TectonicPlanetV6"),
+			TEXT("QueryOwnership"),
+			TEXT("ActiveZone"),
+			TEXT("QuietInterior"),
+			TEXT("OceanFill"),
+			TEXT("Recovered"),
+			TEXT("Recover"),
+			TEXT("Repair"),
+			TEXT("Heal"),
+			TEXT("Backfill"),
+			TEXT("Resync"),
+			TEXT("Promote"),
+			TEXT("Reclassify")
+		};
+
+		bool bPassed = true;
+		for (const TCHAR* RelativePath : SourcePaths)
+		{
+			const FString FullPath = FPaths::Combine(FPaths::ProjectDir(), RelativePath);
+			FString Contents;
+			if (!FFileHelper::LoadFileToString(Contents, *FullPath))
+			{
+				Test.AddError(FString::Printf(TEXT("Prototype D source hygiene could not read %s"), *FullPath));
+				bPassed = false;
+				continue;
+			}
+			for (const TCHAR* Token : ForbiddenTokens)
+			{
+				if (Contents.Contains(Token))
+				{
+					Test.AddError(FString::Printf(
+						TEXT("Prototype D source hygiene found forbidden token '%s' in %s"),
+						Token,
+						*FullPath));
+					bPassed = false;
+				}
+			}
+		}
+
+		const FString SidecarHeaderPath = FPaths::Combine(
+			FPaths::ProjectDir(),
+			TEXT("Source/Aurous/Public/TectonicPlanetSidecar.h"));
+		FString SidecarHeader;
+		if (!FFileHelper::LoadFileToString(SidecarHeader, *SidecarHeaderPath))
+		{
+			Test.AddError(TEXT("Prototype D source hygiene could not read TectonicPlanetSidecar.h"));
+			return false;
+		}
+
+		if (!SidecarHeader.Contains(TEXT("ApplyDivergentSpreadingEventForTest")))
+		{
+			Test.AddError(TEXT("Prototype D source hygiene expected the test-only Apply...EventForTest seeding API"));
+			bPassed = false;
+		}
+		if (SidecarHeader.Contains(TEXT("ApplyDivergentSpreadingRepair")) ||
+			SidecarHeader.Contains(TEXT("ApplyDivergentSpreadingRecovery")) ||
+			SidecarHeader.Contains(TEXT("ApplyDivergentSpreadingPromote")))
+		{
+			Test.AddError(TEXT("Prototype D source hygiene found repair-shaped Apply API in sidecar header"));
+			bPassed = false;
+		}
+
+		return bPassed;
+	}
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -1759,6 +1886,243 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 	TestTrue(
 		FString::Printf(TEXT("Prototype C automation runtime stays under %.0f seconds"), PrototypeCRuntimeBudgetSeconds),
 		ElapsedSeconds <= PrototypeCRuntimeBudgetSeconds);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetSidecarPrototypeDTest,
+	"Aurous.TectonicPlanet.SidecarPrototypeD",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
+{
+	CheckPrototypeDSourceHygieneGate(*this);
+
+	const FTectonicSidecarConfig Config =
+		MakeSidecarConfig(ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial);
+	TestEqual(TEXT("Prototype D config ridge generation gap defaults to 5 steps"), Config.RidgeGenerationGapSteps, 5);
+	TestEqual(TEXT("Prototype D config overlay continental threshold defaults to 0.5"), Config.OverlayContinentalWeightThreshold, 0.5);
+
+	FTectonicPlanetSidecar EmptyA;
+	FTectonicPlanetSidecar EmptyB;
+	EmptyA.Initialize(Config);
+	EmptyB.Initialize(Config);
+
+	TestEqual(TEXT("Prototype D empty crust store starts empty"), EmptyA.GetOceanCrustStore().Num(), 0);
+	TestEqual(TEXT("Prototype D empty event log starts empty"), EmptyA.GetCrustEventLog().Num(), 0);
+	TestEqual(
+		TEXT("Prototype D empty authority hash is deterministic across identical configs"),
+		EmptyA.ComputeSidecarAuthorityHash(),
+		EmptyB.ComputeSidecarAuthorityHash());
+
+	{
+		FTectonicPlanetSidecar MotionOnly;
+		MotionOnly.Initialize(Config);
+		MotionOnly.AdvanceSteps(5);
+		TestEqual(TEXT("Prototype D AdvanceStep does not create crust"), MotionOnly.GetOceanCrustStore().Num(), 0);
+		TestEqual(TEXT("Prototype D AdvanceStep does not append events"), MotionOnly.GetCrustEventLog().Num(), 0);
+	}
+
+	{
+		const uint32 AuthorityHashBefore = EmptyA.ComputeSidecarAuthorityHash();
+		FTectonicPlanet ProjectedA;
+		FTectonicPlanet ProjectedB;
+		EmptyA.ProjectToPlanet(ProjectedA);
+		const uint32 AuthorityHashAfterA = EmptyA.ComputeSidecarAuthorityHash();
+		EmptyA.ProjectToPlanet(ProjectedB);
+		const uint32 AuthorityHashAfterB = EmptyA.ComputeSidecarAuthorityHash();
+		TestEqual(TEXT("Prototype D projection idempotence preserves authority on first projection"), AuthorityHashBefore, AuthorityHashAfterA);
+		TestEqual(TEXT("Prototype D projection idempotence preserves authority on second projection"), AuthorityHashBefore, AuthorityHashAfterB);
+		TestEqual(TEXT("Prototype D projection idempotence preserves crust count"), EmptyA.GetOceanCrustStore().Num(), 0);
+		TestEqual(TEXT("Prototype D projection idempotence preserves event count"), EmptyA.GetCrustEventLog().Num(), 0);
+
+		if (ProjectedA.Samples.Num() > 0)
+		{
+			ProjectedA.Samples[0].PlateId = 123456;
+			ProjectedA.Samples[0].ContinentalWeight = 0.987f;
+			ProjectedA.Samples[0].Elevation = 42.0f;
+			ProjectedA.Samples[0].bIsBoundary = !ProjectedA.Samples[0].bIsBoundary;
+		}
+		TestEqual(
+			TEXT("Prototype D mutating projected FTectonicPlanet output does not affect sidecar authority"),
+			AuthorityHashBefore,
+			EmptyA.ComputeSidecarAuthorityHash());
+	}
+
+	const TArray<FSidecarOwnerEdge> EmptyEdges = EmptyA.EnumerateOwnerEdgesSorted();
+	TestTrue(TEXT("Prototype D owner-edge helper returns edges"), EmptyEdges.Num() > 0);
+	for (int32 EdgeIndex = 0; EdgeIndex < EmptyEdges.Num(); ++EdgeIndex)
+	{
+		const FSidecarOwnerEdge& Edge = EmptyEdges[EdgeIndex];
+		TestTrue(TEXT("Prototype D owner edge key is valid"), Edge.Key.IsValid());
+		TestTrue(TEXT("Prototype D owner edge crosses two owners"), Edge.LowPlateId != Edge.HighPlateId);
+		if (EdgeIndex > 0)
+		{
+			TestTrue(TEXT("Prototype D owner edges are sorted and unique"),
+				EmptyEdges[EdgeIndex - 1].Key < Edge.Key);
+		}
+	}
+
+	const TArray<FSidecarOwnerEdge> EmptyEdgesRepeat = EmptyB.EnumerateOwnerEdgesSorted();
+	TestEqual(TEXT("Prototype D owner-edge helper deterministic count"), EmptyEdges.Num(), EmptyEdgesRepeat.Num());
+	const int32 EdgeCompareCount = FMath::Min(EmptyEdges.Num(), EmptyEdgesRepeat.Num());
+	for (int32 EdgeIndex = 0; EdgeIndex < EdgeCompareCount; ++EdgeIndex)
+	{
+		TestEqual(TEXT("Prototype D owner-edge helper deterministic sample A"),
+			EmptyEdges[EdgeIndex].Key.SampleA,
+			EmptyEdgesRepeat[EdgeIndex].Key.SampleA);
+		TestEqual(TEXT("Prototype D owner-edge helper deterministic sample B"),
+			EmptyEdges[EdgeIndex].Key.SampleB,
+			EmptyEdgesRepeat[EdgeIndex].Key.SampleB);
+		TestEqual(TEXT("Prototype D owner-edge helper deterministic low plate"),
+			EmptyEdges[EdgeIndex].LowPlateId,
+			EmptyEdgesRepeat[EdgeIndex].LowPlateId);
+		TestEqual(TEXT("Prototype D owner-edge helper deterministic high plate"),
+			EmptyEdges[EdgeIndex].HighPlateId,
+			EmptyEdgesRepeat[EdgeIndex].HighPlateId);
+	}
+
+	FTectonicPlanetSidecar SeedA;
+	FTectonicPlanetSidecar SeedB;
+	SeedA.Initialize(Config);
+	SeedB.Initialize(Config);
+	SeedA.AdvanceSteps(3);
+	SeedB.AdvanceSteps(3);
+	const TArray<FSidecarOwnerEdge> SeedEdges = SeedA.EnumerateOwnerEdgesSorted();
+	TestTrue(TEXT("Prototype D seed sidecar has owner edges"), SeedEdges.Num() >= 2);
+	if (SeedEdges.Num() >= 2)
+	{
+		const FSidecarOwnerEdge SeedEdge = SeedEdges[0];
+		const FSidecarDivergentSpreadingEventInput Input =
+			MakeDivergentEventInputForTest(SeedEdge, SeedEdge.HighPlateId, SeedEdge.LowPlateId, 12.5);
+		const uint32 HashBeforeSeed = SeedA.ComputeSidecarAuthorityHash();
+		int32 CrustId = INDEX_NONE;
+		int32 EventId = INDEX_NONE;
+		TestTrue(TEXT("Prototype D test-only divergent seed succeeds"),
+			SeedA.ApplyDivergentSpreadingEventForTest(Input, &CrustId, &EventId));
+		TestTrue(TEXT("Prototype D test-only divergent seed outputs valid crust id"), CrustId > 0);
+		TestTrue(TEXT("Prototype D test-only divergent seed outputs valid event id"), EventId > 0);
+		TestEqual(TEXT("Prototype D test-only divergent seed appends one crust record"), SeedA.GetOceanCrustStore().Num(), 1);
+		TestEqual(TEXT("Prototype D test-only divergent seed appends one event record"), SeedA.GetCrustEventLog().Num(), 1);
+		TestTrue(TEXT("Prototype D seeded state changes authority hash"),
+			HashBeforeSeed != SeedA.ComputeSidecarAuthorityHash());
+
+		const FSidecarOceanCrustRecord& CrustRecord = SeedA.GetOceanCrustStore().Records[0];
+		const FSidecarCrustEventRecord& EventRecord = SeedA.GetCrustEventLog().Events[0];
+		TestEqual(TEXT("Prototype D crust id starts at 1"), CrustRecord.CrustId, 1);
+		TestEqual(TEXT("Prototype D event id starts at 1"), EventRecord.EventId, 1);
+		TestEqual(TEXT("Prototype D crust birth step matches sidecar step"), CrustRecord.BirthStep, SeedA.GetCurrentStep());
+		TestEqual(TEXT("Prototype D event step matches sidecar step"), EventRecord.Step, SeedA.GetCurrentStep());
+		TestEqual(TEXT("Prototype D crust canonical low plate"), CrustRecord.PlateA, SeedEdge.LowPlateId);
+		TestEqual(TEXT("Prototype D crust canonical high plate"), CrustRecord.PlateB, SeedEdge.HighPlateId);
+		TestEqual(TEXT("Prototype D event canonical low plate"), EventRecord.PlateA, SeedEdge.LowPlateId);
+		TestEqual(TEXT("Prototype D event canonical high plate"), EventRecord.PlateB, SeedEdge.HighPlateId);
+		TestEqual(TEXT("Prototype D crust birth edge source sample A is canonicalized"),
+			CrustRecord.BirthEdges[0].Key.SampleA,
+			SeedEdge.Key.SampleA);
+		TestEqual(TEXT("Prototype D crust birth edge source sample B is canonicalized"),
+			CrustRecord.BirthEdges[0].Key.SampleB,
+			SeedEdge.Key.SampleB);
+		TestTrue(TEXT("Prototype D birth endpoint A is stored normalized from input"),
+			AngularDistanceRadForTest(CrustRecord.BirthEdges[0].EndpointA, Input.BirthEdges[0].EndpointA.GetSafeNormal()) <= 1.0e-10);
+		TestTrue(TEXT("Prototype D birth endpoint B is stored normalized from input"),
+			AngularDistanceRadForTest(CrustRecord.BirthEdges[0].EndpointB, Input.BirthEdges[0].EndpointB.GetSafeNormal()) <= 1.0e-10);
+		TestEqual(TEXT("Prototype D event source edge count"), EventRecord.SourceEdges.Num(), 1);
+		TestEqual(TEXT("Prototype D event source edge sample A is canonicalized"),
+			EventRecord.SourceEdges[0].SampleA,
+			SeedEdge.Key.SampleA);
+		TestEqual(TEXT("Prototype D event source edge sample B is canonicalized"),
+			EventRecord.SourceEdges[0].SampleB,
+			SeedEdge.Key.SampleB);
+		TestEqual(TEXT("Prototype D debug sample ids are sorted"), CrustRecord.DebugSampleIds[0], SeedEdge.Key.SampleA);
+		TestEqual(TEXT("Prototype D debug sample ids are sorted"), CrustRecord.DebugSampleIds[1], SeedEdge.Key.SampleB);
+
+		int32 CrustIdB = INDEX_NONE;
+		int32 EventIdB = INDEX_NONE;
+		TestTrue(TEXT("Prototype D same seed succeeds on identical sidecar"),
+			SeedB.ApplyDivergentSpreadingEventForTest(Input, &CrustIdB, &EventIdB));
+		TestEqual(TEXT("Prototype D same seeded state gives identical authority hash"),
+			SeedA.ComputeSidecarAuthorityHash(),
+			SeedB.ComputeSidecarAuthorityHash());
+
+		const FSidecarDivergentSpreadingEventInput Input2 =
+			MakeDivergentEventInputForTest(SeedEdges[1], SeedEdges[1].LowPlateId, SeedEdges[1].HighPlateId, 15.0);
+		TestTrue(TEXT("Prototype D second seed succeeds for hash policy"),
+			SeedA.ApplyDivergentSpreadingEventForTest(Input2, &CrustId, &EventId));
+		TestEqual(TEXT("Prototype D second seed appends second crust record"), SeedA.GetOceanCrustStore().Num(), 2);
+		TestEqual(TEXT("Prototype D second seed appends second event record"), SeedA.GetCrustEventLog().Num(), 2);
+
+		FSidecarOceanCrustStore StoreForward = SeedA.GetOceanCrustStore();
+		FSidecarOceanCrustStore StoreReordered = StoreForward;
+		Swap(StoreReordered.Records[0], StoreReordered.Records[1]);
+		TestEqual(TEXT("Prototype D crust store hash is stable under record reorder"),
+			StoreForward.ComputeCanonicalHash(),
+			StoreReordered.ComputeCanonicalHash());
+
+		FSidecarCrustEventLog LogForward = SeedA.GetCrustEventLog();
+		FSidecarCrustEventLog LogReordered = LogForward;
+		Swap(LogReordered.Events[0], LogReordered.Events[1]);
+		TestTrue(TEXT("Prototype D event log hash changes when append order changes"),
+			LogForward.ComputeAppendOrderHash() != LogReordered.ComputeAppendOrderHash());
+
+		const uint32 SeedAuthorityBeforeProjection = SeedA.ComputeSidecarAuthorityHash();
+		const int32 SeedCrustCountBeforeProjection = SeedA.GetOceanCrustStore().Num();
+		const int32 SeedEventCountBeforeProjection = SeedA.GetCrustEventLog().Num();
+		FTectonicPlanet SeedProjectedA;
+		FTectonicPlanet SeedProjectedB;
+		SeedA.ProjectToPlanet(SeedProjectedA);
+		SeedA.ProjectToPlanet(SeedProjectedB);
+		TestEqual(TEXT("Prototype D seeded projection preserves authority hash"),
+			SeedAuthorityBeforeProjection,
+			SeedA.ComputeSidecarAuthorityHash());
+		TestEqual(TEXT("Prototype D seeded projection preserves crust count"),
+			SeedCrustCountBeforeProjection,
+			SeedA.GetOceanCrustStore().Num());
+		TestEqual(TEXT("Prototype D seeded projection preserves event count"),
+			SeedEventCountBeforeProjection,
+			SeedA.GetCrustEventLog().Num());
+	}
+
+	{
+		FTectonicPlanetSidecar VelocitySidecar;
+		VelocitySidecar.Initialize(Config);
+		int32 PlateA = INDEX_NONE;
+		int32 PlateB = INDEX_NONE;
+		FVector3d CenterA = FVector3d::ZeroVector;
+		FVector3d CenterB = FVector3d::ZeroVector;
+		FVector3d BoundaryPoint = FVector3d::ZeroVector;
+		TestTrue(TEXT("Prototype D found controlled boundary pair"),
+			FindStrongBoundaryPlatePair(VelocitySidecar, PlateA, PlateB, CenterA, CenterB, BoundaryPoint));
+
+		FSidecarOwnerEdge PairEdge;
+		TestTrue(TEXT("Prototype D found owner edge for controlled pair"),
+			FindOwnerEdgeForPair(VelocitySidecar, PlateA, PlateB, PairEdge));
+
+		ConfigureControlledPair(VelocitySidecar, PlateA, PlateB, CenterA, CenterB, BoundaryPoint, true);
+		double DivergentSpeedKmPerMy = 0.0;
+		TestTrue(TEXT("Prototype D boundary velocity helper computes divergent speed"),
+			VelocitySidecar.ComputeBoundaryNormalSeparationKmPerMy(PairEdge, DivergentSpeedKmPerMy));
+		AddInfo(FString::Printf(TEXT("[SidecarPrototypeDBoundaryVelocity] divergent_km_per_my=%.3f"), DivergentSpeedKmPerMy));
+		TestTrue(TEXT("Prototype D boundary velocity helper reports positive divergent speed"),
+			DivergentSpeedKmPerMy > 1.0);
+
+		ConfigureControlledPair(VelocitySidecar, PlateA, PlateB, CenterA, CenterB, BoundaryPoint, false);
+		double ConvergentSpeedKmPerMy = 0.0;
+		TestTrue(TEXT("Prototype D boundary velocity helper computes convergent speed"),
+			VelocitySidecar.ComputeBoundaryNormalSeparationKmPerMy(PairEdge, ConvergentSpeedKmPerMy));
+		AddInfo(FString::Printf(TEXT("[SidecarPrototypeDBoundaryVelocity] convergent_km_per_my=%.3f"), ConvergentSpeedKmPerMy));
+		TestTrue(TEXT("Prototype D boundary velocity helper reports negative convergent speed"),
+			ConvergentSpeedKmPerMy < -1.0);
+
+		ZeroAllPlateKinematics(VelocitySidecar);
+		double PerpendicularSpeedKmPerMy = 0.0;
+		TestTrue(TEXT("Prototype D boundary velocity helper computes zero-relative control"),
+			VelocitySidecar.ComputeBoundaryNormalSeparationKmPerMy(PairEdge, PerpendicularSpeedKmPerMy));
+		AddInfo(FString::Printf(TEXT("[SidecarPrototypeDBoundaryVelocity] zero_relative_km_per_my=%.6f"), PerpendicularSpeedKmPerMy));
+		TestTrue(TEXT("Prototype D boundary velocity helper reports approximately zero perpendicular/zero-relative speed"),
+			FMath::Abs(PerpendicularSpeedKmPerMy) <= 1.0e-6);
+	}
 
 	return true;
 }

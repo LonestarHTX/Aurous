@@ -11,6 +11,7 @@
 
 #include "CoreMinimal.h"
 #include "TectonicPlanet.h"
+#include "TectonicSidecarCrust.h"
 
 enum class ETectonicSidecarProjectionMode : uint8
 {
@@ -50,6 +51,8 @@ struct AUROUS_API FTectonicSidecarConfig
 	double MeaningfulHitContainmentScore = 0.02;
 	double DivergenceMinKmPerMy = 0.5;
 	double DivergenceSpeedFraction = 0.05;
+	int32 RidgeGenerationGapSteps = 5;
+	double OverlayContinentalWeightThreshold = 0.5;
 	bool bForceExplicitProjectionAtRestForTest = false;
 };
 
@@ -220,15 +223,30 @@ public:
 	const TArray<uint8>& GetLastMaterialOwnerMismatchFlags() const { return LastMaterialOwnerMismatchFlags; }
 	const TArray<int32>& GetLastMaterialOverlapCounts() const { return LastMaterialOverlapCounts; }
 	const TArray<uint8>& GetLastDivergentBoundaryFlags() const { return LastDivergentBoundaryFlags; }
+	const FSidecarOceanCrustStore& GetOceanCrustStore() const { return OceanCrustStore; }
+	const FSidecarCrustEventLog& GetCrustEventLog() const { return CrustEventLog; }
 	int32 GetCurrentStep() const { return CurrentStep; }
 
 	static uint32 ComputeProjectionHash(const FTectonicPlanet& Planet);
+	uint32 ComputeSidecarAuthorityHash() const;
+	// Test-only Slice 1 seeding hook; runtime D mutation APIs must use event-shaped Apply...Event names.
+	bool ApplyDivergentSpreadingEventForTest(
+		const FSidecarDivergentSpreadingEventInput& Input,
+		int32* OutCrustId = nullptr,
+		int32* OutEventId = nullptr);
+	// Pure D read helpers. Slice 2 analytic tests use these instead of event-reported magnitudes.
+	TArray<FSidecarOwnerEdge> EnumerateOwnerEdgesSorted() const;
+	bool ComputeBoundaryNormalSeparationKmPerMy(
+		const FSidecarOwnerEdge& OwnerEdge,
+		double& OutSeparationKmPerMy) const;
 
 private:
 	FTectonicSidecarConfig Config;
 	FTectonicPlanet InitialPlanet;
 	TArray<FTectonicSidecarPlate> Plates;
 	TMap<int32, int32> PlateIndexById;
+	FSidecarOceanCrustStore OceanCrustStore;
+	FSidecarCrustEventLog CrustEventLog;
 	TArray<int32> InitialPlateIds;
 	TArray<float> InitialContinentalWeights;
 	TArray<uint8> InitialBoundaryFlags;
