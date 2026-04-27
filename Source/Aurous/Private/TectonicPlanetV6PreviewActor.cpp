@@ -137,6 +137,10 @@ namespace
 			return TectonicPlanetVisualization::GetContinentalWeightColor(Sample.ContinentalWeight);
 		case ETectonicMapExportMode::BoundaryMask:
 			return TectonicPlanetVisualization::GetBoundaryMaskColor(Sample.bIsBoundary);
+		case ETectonicMapExportMode::GapMask:
+			return TectonicPlanetVisualization::GetGapMaskColor(false);
+		case ETectonicMapExportMode::OverlapMask:
+			return TectonicPlanetVisualization::GetOverlapMaskColor(false);
 		case ETectonicMapExportMode::SubductionDistance:
 			return TectonicPlanetVisualization::GetSubductionDistanceColor(Sample.SubductionDistanceKm);
 		case ETectonicMapExportMode::Elevation:

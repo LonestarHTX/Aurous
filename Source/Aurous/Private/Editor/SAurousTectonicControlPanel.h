@@ -9,6 +9,7 @@
 
 class AActor;
 class ATectonicPlanetActor;
+class ATectonicPlanetSidecarActor;
 class ATectonicPlanetV6PreviewActor;
 class STextComboBox;
 
@@ -24,6 +25,7 @@ private:
 	AActor* GetSelectedActor() const;
 	ATectonicPlanetActor* GetSelectedLegacyActor() const;
 	ATectonicPlanetV6PreviewActor* GetSelectedV6Actor() const;
+	ATectonicPlanetSidecarActor* GetSelectedSidecarActor() const;
 	AActor* FindActorInEditorSelection() const;
 	void SetSelectedActor(AActor* InActor);
 	void SyncPendingSettingsFromActor();

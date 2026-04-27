@@ -64,10 +64,16 @@ namespace
 		case ETectonicMapExportMode::ContinentalWeight:
 			return TectonicPlanetVisualization::GetContinentalWeightColor(Sample.ContinentalWeight);
 
-		case ETectonicMapExportMode::Elevation:
 		case ETectonicMapExportMode::BoundaryMask:
+			return TectonicPlanetVisualization::GetBoundaryMaskColor(Sample.bIsBoundary);
+
 		case ETectonicMapExportMode::GapMask:
+			return TectonicPlanetVisualization::GetGapMaskColor(false);
+
 		case ETectonicMapExportMode::OverlapMask:
+			return TectonicPlanetVisualization::GetOverlapMaskColor(false);
+
+		case ETectonicMapExportMode::Elevation:
 		case ETectonicMapExportMode::All:
 		default:
 			return TectonicPlanetVisualization::GetElevationColor(Sample.Elevation);
