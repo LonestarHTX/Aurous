@@ -71,7 +71,11 @@ namespace
 			return TectonicPlanetVisualization::GetGapMaskColor(false);
 
 		case ETectonicMapExportMode::OverlapMask:
+		case ETectonicMapExportMode::MaterialOverlap:
 			return TectonicPlanetVisualization::GetOverlapMaskColor(false);
+
+		case ETectonicMapExportMode::MaterialClassification:
+			return TectonicPlanetVisualization::GetGapMaskColor(false);
 
 		case ETectonicMapExportMode::Elevation:
 		case ETectonicMapExportMode::All:

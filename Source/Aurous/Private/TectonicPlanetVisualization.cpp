@@ -203,6 +203,10 @@ const TCHAR* TectonicPlanetVisualization::GetExportModeName(const ETectonicMapEx
 		return TEXT("GapMask");
 	case ETectonicMapExportMode::OverlapMask:
 		return TEXT("OverlapMask");
+	case ETectonicMapExportMode::MaterialClassification:
+		return TEXT("MaterialClassification");
+	case ETectonicMapExportMode::MaterialOverlap:
+		return TEXT("MaterialOverlap");
 	case ETectonicMapExportMode::CombinedTectonicSummary:
 		return TEXT("CombinedTectonicSummary");
 	case ETectonicMapExportMode::All:

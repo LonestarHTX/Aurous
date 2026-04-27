@@ -467,6 +467,14 @@ namespace
 				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetOverlapMaskColor(false);
 				break;
 
+			case ETectonicMapExportMode::MaterialClassification:
+				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetGapMaskColor(false);
+				break;
+
+			case ETectonicMapExportMode::MaterialOverlap:
+				OutPixels[PixelIndex] = TectonicPlanetVisualization::GetOverlapMaskColor(false);
+				break;
+
 			case ETectonicMapExportMode::All:
 			default:
 				OutPixels[PixelIndex] = FColor::Black;

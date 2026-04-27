@@ -1,5 +1,6 @@
 #include "Misc/AutomationTest.h"
 
+#include "Misc/FileHelper.h"
 #include "HAL/PlatformFile.h"
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Paths.h"
@@ -230,7 +231,44 @@ namespace
 	uint32 HashSidecarAuthorityState(const FTectonicPlanetSidecar& Sidecar)
 	{
 		uint32 Hash = 2166136261u;
+		const FTectonicSidecarConfig& Config = Sidecar.GetConfig();
+		MixHashInt32(Hash, Config.SampleCount);
+		MixHashInt32(Hash, Config.PlateCount);
+		MixHashInt32(Hash, Config.Seed);
+		MixHashDouble(Hash, Config.PlanetRadiusKm);
+		MixHashDouble(Hash, Config.DeltaTimeMy);
+		MixHashFloat(Hash, Config.InitialContinentalFraction);
+		MixHashFloat(Hash, Config.BoundaryWarpAmplitude);
+		MixHashDouble(Hash, Config.MinPlateSpeedKmPerMy);
+		MixHashDouble(Hash, Config.MaxPlateSpeedKmPerMy);
+		MixHashUInt32(Hash, Config.bForceZeroAngularSpeeds ? 1u : 0u);
+		MixHashUInt32(Hash, static_cast<uint32>(Config.ProjectionMode));
+		MixHashDouble(Hash, Config.RecoveryToleranceRad);
+		MixHashDouble(Hash, Config.MeaningfulHitContainmentScore);
+		MixHashDouble(Hash, Config.DivergenceMinKmPerMy);
+		MixHashDouble(Hash, Config.DivergenceSpeedFraction);
+		MixHashUInt32(Hash, Config.bForceExplicitProjectionAtRestForTest ? 1u : 0u);
 		MixHashInt32(Hash, Sidecar.GetCurrentStep());
+		const FTectonicPlanet& InitialPlanet = Sidecar.GetInitialPlanet();
+		MixHashInt32(Hash, InitialPlanet.CurrentStep);
+		MixHashInt32(Hash, InitialPlanet.Samples.Num());
+		for (const FSample& Sample : InitialPlanet.Samples)
+		{
+			MixHashVector(Hash, Sample.Position);
+			MixHashInt32(Hash, Sample.PlateId);
+			MixHashFloat(Hash, Sample.ContinentalWeight);
+			MixHashFloat(Hash, Sample.Elevation);
+			MixHashFloat(Hash, Sample.Thickness);
+			MixHashFloat(Hash, Sample.Age);
+			MixHashUInt32(Hash, Sample.bIsBoundary ? 1u : 0u);
+		}
+		MixHashInt32(Hash, InitialPlanet.TriangleIndices.Num());
+		for (const FIntVector& Triangle : InitialPlanet.TriangleIndices)
+		{
+			MixHashInt32(Hash, Triangle.X);
+			MixHashInt32(Hash, Triangle.Y);
+			MixHashInt32(Hash, Triangle.Z);
+		}
 		for (const FTectonicSidecarPlate& Plate : Sidecar.GetPlates())
 		{
 			MixHashInt32(Hash, Plate.PlateId);
@@ -244,6 +282,8 @@ namespace
 			MixHashDouble(Hash, Plate.InitialContinentalMass);
 			MixHashDouble(Hash, Plate.InitialFootprintContinentalMass);
 			MixHashDouble(Hash, Plate.SupportDistanceThresholdRad);
+			MixHashVector(Hash, Plate.InitialCoreCentroidLocal);
+			MixHashInt32(Hash, Plate.InitialContinentalCoreSampleCount);
 			MixHashInt32(Hash, Plate.MaterialSamples.Num());
 			for (const FTectonicSidecarMaterialSample& Sample : Plate.MaterialSamples)
 			{
@@ -253,6 +293,17 @@ namespace
 				MixHashFloat(Hash, Sample.Elevation);
 				MixHashFloat(Hash, Sample.Thickness);
 				MixHashFloat(Hash, Sample.Age);
+			}
+			MixHashInt32(Hash, Plate.MaterialGrid.LongitudeBins);
+			MixHashInt32(Hash, Plate.MaterialGrid.LatitudeBins);
+			MixHashInt32(Hash, Plate.MaterialGrid.Bins.Num());
+			for (const TArray<int32>& Bin : Plate.MaterialGrid.Bins)
+			{
+				MixHashInt32(Hash, Bin.Num());
+				for (const int32 SampleIndex : Bin)
+				{
+					MixHashInt32(Hash, SampleIndex);
+				}
 			}
 			MixHashInt32(Hash, Plate.FootprintTriangles.Num());
 			for (const FTectonicSidecarFootprintTriangle& Triangle : Plate.FootprintTriangles)
@@ -358,6 +409,117 @@ namespace
 		return WeightSum > UE_DOUBLE_SMALL_NUMBER
 			? WeightedSum.GetSafeNormal()
 			: FVector3d::ZeroVector;
+	}
+
+	int32 ComputeExpectedVoronoiOwnerForTest(
+		const FTectonicPlanetSidecar& Sidecar,
+		const FVector3d& UnitPosition)
+	{
+		int32 BestPlateId = INDEX_NONE;
+		double BestScore = -TNumericLimits<double>::Max();
+		for (const FTectonicSidecarPlate& Plate : Sidecar.GetPlates())
+		{
+			const FVector3d CurrentCenter = Plate.WorldFromLocal.RotateVector(Plate.InitialCenter).GetSafeNormal();
+			const double Score = FVector3d::DotProduct(UnitPosition, CurrentCenter);
+			if (Score > BestScore ||
+				(FMath::IsNearlyEqual(Score, BestScore) && (BestPlateId == INDEX_NONE || Plate.PlateId < BestPlateId)))
+			{
+				BestScore = Score;
+				BestPlateId = Plate.PlateId;
+			}
+		}
+		return BestPlateId;
+	}
+
+	bool CheckPrototypeCIndependentOwnershipAndBoundaries(
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const FTectonicPlanetSidecar& Sidecar,
+		const FTectonicPlanet& Planet)
+	{
+		TArray<int32> ExpectedOwners;
+		ExpectedOwners.SetNum(Planet.Samples.Num());
+
+		int32 OwnerMismatchCount = 0;
+		int32 FirstOwnerMismatchIndex = INDEX_NONE;
+		for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+		{
+			const int32 ExpectedOwner = ComputeExpectedVoronoiOwnerForTest(
+				Sidecar,
+				Planet.Samples[SampleIndex].Position.GetSafeNormal());
+			ExpectedOwners[SampleIndex] = ExpectedOwner;
+			if (Planet.Samples[SampleIndex].PlateId != ExpectedOwner)
+			{
+				++OwnerMismatchCount;
+				if (FirstOwnerMismatchIndex == INDEX_NONE)
+				{
+					FirstOwnerMismatchIndex = SampleIndex;
+				}
+			}
+		}
+
+		TArray<uint8> ExpectedBoundaryFlags;
+		ExpectedBoundaryFlags.SetNumZeroed(Planet.Samples.Num());
+		int32 BoundaryMismatchCount = 0;
+		int32 FirstBoundaryMismatchIndex = INDEX_NONE;
+		for (int32 SampleIndex = 0; SampleIndex < Planet.Samples.Num(); ++SampleIndex)
+		{
+			bool bExpectedBoundary = false;
+			if (Planet.SampleAdjacency.IsValidIndex(SampleIndex))
+			{
+				for (const int32 NeighborIndex : Planet.SampleAdjacency[SampleIndex])
+				{
+					if (ExpectedOwners.IsValidIndex(NeighborIndex) &&
+						ExpectedOwners[NeighborIndex] != ExpectedOwners[SampleIndex])
+					{
+						bExpectedBoundary = true;
+						break;
+					}
+				}
+			}
+			ExpectedBoundaryFlags[SampleIndex] = bExpectedBoundary ? 1 : 0;
+
+			if (Planet.Samples[SampleIndex].bIsBoundary != bExpectedBoundary)
+			{
+				++BoundaryMismatchCount;
+				if (FirstBoundaryMismatchIndex == INDEX_NONE)
+				{
+					FirstBoundaryMismatchIndex = SampleIndex;
+				}
+			}
+		}
+
+		Test.TestEqual(
+			FString::Printf(TEXT("%s independently recomputed Voronoi owners match every sample"), *Label),
+			OwnerMismatchCount,
+			0);
+		Test.TestEqual(
+			FString::Printf(TEXT("%s independently recomputed raw adjacency boundaries match every sample"), *Label),
+			BoundaryMismatchCount,
+			0);
+
+		if (OwnerMismatchCount > 0 && Planet.Samples.IsValidIndex(FirstOwnerMismatchIndex))
+		{
+			Test.AddError(FString::Printf(
+				TEXT("%s first owner mismatch sample=%d projected=%d expected=%d"),
+				*Label,
+				FirstOwnerMismatchIndex,
+				Planet.Samples[FirstOwnerMismatchIndex].PlateId,
+				ExpectedOwners[FirstOwnerMismatchIndex]));
+		}
+		if (BoundaryMismatchCount > 0 && Planet.Samples.IsValidIndex(FirstBoundaryMismatchIndex))
+		{
+			Test.AddError(FString::Printf(
+				TEXT("%s first boundary mismatch sample=%d projected=%s expected=%s"),
+				*Label,
+				FirstBoundaryMismatchIndex,
+				Planet.Samples[FirstBoundaryMismatchIndex].bIsBoundary ? TEXT("true") : TEXT("false"),
+				ExpectedBoundaryFlags.IsValidIndex(FirstBoundaryMismatchIndex) && ExpectedBoundaryFlags[FirstBoundaryMismatchIndex] != 0
+					? TEXT("true")
+					: TEXT("false")));
+		}
+
+		return OwnerMismatchCount == 0 && BoundaryMismatchCount == 0;
 	}
 
 	void SetUniformPlateKinematicsForTest(
@@ -520,6 +682,23 @@ namespace
 			0.0f,
 			1.0f,
 			FPaths::Combine(OutputDirectory, TEXT("DivergentBoundary.png")));
+		const TCHAR* MandatoryOverlayNames[] = {
+			TEXT("MaterialSource.png"),
+			TEXT("MaterialClassification.png"),
+			TEXT("MaterialOwnerMismatch.png"),
+			TEXT("MaterialOverlap.png"),
+			TEXT("DivergentBoundary.png")
+		};
+		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+		for (const TCHAR* OverlayName : MandatoryOverlayNames)
+		{
+			const FString OverlayPath = FPaths::Combine(OutputDirectory, OverlayName);
+			if (!PlatformFile.FileExists(*OverlayPath))
+			{
+				Test.AddError(FString::Printf(TEXT("[%s] missing mandatory sidecar overlay %s"), *Prefix, *OverlayPath));
+				bExported = false;
+			}
+		}
 		return bExported;
 	}
 
@@ -726,6 +905,55 @@ namespace
 		Require(D.HighCWFragmentationDelta <= 0.05,
 			FString::Printf(TEXT("%s high-CW fragmentation delta was %.6f"), *Label, D.HighCWFragmentationDelta));
 		return bValid;
+	}
+
+	bool CheckPrototypeCSourceContaminationGate(FAutomationTestBase& Test)
+	{
+		const TCHAR* SourcePaths[] = {
+			TEXT("Source/Aurous/Public/TectonicPlanetSidecar.h"),
+			TEXT("Source/Aurous/Private/TectonicPlanetSidecar.cpp"),
+			TEXT("Source/Aurous/Public/TectonicPlanetSidecarActor.h"),
+			TEXT("Source/Aurous/Private/TectonicPlanetSidecarActor.cpp")
+		};
+		const TCHAR* ForbiddenTokens[] = {
+			TEXT("TectonicPlanetV6"),
+			TEXT("QueryOwnership"),
+			TEXT("TriggerEventResampling"),
+			TEXT("EGapResolutionPath"),
+			TEXT("NonDivergentFallbackOceanized"),
+			TEXT("PreserveOwnership"),
+			TEXT("QuietInterior"),
+			TEXT("ActiveZone"),
+			TEXT("ThesisRemesh"),
+			TEXT("GenericQueryCompetition"),
+			TEXT("RetainedSyntheticCoverage"),
+			TEXT("InteriorAdvection")
+		};
+
+		bool bPassed = true;
+		for (const TCHAR* RelativePath : SourcePaths)
+		{
+			const FString FullPath = FPaths::Combine(FPaths::ProjectDir(), RelativePath);
+			FString Contents;
+			if (!FFileHelper::LoadFileToString(Contents, *FullPath))
+			{
+				Test.AddError(FString::Printf(TEXT("Prototype C contamination gate could not read %s"), *FullPath));
+				bPassed = false;
+				continue;
+			}
+			for (const TCHAR* Token : ForbiddenTokens)
+			{
+				if (Contents.Contains(Token))
+				{
+					Test.AddError(FString::Printf(
+						TEXT("Prototype C contamination gate found forbidden token '%s' in %s"),
+						Token,
+						*FullPath));
+					bPassed = false;
+				}
+			}
+		}
+		return bPassed;
 	}
 
 	bool FindStrongBoundaryPlatePair(
@@ -1149,6 +1377,7 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 	PlatformFile.DeleteDirectoryRecursively(*ExportRoot);
 	PlatformFile.CreateDirectoryTree(*ExportRoot);
+	CheckPrototypeCSourceContaminationGate(*this);
 
 	{
 		FTectonicPlanetSidecar A;
@@ -1182,6 +1411,7 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 		FTectonicPlanet Projected0;
 		FTectonicSidecarProjectionDiagnostics Diagnostics0;
 		Sidecar.ProjectToPlanet(Projected0, &Diagnostics0);
+		CheckPrototypeCIndependentOwnershipAndBoundaries(*this, TEXT("zero_motion_step_0"), Sidecar, Projected0);
 		const uint32 DebugHash0 = HashSidecarDebugValues(Sidecar);
 
 		const int32 Checkpoints[] = { 100, 200, 400 };
@@ -1191,6 +1421,11 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 			FTectonicPlanet Projected;
 			FTectonicSidecarProjectionDiagnostics Diagnostics;
 			Sidecar.ProjectToPlanet(Projected, &Diagnostics);
+			CheckPrototypeCIndependentOwnershipAndBoundaries(
+				*this,
+				FString::Printf(TEXT("zero_motion_step_%d"), Checkpoint),
+				Sidecar,
+				Projected);
 			TestEqual(
 				FString::Printf(TEXT("Prototype C zero-motion projection hash remains stable at step %d"), Checkpoint),
 				Diagnostics0.ProjectionHash,
@@ -1259,6 +1494,7 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 				FTectonicSidecarProjectionDiagnostics Diagnostics;
 				Sidecar.ProjectToPlanet(Projected, &Diagnostics);
 				CheckPrototypeCProjectionValidity(*this, TEXT("rigid_advection"), Projected, Diagnostics);
+				CheckPrototypeCIndependentOwnershipAndBoundaries(*this, TEXT("rigid_advection"), Sidecar, Projected);
 
 				const FVector3d ProjectedCentroid = ComputeProjectedContinentalCentroidForTest(
 					Projected,
@@ -1272,15 +1508,23 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 				const double ExpectedDriftKm =
 					AngularDistanceRadForTest(ProjectedCentroid0, ExpectedProjectedCentroid) *
 					Config.PlanetRadiusKm;
+				const double SampleSpacingKm =
+					FMath::Sqrt((4.0 * PI) / FMath::Max(1.0, static_cast<double>(Config.SampleCount))) *
+					Config.PlanetRadiusKm;
+				const double ProjectedCentroidToleranceKm = 4.0 * SampleSpacingKm;
 				AddInfo(FString::Printf(
-					TEXT("[SidecarPrototypeCRigidAdvection] plate=%d weight=%.2f expected_drift_km=%.2f projected_error_km=%.2f"),
+					TEXT("[SidecarPrototypeCRigidAdvection] plate=%d weight=%.2f expected_drift_km=%.2f projected_error_km=%.2f tolerance_km=%.2f"),
 					PlateId,
 					LocalWeight,
 					ExpectedDriftKm,
-					ProjectedErrorKm));
+					ProjectedErrorKm,
+					ProjectedCentroidToleranceKm));
+				TestTrue(
+					TEXT("Prototype C rigid advection expected drift is meaningfully larger than lattice spacing"),
+					ExpectedDriftKm >= 8.0 * SampleSpacingKm);
 				TestTrue(
 					FString::Printf(TEXT("Prototype C projected material centroid follows rigid rotation within lattice tolerance, error %.2f km"), ProjectedErrorKm),
-					ProjectedErrorKm <= 750.0);
+					ProjectedErrorKm <= ProjectedCentroidToleranceKm);
 				TestTrue(
 					TEXT("Prototype C rigid advection does not fabricate material"),
 					Diagnostics.MaterialFabricatedFraction <= 0.0);
@@ -1328,6 +1572,7 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 	{
 		FTectonicPlanetSidecar Sidecar;
 		Sidecar.Initialize(MakeSidecarConfig(ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial));
+		bool bDefaultMotionProducedMaterialOverlap = false;
 
 		const int32 Checkpoints[] = { 0, 100, 200, 400 };
 		for (const int32 Checkpoint : Checkpoints)
@@ -1340,12 +1585,21 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 			{
 				Step0BoundaryFraction = Diagnostics.BoundaryFraction;
 			}
+			if (Checkpoint > 0 && Diagnostics.MaterialOverlapSupportSampleCount > 0)
+			{
+				bDefaultMotionProducedMaterialOverlap = true;
+			}
 			AddSidecarDiagnosticsInfo(*this, TEXT("SidecarPrototypeC"), TEXT("60k40"), Diagnostics);
 			CheckPrototypeCProjectionValidity(
 				*this,
 				FString::Printf(TEXT("60k40_step_%d"), Checkpoint),
 				Projected,
 				Diagnostics);
+			CheckPrototypeCIndependentOwnershipAndBoundaries(
+				*this,
+				FString::Printf(TEXT("60k40_step_%d"), Checkpoint),
+				Sidecar,
+				Projected);
 			CheckPrototypeCOwnershipGate(
 				*this,
 				FString::Printf(TEXT("60k40_step_%d"), Checkpoint),
@@ -1353,6 +1607,9 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 				Step0BoundaryFraction);
 			ExportSidecarCCheckpointMaps(*this, Sidecar, Projected, ExportRoot, Checkpoint, TEXT("60k40"));
 		}
+		TestTrue(
+			TEXT("Prototype C default differential motion exposes material overlap as a separate signal"),
+			bDefaultMotionProducedMaterialOverlap);
 	}
 
 	{
@@ -1380,6 +1637,11 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 				FString::Printf(TEXT("controlled_divergent_step_%d"), Checkpoint),
 				Projected,
 				Diagnostics);
+			CheckPrototypeCIndependentOwnershipAndBoundaries(
+				*this,
+				FString::Printf(TEXT("controlled_divergent_step_%d"), Checkpoint),
+				Sidecar,
+				Projected);
 			TestTrue(
 				FString::Printf(TEXT("Prototype C divergent boundary diagnostic exists at step %d"), Checkpoint),
 				Diagnostics.DivergentBoundaryFraction > 0.0);
@@ -1419,8 +1681,8 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 		Sidecar.ProjectToPlanet(Projected, &Diagnostics);
 		AddSidecarDiagnosticsInfo(*this, TEXT("SidecarPrototypeC"), TEXT("controlled_convergent"), Diagnostics);
 		CheckPrototypeCProjectionValidity(*this, TEXT("controlled_convergent"), Projected, Diagnostics);
-		TestTrue(TEXT("Prototype C convergent projection exposes material conflict"),
-			Diagnostics.MaterialOverlapSupportSampleCount > 0 ||
+		CheckPrototypeCIndependentOwnershipAndBoundaries(*this, TEXT("controlled_convergent"), Sidecar, Projected);
+		TestTrue(TEXT("Prototype C controlled convergent projection exposes material-owner mismatch"),
 			Diagnostics.MaterialOwnerMismatchSampleCount > 0);
 		TestTrue(TEXT("Prototype C convergent event isolation does not look like divergent boundary creation"),
 			Diagnostics.DivergentBoundaryFraction <= 0.01);
@@ -1475,12 +1737,13 @@ bool FTectonicPlanetSidecarPrototypeCTest::RunTest(const FString& Parameters)
 			FMath::Abs(Resolution60k40.StepNMeanContinentalWeight - Resolution250k40.StepNMeanContinentalWeight) <= 0.04);
 		TestTrue(
 			TEXT("Prototype C resolution independence preserves continental centroid drift trend"),
-			FMath::Abs(Resolution60k40.ContinentalCentroidDriftKm - Resolution250k40.ContinentalCentroidDriftKm) <= 500.0);
+			FMath::Abs(Resolution60k40.ContinentalCentroidDriftKm - Resolution250k40.ContinentalCentroidDriftKm) <= 100.0);
 		TestTrue(
 			TEXT("Prototype C resolution independence has no material fabrication at 250k"),
 			Diagnostics.MaterialFabricatedFraction <= 0.0);
 
 		CheckPrototypeCProjectionValidity(*this, TEXT("250k40_smoke"), Projected, Diagnostics);
+		CheckPrototypeCIndependentOwnershipAndBoundaries(*this, TEXT("250k40_smoke"), Sidecar, Projected);
 		CheckPrototypeCOwnershipGate(*this, TEXT("250k40_smoke"), Diagnostics, BaselineDiagnostics.BoundaryFraction);
 		ExportSidecarCCheckpointMaps(*this, Sidecar, Projected, ExportRoot, 40, TEXT("250k40_smoke"));
 	}

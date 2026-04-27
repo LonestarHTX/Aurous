@@ -71,6 +71,9 @@ public:
 	void ShowBoundaryMask();
 
 	UFUNCTION(CallInEditor, Category = "Sidecar C|Visualization")
+	void ShowMaterialClassification();
+
+	UFUNCTION(CallInEditor, Category = "Sidecar C|Visualization")
 	void ShowMaterialOverlap();
 
 protected:

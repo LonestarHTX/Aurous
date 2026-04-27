@@ -5,8 +5,11 @@
 
 enum class ETectonicSidecarProjectionMode : uint8
 {
+	// Prototype A diagnostic harness: material support can drive projected ownership.
 	MaterialSupportDiagnostic,
+	// Prototype B diagnostic harness: explicit advected footprints can create gaps/overlaps.
 	ExplicitFootprints,
+	// Prototype C freeze path: ownership is nearest rotated plate center only.
 	VoronoiOwnershipDecoupledMaterial,
 };
 
@@ -34,6 +37,7 @@ struct AUROUS_API FTectonicSidecarConfig
 	bool bForceZeroAngularSpeeds = false;
 	ETectonicSidecarProjectionMode ProjectionMode = ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial;
 	double RecoveryToleranceRad = -1.0;
+	// Prototype C uses this only to classify material-overlap diagnostics, never ownership.
 	double MeaningfulHitContainmentScore = 0.02;
 	double DivergenceMinKmPerMy = 0.5;
 	double DivergenceSpeedFraction = 0.05;
@@ -219,6 +223,7 @@ private:
 	TArray<int32> InitialPlateIds;
 	TArray<float> InitialContinentalWeights;
 	TArray<uint8> InitialBoundaryFlags;
+	// Projection diagnostic caches. These are not tectonic authority and may be rewritten by const projection.
 	mutable TArray<int32> LastMaterialSourcePlateIds;
 	mutable TArray<uint8> LastMaterialClassifications;
 	mutable TArray<uint8> LastMaterialOwnerMismatchFlags;

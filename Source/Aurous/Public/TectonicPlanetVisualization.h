@@ -14,6 +14,8 @@ enum class ETectonicMapExportMode : uint8
 	BoundaryMask UMETA(DisplayName = "Boundary Mask"),
 	GapMask UMETA(DisplayName = "Gap Mask"),
 	OverlapMask UMETA(DisplayName = "Overlap Mask"),
+	MaterialClassification UMETA(DisplayName = "Material Classification"),
+	MaterialOverlap UMETA(DisplayName = "Material Overlap"),
 	CombinedTectonicSummary UMETA(DisplayName = "Combined Tectonic Summary"),
 	All UMETA(DisplayName = "All")
 };

@@ -66,12 +66,16 @@ namespace
 		case ETectonicMapExportMode::BoundaryMask:
 			return TectonicPlanetVisualization::GetBoundaryMaskColor(Sample.bIsBoundary);
 		case ETectonicMapExportMode::GapMask:
+			return TectonicPlanetVisualization::GetGapMaskColor(false);
+		case ETectonicMapExportMode::OverlapMask:
+			return TectonicPlanetVisualization::GetOverlapMaskColor(false);
+		case ETectonicMapExportMode::MaterialClassification:
 			{
 				const TArray<uint8>& Classes = Sidecar.GetLastMaterialClassifications();
 				const bool bOceanFill = Classes.IsValidIndex(SampleIndex) && IsOceanMaterialClass(Classes[SampleIndex]);
 				return TectonicPlanetVisualization::GetGapMaskColor(bOceanFill);
 			}
-		case ETectonicMapExportMode::OverlapMask:
+		case ETectonicMapExportMode::MaterialOverlap:
 			{
 				const TArray<int32>& Overlaps = Sidecar.GetLastMaterialOverlapCounts();
 				const bool bOverlap = Overlaps.IsValidIndex(SampleIndex) && Overlaps[SampleIndex] > 1;
@@ -205,7 +209,11 @@ void ATectonicPlanetSidecarActor::Generate()
 	}
 #endif
 
-	Sidecar.Initialize(BuildSidecarConfig());
+	const FTectonicSidecarConfig Config = BuildSidecarConfig();
+	checkf(
+		Config.ProjectionMode == ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial,
+		TEXT("Sidecar C actor must remain on VoronoiOwnershipDecoupledMaterial projection mode."));
+	Sidecar.Initialize(Config);
 	bInitialized = true;
 	LastAdvanceStepMs = 0.0;
 	ProjectSidecar();
@@ -348,9 +356,18 @@ void ATectonicPlanetSidecarActor::ShowBoundaryMask()
 	}
 }
 
+void ATectonicPlanetSidecarActor::ShowMaterialClassification()
+{
+	VisualizationMode = ETectonicMapExportMode::MaterialClassification;
+	if (bInitialized)
+	{
+		BuildMesh();
+	}
+}
+
 void ATectonicPlanetSidecarActor::ShowMaterialOverlap()
 {
-	VisualizationMode = ETectonicMapExportMode::OverlapMask;
+	VisualizationMode = ETectonicMapExportMode::MaterialOverlap;
 	if (bInitialized)
 	{
 		BuildMesh();

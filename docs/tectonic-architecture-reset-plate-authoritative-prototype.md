@@ -187,22 +187,36 @@ Fields:
 5. derive projected boundaries from projected neighboring plate regions
 6. emit diagnostics and exports
 
-Prototype A deliberately does not perform tectonic material exchange.
+Prototype A is now the material-support diagnostic harness. It deliberately
+keeps V6 frozen and logs where material-support projection fails under motion.
 
 ### 8.2 Prototype B Loop
 
 Add:
 
-- explicit divergent interface strips
-- coherent oceanic corridor creation only along separating plate pairs
+- explicit advected plate footprints
+- footprint gaps / overlaps as projection diagnostics
+- spatial divergent corridors as a projection-only proof
 
 ### 8.3 Prototype C Loop
 
-Add:
+Replace projection ownership with the frozen foundation:
 
-- convergent consumption of oceanic crust
-- terrane accretion / continental collision mutation
-- localized uplift/orogeny updates
+- ownership is nearest currently rotated plate center, with lowest plate id as tie-break
+- boundaries are raw one-ring owner adjacency
+- carried material projects separately and may disagree with ownership
+- material/owner mismatch, material overlap, and divergent boundary are diagnostics only
+
+Prototype C does not perform tectonic material exchange. It is the ownership,
+boundary, and decoupled-material freeze layer.
+
+### 8.4 Prototype D Loop
+
+Add persistent crust events on top of frozen C:
+
+- persistent divergent oceanic crust identity, age, and thickness
+- named pair-local spreading events
+- later convergent consumption, terrane accretion, collision, rifting, and uplift
 
 ## 9. Reuse From Current Codebase
 
@@ -257,11 +271,19 @@ Prototype A must pass at least:
 
 Prototype B adds:
 
-- Basin-Opening Gate
+- spatial-only Basin-Opening Gate evidence
 
 Prototype C adds:
 
-- Balance Gate
+- frozen ownership/boundary invariants
+- decoupled material advection
+- projection idempotence
+- no V6/v9 ownership-recovery contamination
+
+Prototype D adds:
+
+- persistent Basin-Opening Gate evidence
+- later Balance Gate evidence after explicit crust source/sink processes exist
 
 ## 12. Risks
 
@@ -276,7 +298,8 @@ Prototype C adds:
 2. route projection/export from plate/material state rather than lattice ownership
 3. implement Prototype A with no tectonic exchange
 4. run drift/coherence/boundary acceptance tests
-5. only then add divergent basin opening as Prototype B
+5. freeze Prototype C ownership/material invariants
+6. only then add persistent divergent ocean crust as Prototype D
 
 ## 14. Decision Rule
 

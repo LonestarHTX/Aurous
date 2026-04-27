@@ -140,7 +140,10 @@ namespace
 		case ETectonicMapExportMode::GapMask:
 			return TectonicPlanetVisualization::GetGapMaskColor(false);
 		case ETectonicMapExportMode::OverlapMask:
+		case ETectonicMapExportMode::MaterialOverlap:
 			return TectonicPlanetVisualization::GetOverlapMaskColor(false);
+		case ETectonicMapExportMode::MaterialClassification:
+			return TectonicPlanetVisualization::GetGapMaskColor(false);
 		case ETectonicMapExportMode::SubductionDistance:
 			return TectonicPlanetVisualization::GetSubductionDistanceColor(Sample.SubductionDistanceKm);
 		case ETectonicMapExportMode::Elevation:

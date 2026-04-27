@@ -1628,7 +1628,6 @@ void FTectonicPlanetSidecar::ProjectVoronoiOwnershipDecoupledMaterialToPlanet(
 	BuildProjectedMaterialGrid(Plates, ProjectedMaterialGrid);
 
 	const double SampleAreaUnit = SampleCount > 0 ? (4.0 * PI) / static_cast<double>(SampleCount) : 0.0;
-	const double RecoveryToleranceRad = GetConfiguredRecoveryToleranceRad(Config);
 	const int32 FallbackPlateId = !Plates.IsEmpty() ? Plates[0].PlateId : INDEX_NONE;
 
 	for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)

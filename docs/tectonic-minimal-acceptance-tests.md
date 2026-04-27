@@ -91,6 +91,18 @@ Required evidence:
 3. the corridor persists for `+10` and `+25` steps
 4. opening remains pair-local rather than becoming global speckle
 
+Prototype B note:
+
+Prototype B can satisfy this gate only as a spatial projection proof: a corridor is present at each checkpoint, but the projected ocean fill is created fresh from current footprint geometry. It does not prove persistent identifiable oceanic crust, age gradients, or thickness accumulation.
+
+Prototype C note:
+
+Prototype C intentionally does not attempt this gate. It freezes clean Voronoi ownership, raw adjacency boundaries, and decoupled carried material so later tectonic processes have a stable foundation.
+
+Prototype D note:
+
+Persistent identifiable oceanic crust, age gradients, and thickness accumulation remain Prototype D requirements.
+
 Required visual exports around each audited rift:
 
 - `CombinedTectonicSummary.png`
@@ -180,3 +192,7 @@ Before promoting any future prototype or architecture direction, all of these mu
 5. long-horizon CAF remains in a bounded acceptable regime
 
 If one of those fails, the prototype remains a diagnostic result, not a promoted direction.
+
+Prototype C freeze exception:
+
+Prototype C is promotable only as the ownership/material foundation. It is not a full tectonic promotion and is not expected to satisfy the basin-opening or balance gates until Prototype D and later persistent crust processes exist.

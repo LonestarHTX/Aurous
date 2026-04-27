@@ -41,7 +41,9 @@ void SAurousTectonicControlPanel::Construct(const FArguments& InArgs)
 		MakeShared<FString>(TEXT("ContinentalWeight")),
 		MakeShared<FString>(TEXT("BoundaryMask")),
 		MakeShared<FString>(TEXT("GapMask")),
-		MakeShared<FString>(TEXT("OverlapMask"))
+		MakeShared<FString>(TEXT("OverlapMask")),
+		MakeShared<FString>(TEXT("MaterialClassification")),
+		MakeShared<FString>(TEXT("MaterialOverlap"))
 	};
 
 	SetSelectedActor(FindActorInEditorSelection());
@@ -792,6 +794,14 @@ ETectonicMapExportMode SAurousTectonicControlPanel::GetSelectedVisualizationMode
 	{
 		return ETectonicMapExportMode::OverlapMask;
 	}
+	if (*SelectedItem == TEXT("MaterialClassification"))
+	{
+		return ETectonicMapExportMode::MaterialClassification;
+	}
+	if (*SelectedItem == TEXT("MaterialOverlap"))
+	{
+		return ETectonicMapExportMode::MaterialOverlap;
+	}
 	return ETectonicMapExportMode::Elevation;
 }
 
@@ -827,6 +837,14 @@ void SAurousTectonicControlPanel::SelectVisualizationMode(const ETectonicMapExpo
 
 	case ETectonicMapExportMode::OverlapMask:
 		OptionIndex = 6;
+		break;
+
+	case ETectonicMapExportMode::MaterialClassification:
+		OptionIndex = 7;
+		break;
+
+	case ETectonicMapExportMode::MaterialOverlap:
+		OptionIndex = 8;
 		break;
 
 	case ETectonicMapExportMode::Elevation:
