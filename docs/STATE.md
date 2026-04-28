@@ -64,10 +64,12 @@ Key hardening metrics:
 
 | Metric | Value |
 | --- | --- |
-| C automation runtime | about 32 seconds |
-| D exact automation runtime | about 30 seconds |
-| D visual gate runtime | about 87 seconds |
-| D long-horizon 60k/40 runtime | about 110 seconds |
+| Slice 6 build runtime | 10.7 seconds |
+| C automation runtime | 32.6 seconds |
+| D exact automation runtime | 30.2 seconds |
+| D visual gate runtime | 87.2 seconds |
+| D long-horizon 60k/40 runtime | 109.6 seconds |
+| Slice 6 elevation formula tolerance | `< 1e-6` per D-projected sample |
 | Rigid expected drift | 5600.00 km |
 | Rigid projected error | 4.88 km |
 | Rigid projected tolerance | 368.81 km |
