@@ -20,6 +20,10 @@ D contracts:
 - `docs/architecture/decisions/0002-d-persistent-divergent-ocean-crust.md`
 - `docs/architecture/decisions/0003-d-oceanic-crust-cooling-law.md`
 
+Proposed next contract:
+
+- `docs/architecture/decisions/0004-e-subduction-crust-consumption.md`
+
 Short version:
 
 - owner = nearest currently rotated plate center, lower `PlateId` tie-break
@@ -76,7 +80,7 @@ Key hardening metrics:
 
 Priority order:
 
-1. Draft the next ADR for Prototype E: subduction / crust consumption.
+1. Revise and accept ADR 0004 before any Prototype E code lands.
 2. Preserve C invariants while adding any E behavior.
 3. Treat D balance limits as expected until subduction exists; D creates crust
    and does not consume it.
