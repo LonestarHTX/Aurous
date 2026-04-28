@@ -82,8 +82,8 @@ Key hardening metrics:
 
 Priority order:
 
-1. Run the Prototype E adversarial ADR review and 30-day pre-mortem in
-   `docs/architecture/e-pre-mortem-prompt.md` before any Prototype E code lands.
+1. Fold ADR 0004's accepted Slice 1 data contract into the Prototype E Slice 1
+   implementation plan.
 2. Implement Prototype E Slice 1 as a state/hash scaffold only.
 3. Preserve C invariants while adding any E behavior.
 4. Treat D balance limits as expected until subduction exists; D creates crust

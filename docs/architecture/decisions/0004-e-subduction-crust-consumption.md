@@ -93,6 +93,24 @@ removed or shortened deterministically by subduction events. This lets E
 preserve partially consumed crust without introducing a second ownership system
 or mutating C sample ownership.
 
+Slice 1 interval contract:
+
+- Interval endpoint convention is closed numeric support `[StartT, EndT]` with
+  `0 <= StartT < EndT <= 1`.
+- `ActiveIntervalToleranceT = 1.0e-9` for endpoint comparison, empty-interval
+  removal, and hash normalization.
+- An interval with `EndT - StartT <= ActiveIntervalToleranceT` is empty and
+  must not be stored.
+- Intervals for one edge are sorted by `StartT`, then `EndT`.
+- Overlapping intervals, or intervals separated by
+  `<= ActiveIntervalToleranceT`, are merged during canonicalization.
+- `ActiveIntervalsBySourceEdge` is canonicalized by sorting edge keys
+  ascending, then canonicalizing each edge's interval array.
+- Hashing must use the canonical sorted edge order and canonical sorted interval
+  order. Endpoint values are clamped to `[0, 1]` and normalized to
+  `ActiveIntervalToleranceT` before hashing.
+- NaN/Inf endpoints are invalid and must fail tests.
+
 Minimum new event type:
 
 - `ETectonicSidecarCrustEventType::SubductionConsumption`
@@ -105,6 +123,12 @@ Minimum new event input/record shape:
 - subducting plate id, when known
 - source owner-edge ids
 - consumed area
+- pre-consumption active area
+- post-consumption active area
+- pre-consumption consumed area
+- post-consumption consumed area
+- consumed interval deltas by source edge
+- post-consumption active intervals for every touched source edge
 - convergence speed
 - edge length
 - event step/time
@@ -117,6 +141,16 @@ All new persistent state is sidecar authority and must be included in
 
 The event log remains append-order-sensitive. The crust store remains canonical
 state hashable independent of container order by sorting on `CrustId`.
+
+The event log is replay-sufficient for E consumption. Given the D-created crust
+store state before the first E event, replaying E `SubductionConsumption` records
+in append order must reproduce the same `ActiveIntervalsBySourceEdge`,
+`ActiveAreaKm2`, `ConsumedAreaKm2`, `ConsumedFraction`, `LastConsumedStep`,
+`FullyConsumedStep`, and `bIsFullyConsumed` values as the canonical crust store.
+Each E apply path must mutate the crust store and append the corresponding event
+record through the same event-shaped function. The test-only
+`ApplySubductionConsumptionEventForTest` path must call the same mutation helper
+as runtime E, not a separate store rewrite path.
 
 ## Consumption Rule
 
@@ -194,6 +228,23 @@ separation speed.
 
 The consumed area is capped by the active area remaining on the target crust
 record.
+
+Named field invariants:
+
+- `ActiveAreaKm2 + ConsumedAreaKm2 == CreatedAreaKm2`, within area tolerance.
+- `ConsumedFraction == ConsumedAreaKm2 / CreatedAreaKm2` when
+  `CreatedAreaKm2 > 0`.
+- `ConsumedFraction == 0` when `CreatedAreaKm2 <= 0`.
+- `ActiveAreaKm2 >= 0` and `ConsumedAreaKm2 >= 0`.
+- `ConsumedAreaKm2` is monotonic nondecreasing for a crust record.
+- `ActiveAreaKm2` is monotonic nonincreasing for a crust record after E begins
+  consuming it.
+- `bIsFullyConsumed == true` iff `ActiveAreaKm2 <= AreaToleranceKm2`.
+- `FullyConsumedStep` is set exactly once, at the first step where the record
+  becomes fully consumed.
+
+`AreaToleranceKm2` defaults to `1.0e-6` for Slice 1 and may be revisited only
+with an ADR/test-plan note if numerical scale makes that inappropriate.
 
 E does not physically delete crust records in the first implementation. A
 fully consumed record remains in the store with:
@@ -281,6 +332,10 @@ Required independent computations:
 - expected target crust by age/continental hierarchy
 - expected active area after consumption from prior active area minus expected
   consumed area
+- expected interval clipping by subtracting consumed interval deltas from the
+  prior canonical active intervals
+- expected event-log replay state from append-order replay, compared with the
+  canonical crust store
 - expected projection exclusion for fully consumed crust
 
 No E test may pass only because E diagnostics agree with themselves.
@@ -296,6 +351,7 @@ E must keep these existing gates green:
 
 New E gates, once slices land:
 
+- exact filter `^Aurous.TectonicPlanet.SidecarPrototypeE$`
 - default config creates zero subduction events
 - below-threshold convergence creates zero consumption
 - divergent motion creates zero consumption
@@ -313,6 +369,9 @@ New E gates, once slices land:
 - repeated `ProjectToPlanet` does not mutate consumption state
 - no NaN/Inf in persistent E fields or projected E diagnostics
 - no V6/V9 repair/recovery/ocean-fill authority tokens in E code
+- active intervals canonicalize to identical hashes after edge/interval reorder
+- event-log replay reconstructs store consumption state after seeded events
+- test-only seeding and runtime seeding use the same event-shaped apply helper
 
 ## Implementation Slices
 
@@ -338,6 +397,21 @@ Forbidden:
 - terrain/elevation mutation
 - slab pull
 - collision
+
+Slice 1 names and hygiene:
+
+- Test filter: `^Aurous.TectonicPlanet.SidecarPrototypeE$`.
+- Config defaults live on `FTectonicSidecarConfig` next to D defaults unless
+  Slice 1 proves the E config surface is already large enough to justify a
+  nested struct. Defaults remain off.
+- E mutation APIs must match `^Apply[A-Z][A-Za-z]*Event(ForTest)?$`.
+- Repair-shaped mutation names are review blockers in E files:
+  `Recover`, `Repair`, `Heal`, `Backfill`, `Resync`, `Promote`,
+  `Reclassify`.
+- E mutation/detection files must not reference projection authority tags:
+  `OceanFallback`, `DivergentOceanFill`, `MaterialOwnerMismatch` as a
+  consumable source, `QueryOwnership`, `ActiveZone`, `QuietInterior`, `V6`,
+  or `V9`.
 
 ### Slice 2: Convergent Detection And Consumption
 
@@ -422,15 +496,26 @@ Prototype E does not implement:
 5. D high-resolution 5b evidence is not a prerequisite for E. It can run in
    parallel as confidence evidence.
 
+## Accepted Answers From Pre-Code Review
+
+1. Active intervals must have a canonical endpoint, sort, merge, empty-removal,
+   tolerance, and hash contract before Slice 1 code lands.
+2. The E event log is replay-sufficient for consumption state, not merely audit
+   narration.
+3. `ApplySubductionConsumptionEventForTest` must use the same event-shaped apply
+   helper as runtime E.
+4. `ConsumedFraction` is defined from `ConsumedAreaKm2 / CreatedAreaKm2`, and
+   `ActiveAreaKm2 + ConsumedAreaKm2 == CreatedAreaKm2` is a named invariant.
+5. The Slice 1 test filter, config placement, and E source-hygiene naming rules
+   are part of the acceptance contract.
+
 ## Follow-Up Work
 
 Before any Prototype E code lands:
 
-- run the Prototype E adversarial ADR review and 30-day pre-mortem prompt in
-  `docs/architecture/e-pre-mortem-prompt.md`
-- define Slice 1 field names against `TectonicSidecarCrust.h`
-- write a source-hygiene rule for E mutation APIs
-- define the exact test filter name, likely
-  `Aurous.TectonicPlanet.SidecarPrototypeE`
-- decide whether the `FTectonicSidecarConfig` E defaults should live next to D
-  config or in a nested E config struct
+- confirm the updated pre-code review findings above are represented in the
+  Slice 1 implementation plan
+- define the exact C++ field names against `TectonicSidecarCrust.h` using the
+  contracts in this ADR
+- keep D high-resolution 5b running in parallel as confidence evidence, not as
+  an E Slice 1 blocker
