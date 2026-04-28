@@ -61,6 +61,11 @@ struct AUROUS_API FTectonicSidecarConfig
 	double OceanicAbyssalPlainElevationKm = -6.0;
 	double OceanicElevationDampingKmPerMy = 0.04;
 	double OceanicCrustThicknessKm = 7.0;
+	bool bEnableSubductionConsumptionEvents = false;
+	double SubductionConvergenceMinKmPerMy = 10.0;
+	double ActiveIntervalToleranceT = 1.0e-9;
+	double AreaToleranceKm2 = 1.0e-6;
+	double PrototypeERuntimeBudgetSeconds = 30.0;
 	bool bForceExplicitProjectionAtRestForTest = false;
 };
 
@@ -246,6 +251,10 @@ public:
 	bool ApplyDivergentSpreadingEventForTest(
 		const FSidecarDivergentSpreadingEventInput& Input,
 		int32* OutCrustId = nullptr,
+		int32* OutEventId = nullptr);
+	// Test-only Slice 1 E seeding hook; runtime E must use the same event-shaped apply helper.
+	bool ApplySubductionConsumptionEventForTest(
+		const FSidecarSubductionConsumptionEventInput& Input,
 		int32* OutEventId = nullptr);
 	// Pure D read helpers. Slice 2 analytic tests use these instead of event-reported magnitudes.
 	TArray<FSidecarOwnerEdge> EnumerateOwnerEdgesSorted() const;

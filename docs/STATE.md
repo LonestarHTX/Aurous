@@ -38,6 +38,7 @@ Short version:
 Prototype C freeze tests pass at the baseline commit.
 
 Prototype D Slice 6 passes local validation on the active branch.
+Prototype E Slice 1 passes local validation as a sealed-box state/hash scaffold.
 
 Validated evidence:
 
@@ -55,6 +56,8 @@ Validated evidence:
   overlays through step 400.
 - `Aurous.TectonicPlanet.SidecarPrototypeDLongHorizon` passes 60k/40 through
   step 1000.
+- `Aurous.TectonicPlanet.SidecarPrototypeE` passes with subduction consumption
+  state/hash/replay tests and no runtime E detection or projection behavior.
 - Slice 6 exports `OceanCrustElevation.png` and validates projected D elevation
   against `clamp(-1.0 - 0.04 * AgeMy, -6.0, -1.0)`.
 - Visual review verified the cooling gradient: young ridge crust is bright and
@@ -67,6 +70,7 @@ Key hardening metrics:
 | Slice 6 build runtime | 10.7 seconds |
 | C automation runtime | 32.6 seconds |
 | D exact automation runtime | 30.2 seconds |
+| E scaffold automation runtime | 14.6 seconds |
 | D visual gate runtime | 87.2 seconds |
 | D long-horizon 60k/40 runtime | 109.6 seconds |
 | Slice 6 elevation formula tolerance | `< 1e-6` per D-projected sample |
@@ -82,15 +86,13 @@ Key hardening metrics:
 
 Priority order:
 
-1. Fold ADR 0004's accepted Slice 1 data contract into the Prototype E Slice 1
-   implementation plan.
-2. Implement Prototype E Slice 1 as a state/hash scaffold only.
-3. Preserve C invariants while adding any E behavior.
-4. Treat D balance limits as expected until subduction exists; D creates crust
+1. Plan Prototype E Slice 2 runtime subduction detection against ADR 0004.
+2. Preserve C invariants while adding any E behavior.
+3. Treat D balance limits as expected until subduction exists; D creates crust
    and does not consume it.
-5. Continue 5b high-resolution D long-horizon evidence in parallel as
+4. Continue 5b high-resolution D long-horizon evidence in parallel as
    confidence evidence, not an E prerequisite.
-6. Track, but do not rush, extraction of C into its own class once A/B can be deprecated.
+5. Track, but do not rush, extraction of C into its own class once A/B can be deprecated.
 
 Prototype C does not solve persistent ocean crust. Prototype D now solves the
 first persistent divergent-ocean-crust slice, including age-derived cooling, but
@@ -170,6 +172,19 @@ Slice 5b:
    D crust or abyssal D crust at `-6 km`.
 7. Verify the visual gradient: young ridge crust should be bright and old crust
    should darken toward abyssal depth.
+
+## Reproduce The E Scaffold Gate
+
+1. Build `AurousEditor`.
+2. Run the exact core D filter:
+   - `^Aurous.TectonicPlanet.SidecarPrototypeD$`
+3. Run:
+   - `Aurous.TectonicPlanet.SidecarPrototypeE`
+4. Confirm the E test remains sealed-box: subduction events are test-seeded only,
+   default runtime E creates no records, and `ProjectToPlanet` remains
+   idempotent with E fields present.
+5. Expected runtime budget:
+   - `Aurous.TectonicPlanet.SidecarPrototypeE` <= 30 seconds.
 
 ## Repository Hygiene Snapshot
 

@@ -16,6 +16,7 @@ namespace
 	constexpr double ControlledPairSpeedKmPerMy = 80.0;
 	constexpr int32 PrototypeCResolutionCompareStep = 40;
 	constexpr double PrototypeCRuntimeBudgetSeconds = 90.0;
+	constexpr double PrototypeERuntimeBudgetSeconds = 30.0;
 
 	FString BuildSidecarExportRoot(const FString& RunId)
 	{
@@ -260,6 +261,11 @@ namespace
 		MixHashDouble(Hash, Config.OceanicAbyssalPlainElevationKm);
 		MixHashDouble(Hash, Config.OceanicElevationDampingKmPerMy);
 		MixHashDouble(Hash, Config.OceanicCrustThicknessKm);
+		MixHashUInt32(Hash, Config.bEnableSubductionConsumptionEvents ? 1u : 0u);
+		MixHashDouble(Hash, Config.SubductionConvergenceMinKmPerMy);
+		MixHashDouble(Hash, Config.ActiveIntervalToleranceT);
+		MixHashDouble(Hash, Config.AreaToleranceKm2);
+		MixHashDouble(Hash, Config.PrototypeERuntimeBudgetSeconds);
 		MixHashUInt32(Hash, Config.bForceExplicitProjectionAtRestForTest ? 1u : 0u);
 		MixHashInt32(Hash, Sidecar.GetCurrentStep());
 		const FTectonicPlanet& InitialPlanet = Sidecar.GetInitialPlanet();
@@ -2579,6 +2585,107 @@ namespace
 
 		return bPassed;
 	}
+
+	bool CheckPrototypeESourceHygieneGate(FAutomationTestBase& Test)
+	{
+		const TCHAR* SourcePaths[] =
+		{
+			TEXT("Source/Aurous/Public/TectonicSidecarCrust.h"),
+			TEXT("Source/Aurous/Private/TectonicSidecarCrust.cpp")
+		};
+		const TCHAR* ForbiddenTokens[] =
+		{
+			TEXT("TectonicPlanetV6"),
+			TEXT("QueryOwnership"),
+			TEXT("ActiveZone"),
+			TEXT("QuietInterior"),
+			TEXT("OceanFallback"),
+			TEXT("DivergentOceanFill"),
+			TEXT("Recovered"),
+			TEXT("Recover"),
+			TEXT("Repair"),
+			TEXT("Heal"),
+			TEXT("Backfill"),
+			TEXT("Resync"),
+			TEXT("Promote"),
+			TEXT("Reclassify")
+		};
+
+		bool bPassed = true;
+		for (const TCHAR* RelativePath : SourcePaths)
+		{
+			const FString FullPath = FPaths::Combine(FPaths::ProjectDir(), RelativePath);
+			FString Contents;
+			if (!FFileHelper::LoadFileToString(Contents, *FullPath))
+			{
+				Test.AddError(FString::Printf(TEXT("Prototype E source hygiene could not read %s"), *FullPath));
+				bPassed = false;
+				continue;
+			}
+			for (const TCHAR* Token : ForbiddenTokens)
+			{
+				if (Contents.Contains(Token))
+				{
+					Test.AddError(FString::Printf(
+						TEXT("Prototype E source hygiene found forbidden token '%s' in %s"),
+						Token,
+						*FullPath));
+					bPassed = false;
+				}
+			}
+		}
+
+		const FString SidecarHeaderPath = FPaths::Combine(
+			FPaths::ProjectDir(),
+			TEXT("Source/Aurous/Public/TectonicPlanetSidecar.h"));
+		FString SidecarHeader;
+		if (!FFileHelper::LoadFileToString(SidecarHeader, *SidecarHeaderPath))
+		{
+			Test.AddError(TEXT("Prototype E source hygiene could not read TectonicPlanetSidecar.h"));
+			return false;
+		}
+		if (!SidecarHeader.Contains(TEXT("ApplySubductionConsumptionEventForTest")))
+		{
+			Test.AddError(TEXT("Prototype E source hygiene expected the test-only Apply...EventForTest seeding API"));
+			bPassed = false;
+		}
+
+		const FString SidecarCppPath = FPaths::Combine(
+			FPaths::ProjectDir(),
+			TEXT("Source/Aurous/Private/TectonicPlanetSidecar.cpp"));
+		FString SidecarCpp;
+		if (!FFileHelper::LoadFileToString(SidecarCpp, *SidecarCppPath))
+		{
+			Test.AddError(TEXT("Prototype E source hygiene could not read TectonicPlanetSidecar.cpp"));
+			return false;
+		}
+		if (!SidecarCpp.Contains(TEXT("FTectonicPlanetSidecar::ApplySubductionConsumptionEventForTest")))
+		{
+			Test.AddError(TEXT("Prototype E source hygiene expected the sidecar test-only ApplySubductionConsumptionEventForTest implementation"));
+			bPassed = false;
+		}
+
+		const FString StartMarker = TEXT("void FTectonicPlanetSidecar::AdvanceStep()");
+		const FString EndMarker = TEXT("void FTectonicPlanetSidecar::AdvanceSteps");
+		const int32 StartIndex = SidecarCpp.Find(StartMarker);
+		const int32 EndIndex = SidecarCpp.Find(EndMarker);
+		if (StartIndex == INDEX_NONE || EndIndex == INDEX_NONE || EndIndex <= StartIndex)
+		{
+			Test.AddError(TEXT("Prototype E source hygiene could not isolate AdvanceStep"));
+			bPassed = false;
+		}
+		else
+		{
+			const FString AdvanceStepRegion = SidecarCpp.Mid(StartIndex, EndIndex - StartIndex);
+			if (AdvanceStepRegion.Contains(TEXT("SubductionConsumption")))
+			{
+				Test.AddError(TEXT("Prototype E Slice 1 must not add runtime subduction calls to AdvanceStep"));
+				bPassed = false;
+			}
+		}
+
+		return bPassed;
+	}
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
@@ -3767,6 +3874,303 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 		TestEqual(TEXT("Prototype D zero-relative motion creates zero crust"), Sidecar.GetOceanCrustStore().Num(), 0);
 		TestEqual(TEXT("Prototype D zero-relative motion appends zero events"), Sidecar.GetCrustEventLog().Num(), 0);
 	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetSidecarPrototypeETest,
+	"Aurous.TectonicPlanet.SidecarPrototypeE",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetSidecarPrototypeETest::RunTest(const FString& Parameters)
+{
+	const double StartSeconds = FPlatformTime::Seconds();
+	CheckPrototypeESourceHygieneGate(*this);
+
+	const FTectonicSidecarConfig Config =
+		MakeSidecarConfig(ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial);
+	TestEqual(TEXT("Prototype E subduction events default disabled"), Config.bEnableSubductionConsumptionEvents, false);
+	TestEqual(TEXT("Prototype E convergence threshold defaults to 10 km/My"), Config.SubductionConvergenceMinKmPerMy, 10.0);
+	TestEqual(TEXT("Prototype E active interval tolerance defaults to 1e-9"), Config.ActiveIntervalToleranceT, 1.0e-9);
+	TestEqual(TEXT("Prototype E area tolerance defaults to 1e-6 km2"), Config.AreaToleranceKm2, 1.0e-6);
+	TestEqual(TEXT("Prototype E runtime budget defaults to 30 seconds"), Config.PrototypeERuntimeBudgetSeconds, PrototypeERuntimeBudgetSeconds);
+
+	FTectonicPlanetSidecar DefaultSidecar;
+	FTectonicPlanetSidecar DefaultBaseline;
+	DefaultSidecar.Initialize(Config);
+	DefaultBaseline.Initialize(Config);
+	DefaultSidecar.AdvanceSteps(5);
+	TestEqual(TEXT("Prototype E default config creates zero crust records"), DefaultSidecar.GetOceanCrustStore().Num(), 0);
+	TestEqual(TEXT("Prototype E default config appends zero events"), DefaultSidecar.GetCrustEventLog().Num(), 0);
+
+	{
+		FTectonicPlanet ProjectedA;
+		FTectonicPlanet ProjectedB;
+		FTectonicSidecarProjectionDiagnostics DiagnosticsA;
+		FTectonicSidecarProjectionDiagnostics DiagnosticsB;
+		const uint32 AuthorityBeforeProjection = DefaultBaseline.ComputeSidecarAuthorityHash();
+		DefaultBaseline.ProjectToPlanet(ProjectedA, &DiagnosticsA);
+		DefaultBaseline.ProjectToPlanet(ProjectedB, &DiagnosticsB);
+		CheckProjectedSampleArraysEqual(*this, TEXT("Prototype E defaults-off Slice 6 sample-array baseline"), ProjectedA, ProjectedB);
+		TestEqual(
+			TEXT("Prototype E defaults-off Slice 6 diagnostics baseline"),
+			HashProjectionDiagnosticsForTest(DiagnosticsA),
+			HashProjectionDiagnosticsForTest(DiagnosticsB));
+		TestEqual(
+			TEXT("Prototype E defaults-off projection idempotence preserves authority hash"),
+			AuthorityBeforeProjection,
+			DefaultBaseline.ComputeSidecarAuthorityHash());
+		TestEqual(
+			TEXT("Prototype E defaults-off projection hash baseline"),
+			DiagnosticsA.ProjectionHash,
+			DiagnosticsB.ProjectionHash);
+	}
+
+	FTectonicPlanetSidecar SeedA;
+	FTectonicPlanetSidecar SeedB;
+	SeedA.Initialize(Config);
+	SeedB.Initialize(Config);
+	SeedA.AdvanceSteps(3);
+	SeedB.AdvanceSteps(3);
+
+	const TArray<FSidecarOwnerEdge> SeedEdges = SeedA.EnumerateOwnerEdgesSorted();
+	TestTrue(TEXT("Prototype E seed sidecar has owner edges"), SeedEdges.Num() >= 1);
+	if (SeedEdges.Num() >= 1)
+	{
+		const FSidecarOwnerEdge SeedEdge = SeedEdges[0];
+		const FSidecarDivergentSpreadingEventInput DivergentInput =
+			MakeDivergentEventInputForTest(SeedEdge, SeedEdge.HighPlateId, SeedEdge.LowPlateId, 12.5);
+		int32 CrustIdA = INDEX_NONE;
+		int32 DivergentEventIdA = INDEX_NONE;
+		TestTrue(TEXT("Prototype E D baseline divergent seed succeeds"),
+			SeedA.ApplyDivergentSpreadingEventForTest(DivergentInput, &CrustIdA, &DivergentEventIdA));
+		int32 CrustIdB = INDEX_NONE;
+		int32 DivergentEventIdB = INDEX_NONE;
+		TestTrue(TEXT("Prototype E D baseline divergent seed succeeds on twin"),
+			SeedB.ApplyDivergentSpreadingEventForTest(DivergentInput, &CrustIdB, &DivergentEventIdB));
+		TestEqual(TEXT("Prototype E D baseline crust id deterministic"), CrustIdA, CrustIdB);
+		TestEqual(TEXT("Prototype E D baseline event id deterministic"), DivergentEventIdA, DivergentEventIdB);
+
+		const FSidecarOceanCrustStore BaselineStore = SeedA.GetOceanCrustStore();
+		TestEqual(TEXT("Prototype E D baseline has one active crust record"), BaselineStore.Num(), 1);
+		TestEqual(TEXT("Prototype E D baseline active area equals created area"),
+			BaselineStore.Records[0].ActiveAreaKm2,
+			BaselineStore.Records[0].CreatedAreaKm2);
+		TestEqual(TEXT("Prototype E D baseline consumed area starts zero"), BaselineStore.Records[0].ConsumedAreaKm2, 0.0);
+		TestEqual(TEXT("Prototype E D baseline full active interval edge count"), BaselineStore.Records[0].ActiveIntervalsBySourceEdge.Num(), 1);
+
+		FSidecarSubductionConsumptionEventInput SubductionInput;
+		SubductionInput.CrustId = CrustIdA;
+		SubductionInput.PlateA = SeedEdge.HighPlateId;
+		SubductionInput.PlateB = SeedEdge.LowPlateId;
+		SubductionInput.SubductingPlateId = SeedEdge.HighPlateId;
+		SubductionInput.OverridingPlateId = SeedEdge.LowPlateId;
+		SubductionInput.SourceEdges = {
+			FSidecarBoundaryEdgeKey::Make(SeedEdge.Key.SampleB, SeedEdge.Key.SampleA),
+			FSidecarBoundaryEdgeKey::Make(SeedEdge.Key.SampleA, SeedEdge.Key.SampleB)
+		};
+		FSidecarActiveEdgeIntervals NonCanonicalIntervalsA;
+		NonCanonicalIntervalsA.Key = FSidecarBoundaryEdgeKey::Make(SeedEdge.Key.SampleB, SeedEdge.Key.SampleA);
+		NonCanonicalIntervalsA.Intervals = {
+			{ 0.6, 0.8 },
+			{ 0.2, 0.4 },
+			{ 0.4000000005, 0.6 },
+			{ -0.5, 0.1 },
+			{ 0.9, 0.9000000001 }
+		};
+		FSidecarActiveEdgeIntervals NonCanonicalIntervalsB;
+		NonCanonicalIntervalsB.Key = FSidecarBoundaryEdgeKey::Make(SeedEdge.Key.SampleA, SeedEdge.Key.SampleB);
+		NonCanonicalIntervalsB.Intervals = {
+			{ 1.2, 1.4 }
+		};
+		SubductionInput.ConsumedIntervalsBySourceEdge = { NonCanonicalIntervalsA, NonCanonicalIntervalsB };
+		SubductionInput.DebugSampleIds = { SeedEdge.Key.SampleB, SeedEdge.Key.SampleA, SeedEdge.Key.SampleA };
+		SubductionInput.ConsumedAreaKm2 = 25.0;
+		SubductionInput.ConvergenceSpeedKmPerMy = 33.0;
+		SubductionInput.EdgeLengthKm = 44.0;
+		SubductionInput.CrustAgeAtConsumptionMy = 6.0;
+		SubductionInput.ProjectedElevationAtConsumptionKm = -1.24;
+
+		const uint32 AuthorityHashBeforeESeed = SeedA.ComputeSidecarAuthorityHash();
+		const int32 EventCountBeforeESeed = SeedA.GetCrustEventLog().Num();
+		int32 SubductionEventIdA = INDEX_NONE;
+		TestTrue(TEXT("Prototype E test-only subduction seed succeeds"),
+			SeedA.ApplySubductionConsumptionEventForTest(SubductionInput, &SubductionEventIdA));
+		TestTrue(TEXT("Prototype E test-only subduction seed outputs valid event id"), SubductionEventIdA > 0);
+		TestEqual(TEXT("Prototype E test-only subduction seed appends exactly one event"),
+			SeedA.GetCrustEventLog().Num(),
+			EventCountBeforeESeed + 1);
+		TestTrue(TEXT("Prototype E seeded state changes authority hash"),
+			AuthorityHashBeforeESeed != SeedA.ComputeSidecarAuthorityHash());
+
+		const FSidecarOceanCrustRecord& ConsumedRecord = SeedA.GetOceanCrustStore().Records[0];
+		const FSidecarCrustEventRecord& SubductionEvent = SeedA.GetCrustEventLog().Events.Last();
+		TestEqual(TEXT("Prototype E subduction event type is explicit"),
+			static_cast<int32>(SubductionEvent.EventType),
+			static_cast<int32>(ETectonicSidecarCrustEventType::SubductionConsumption));
+		TestEqual(TEXT("Prototype E subduction event crust id"), SubductionEvent.CrustId, CrustIdA);
+		TestEqual(TEXT("Prototype E subduction event canonical low plate"), SubductionEvent.PlateA, SeedEdge.LowPlateId);
+		TestEqual(TEXT("Prototype E subduction event canonical high plate"), SubductionEvent.PlateB, SeedEdge.HighPlateId);
+		TestEqual(TEXT("Prototype E subduction event step matches sidecar step"), SubductionEvent.Step, SeedA.GetCurrentStep());
+		TestEqual(TEXT("Prototype E subduction pre-active area"), SubductionEvent.PreActiveAreaKm2, 123.0);
+		TestEqual(TEXT("Prototype E subduction post-active area"), SubductionEvent.PostActiveAreaKm2, 98.0);
+		TestEqual(TEXT("Prototype E subduction pre-consumed area"), SubductionEvent.PreConsumedAreaKm2, 0.0);
+		TestEqual(TEXT("Prototype E subduction post-consumed area"), SubductionEvent.PostConsumedAreaKm2, 25.0);
+		TestEqual(TEXT("Prototype E subduction event consumed area"), SubductionEvent.ConsumedAreaKm2, 25.0);
+		TestEqual(TEXT("Prototype E subduction convergence speed field"), SubductionEvent.ConvergenceSpeedKmPerMy, 33.0);
+		TestEqual(TEXT("Prototype E subduction edge length field"), SubductionEvent.EdgeLengthKm, 44.0);
+		TestEqual(TEXT("Prototype E subduction age-at-consumption field"), SubductionEvent.CrustAgeAtConsumptionMy, 6.0);
+		TestEqual(TEXT("Prototype E subduction elevation-at-consumption field"),
+			SubductionEvent.ProjectedElevationAtConsumptionKm,
+			-1.24);
+
+		TestEqual(TEXT("Prototype E consumed interval canonical edge count"),
+			SubductionEvent.ConsumedIntervalDeltasBySourceEdge.Num(),
+			1);
+		TestEqual(TEXT("Prototype E consumed interval canonical sample A"),
+			SubductionEvent.ConsumedIntervalDeltasBySourceEdge[0].Key.SampleA,
+			SeedEdge.Key.SampleA);
+		TestEqual(TEXT("Prototype E consumed interval canonical sample B"),
+			SubductionEvent.ConsumedIntervalDeltasBySourceEdge[0].Key.SampleB,
+			SeedEdge.Key.SampleB);
+		TestEqual(TEXT("Prototype E consumed interval canonical interval count"),
+			SubductionEvent.ConsumedIntervalDeltasBySourceEdge[0].Intervals.Num(),
+			2);
+		TestEqual(TEXT("Prototype E consumed interval 0 start"), SubductionEvent.ConsumedIntervalDeltasBySourceEdge[0].Intervals[0].StartT, 0.0);
+		TestEqual(TEXT("Prototype E consumed interval 0 end"), SubductionEvent.ConsumedIntervalDeltasBySourceEdge[0].Intervals[0].EndT, 0.1);
+		TestEqual(TEXT("Prototype E consumed interval 1 start"), SubductionEvent.ConsumedIntervalDeltasBySourceEdge[0].Intervals[1].StartT, 0.2);
+		TestEqual(TEXT("Prototype E consumed interval 1 end"), SubductionEvent.ConsumedIntervalDeltasBySourceEdge[0].Intervals[1].EndT, 0.8);
+
+		TestEqual(TEXT("Prototype E post-consumption active interval edge count"),
+			ConsumedRecord.ActiveIntervalsBySourceEdge.Num(),
+			1);
+		TestEqual(TEXT("Prototype E post-consumption active interval count"),
+			ConsumedRecord.ActiveIntervalsBySourceEdge[0].Intervals.Num(),
+			2);
+		TestEqual(TEXT("Prototype E active interval keeps half-open left remainder start"),
+			ConsumedRecord.ActiveIntervalsBySourceEdge[0].Intervals[0].StartT,
+			0.1);
+		TestEqual(TEXT("Prototype E active interval keeps half-open left remainder end"),
+			ConsumedRecord.ActiveIntervalsBySourceEdge[0].Intervals[0].EndT,
+			0.2);
+		TestEqual(TEXT("Prototype E active interval keeps half-open right remainder start"),
+			ConsumedRecord.ActiveIntervalsBySourceEdge[0].Intervals[1].StartT,
+			0.8);
+		TestEqual(TEXT("Prototype E active interval keeps half-open right remainder end"),
+			ConsumedRecord.ActiveIntervalsBySourceEdge[0].Intervals[1].EndT,
+			1.0);
+
+		TestTrue(TEXT("Prototype E consumed fraction bounded"),
+			ConsumedRecord.ConsumedFraction >= 0.0 && ConsumedRecord.ConsumedFraction <= 1.0);
+		TestTrue(TEXT("Prototype E area conservation holds after partial consumption"),
+			FMath::Abs(
+				(ConsumedRecord.ActiveAreaKm2 + ConsumedRecord.ConsumedAreaKm2) -
+				ConsumedRecord.CreatedAreaKm2) <= Config.AreaToleranceKm2);
+		TestTrue(TEXT("Prototype E consumed area is monotonic"), ConsumedRecord.ConsumedAreaKm2 >= 25.0);
+		TestTrue(TEXT("Prototype E active area is monotonic downward"), ConsumedRecord.ActiveAreaKm2 <= 98.0);
+		TestEqual(TEXT("Prototype E fully consumed flag remains false after partial consumption"),
+			ConsumedRecord.bIsFullyConsumed,
+			false);
+		TestEqual(TEXT("Prototype E fully consumed step remains unset after partial consumption"),
+			ConsumedRecord.FullyConsumedStep,
+			INDEX_NONE);
+
+		FSidecarOceanCrustStore StoreForward = SeedA.GetOceanCrustStore();
+		FSidecarOceanCrustStore StoreReordered = StoreForward;
+		Swap(
+			StoreReordered.Records[0].ActiveIntervalsBySourceEdge[0].Intervals[0],
+			StoreReordered.Records[0].ActiveIntervalsBySourceEdge[0].Intervals[1]);
+		TestEqual(TEXT("Prototype E crust store hash canonicalizes nested interval order"),
+			StoreForward.ComputeCanonicalHash(),
+			StoreReordered.ComputeCanonicalHash());
+
+		int32 SubductionEventIdB = INDEX_NONE;
+		TestTrue(TEXT("Prototype E same noncanonical seed succeeds on twin"),
+			SeedB.ApplySubductionConsumptionEventForTest(SubductionInput, &SubductionEventIdB));
+		TestEqual(TEXT("Prototype E same seeded state gives identical authority hash"),
+			SeedA.ComputeSidecarAuthorityHash(),
+			SeedB.ComputeSidecarAuthorityHash());
+		TestEqual(TEXT("Prototype E same seeded state gives identical store hash"),
+			SeedA.GetOceanCrustStore().ComputeCanonicalHash(),
+			SeedB.GetOceanCrustStore().ComputeCanonicalHash());
+		TestEqual(TEXT("Prototype E same seeded state gives identical event log hash"),
+			SeedA.GetCrustEventLog().ComputeAppendOrderHash(),
+			SeedB.GetCrustEventLog().ComputeAppendOrderHash());
+
+		SeedA.AdvanceStep();
+		FSidecarSubductionConsumptionEventInput FinalConsumeInput = SubductionInput;
+		FinalConsumeInput.ConsumedIntervalsBySourceEdge.Reset();
+		FSidecarActiveEdgeIntervals FinalIntervals;
+		FinalIntervals.Key = SeedEdge.Key;
+		FinalIntervals.Intervals = {
+			{ 0.1, 0.2 },
+			{ 0.8, 1.0 }
+		};
+		FinalConsumeInput.ConsumedIntervalsBySourceEdge.Add(FinalIntervals);
+		FinalConsumeInput.SourceEdges = { SeedEdge.Key };
+		FinalConsumeInput.ConsumedAreaKm2 = 98.0;
+		int32 FinalEventId = INDEX_NONE;
+		TestTrue(TEXT("Prototype E final consumption seed succeeds"),
+			SeedA.ApplySubductionConsumptionEventForTest(FinalConsumeInput, &FinalEventId));
+		const FSidecarOceanCrustRecord& FinalRecord = SeedA.GetOceanCrustStore().Records[0];
+		TestEqual(TEXT("Prototype E fully consumed flag set after full consumption"),
+			FinalRecord.bIsFullyConsumed,
+			true);
+		TestEqual(TEXT("Prototype E fully consumed step set once at final consumption step"),
+			FinalRecord.FullyConsumedStep,
+			SeedA.GetCurrentStep());
+		TestTrue(TEXT("Prototype E final consumed fraction is one"),
+			FMath::Abs(FinalRecord.ConsumedFraction - 1.0) <= Config.AreaToleranceKm2);
+		TestTrue(TEXT("Prototype E final area conservation holds"),
+			FMath::Abs(
+				(FinalRecord.ActiveAreaKm2 + FinalRecord.ConsumedAreaKm2) -
+				FinalRecord.CreatedAreaKm2) <= Config.AreaToleranceKm2);
+
+		FSidecarOceanCrustStore ReplayedStore;
+		TestTrue(TEXT("Prototype E replay of subduction events succeeds"),
+			ReplaySubductionConsumptionEvents(
+				BaselineStore,
+				SeedA.GetCrustEventLog(),
+				ReplayedStore,
+				Config.ActiveIntervalToleranceT,
+				Config.AreaToleranceKm2));
+		TestEqual(TEXT("Prototype E replay store is byte/hash equivalent to consumed store"),
+			SeedA.GetOceanCrustStore().ComputeCanonicalHash(),
+			ReplayedStore.ComputeCanonicalHash());
+
+		FSidecarCrustEventLog LogForward = SeedA.GetCrustEventLog();
+		FSidecarCrustEventLog LogReordered = LogForward;
+		Swap(LogReordered.Events[1], LogReordered.Events[2]);
+		TestTrue(TEXT("Prototype E event log hash changes when append order changes"),
+			LogForward.ComputeAppendOrderHash() != LogReordered.ComputeAppendOrderHash());
+
+		const uint32 AuthorityBeforeProjection = SeedA.ComputeSidecarAuthorityHash();
+		const int32 CrustCountBeforeProjection = SeedA.GetOceanCrustStore().Num();
+		const int32 EventCountBeforeProjection = SeedA.GetCrustEventLog().Num();
+		FTectonicPlanet ProjectedA;
+		FTectonicPlanet ProjectedB;
+		SeedA.ProjectToPlanet(ProjectedA);
+		SeedA.ProjectToPlanet(ProjectedB);
+		TestEqual(TEXT("Prototype E projection idempotence preserves authority hash"),
+			AuthorityBeforeProjection,
+			SeedA.ComputeSidecarAuthorityHash());
+		TestEqual(TEXT("Prototype E projection idempotence preserves crust count"),
+			CrustCountBeforeProjection,
+			SeedA.GetOceanCrustStore().Num());
+		TestEqual(TEXT("Prototype E projection idempotence preserves event count"),
+			EventCountBeforeProjection,
+			SeedA.GetCrustEventLog().Num());
+	}
+
+	const double ElapsedSeconds = FPlatformTime::Seconds() - StartSeconds;
+	AddInfo(FString::Printf(
+		TEXT("[SidecarPrototypeE] elapsed_seconds=%.3f budget_seconds=%.3f"),
+		ElapsedSeconds,
+		PrototypeERuntimeBudgetSeconds));
+	TestTrue(
+		FString::Printf(TEXT("Prototype E automation runtime stays under %.0f seconds"), PrototypeERuntimeBudgetSeconds),
+		ElapsedSeconds <= PrototypeERuntimeBudgetSeconds);
 
 	return true;
 }

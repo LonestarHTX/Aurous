@@ -12,6 +12,7 @@ enum class ETectonicSidecarCrustEventType : uint8
 {
 	None,
 	DivergentSpreading,
+	SubductionConsumption,
 };
 
 struct AUROUS_API FSidecarBoundaryEdgeKey
@@ -38,6 +39,23 @@ struct AUROUS_API FSidecarOwnerEdge
 	FVector3d SampleBPosition = FVector3d::ZeroVector;
 	FVector3d Midpoint = FVector3d::ZeroVector;
 	double LengthRad = 0.0;
+};
+
+struct AUROUS_API FSidecarActiveInterval
+{
+	double StartT = 0.0;
+	double EndT = 0.0;
+
+	bool IsValid(double ToleranceT = 1.0e-9) const;
+	uint32 ComputeHash() const;
+};
+
+struct AUROUS_API FSidecarActiveEdgeIntervals
+{
+	FSidecarBoundaryEdgeKey Key;
+	TArray<FSidecarActiveInterval> Intervals;
+
+	uint32 ComputeHash() const;
 };
 
 struct AUROUS_API FSidecarOceanCrustBirthEdge
@@ -68,6 +86,23 @@ struct AUROUS_API FSidecarDivergentSpreadingEventInput
 	double ElevationSeedKm = -1.0;
 };
 
+struct AUROUS_API FSidecarSubductionConsumptionEventInput
+{
+	int32 CrustId = INDEX_NONE;
+	int32 PlateA = INDEX_NONE;
+	int32 PlateB = INDEX_NONE;
+	int32 SubductingPlateId = INDEX_NONE;
+	int32 OverridingPlateId = INDEX_NONE;
+	TArray<FSidecarBoundaryEdgeKey> SourceEdges;
+	TArray<FSidecarActiveEdgeIntervals> ConsumedIntervalsBySourceEdge;
+	TArray<int32> DebugSampleIds;
+	double ConsumedAreaKm2 = 0.0;
+	double ConvergenceSpeedKmPerMy = 0.0;
+	double EdgeLengthKm = 0.0;
+	double CrustAgeAtConsumptionMy = 0.0;
+	double ProjectedElevationAtConsumptionKm = 0.0;
+};
+
 struct AUROUS_API FSidecarOceanCrustRecord
 {
 	int32 CrustId = INDEX_NONE;
@@ -89,6 +124,13 @@ struct AUROUS_API FSidecarOceanCrustRecord
 	double AgeMy = 0.0;
 	double ThicknessKm = 7.0;
 	double ElevationSeedKm = -1.0;
+	double ActiveAreaKm2 = 0.0;
+	double ConsumedAreaKm2 = 0.0;
+	double ConsumedFraction = 0.0;
+	int32 LastConsumedStep = INDEX_NONE;
+	int32 FullyConsumedStep = INDEX_NONE;
+	bool bIsFullyConsumed = false;
+	TArray<FSidecarActiveEdgeIntervals> ActiveIntervalsBySourceEdge;
 
 	uint32 ComputeHash() const;
 };
@@ -108,6 +150,21 @@ struct AUROUS_API FSidecarCrustEventRecord
 	TArray<FSidecarBoundaryEdgeKey> SourceEdges;
 	double CreatedAreaKm2 = 0.0;
 	double NormalSeparationKmPerMy = 0.0;
+	TArray<int32> DebugSampleIds;
+	int32 SubductingPlateId = INDEX_NONE;
+	int32 OverridingPlateId = INDEX_NONE;
+	double PreActiveAreaKm2 = 0.0;
+	double PostActiveAreaKm2 = 0.0;
+	double PreConsumedAreaKm2 = 0.0;
+	double PostConsumedAreaKm2 = 0.0;
+	double ConsumedAreaKm2 = 0.0;
+	double ConsumedFraction = 0.0;
+	TArray<FSidecarActiveEdgeIntervals> ConsumedIntervalDeltasBySourceEdge;
+	TArray<FSidecarActiveEdgeIntervals> PostConsumptionActiveIntervalsBySourceEdge;
+	double ConvergenceSpeedKmPerMy = 0.0;
+	double EdgeLengthKm = 0.0;
+	double CrustAgeAtConsumptionMy = 0.0;
+	double ProjectedElevationAtConsumptionKm = 0.0;
 
 	uint32 ComputeHash() const;
 };
@@ -142,3 +199,24 @@ AUROUS_API bool ApplyDivergentSpreadingEvent(
 	double CoalescingToleranceRad,
 	int32* OutCrustId = nullptr,
 	int32* OutEventId = nullptr);
+
+AUROUS_API void CanonicalizeActiveEdgeIntervals(
+	TArray<FSidecarActiveEdgeIntervals>& InOutIntervalsBySourceEdge,
+	double ActiveIntervalToleranceT = 1.0e-9);
+
+AUROUS_API bool ApplySubductionConsumptionEvent(
+	FSidecarOceanCrustStore& InOutStore,
+	FSidecarCrustEventLog& InOutEventLog,
+	const FSidecarSubductionConsumptionEventInput& Input,
+	int32 CurrentStep,
+	double CurrentTimeMy,
+	double ActiveIntervalToleranceT,
+	double AreaToleranceKm2,
+	int32* OutEventId = nullptr);
+
+AUROUS_API bool ReplaySubductionConsumptionEvents(
+	const FSidecarOceanCrustStore& BaselineStore,
+	const FSidecarCrustEventLog& EventLog,
+	FSidecarOceanCrustStore& OutReplayedStore,
+	double ActiveIntervalToleranceT = 1.0e-9,
+	double AreaToleranceKm2 = 1.0e-6);

@@ -1348,6 +1348,11 @@ uint32 FTectonicPlanetSidecar::ComputeSidecarAuthorityHash() const
 	HashSidecarDouble(Hash, Config.OceanicAbyssalPlainElevationKm);
 	HashSidecarDouble(Hash, Config.OceanicElevationDampingKmPerMy);
 	HashSidecarDouble(Hash, Config.OceanicCrustThicknessKm);
+	Hash = HashSidecarValue(Hash, Config.bEnableSubductionConsumptionEvents ? 1u : 0u);
+	HashSidecarDouble(Hash, Config.SubductionConvergenceMinKmPerMy);
+	HashSidecarDouble(Hash, Config.ActiveIntervalToleranceT);
+	HashSidecarDouble(Hash, Config.AreaToleranceKm2);
+	HashSidecarDouble(Hash, Config.PrototypeERuntimeBudgetSeconds);
 	Hash = HashSidecarValue(Hash, Config.bForceExplicitProjectionAtRestForTest ? 1u : 0u);
 	HashSidecarInt32(Hash, CurrentStep);
 
@@ -1486,6 +1491,47 @@ bool FTectonicPlanetSidecar::ApplyDivergentSpreadingEventForTest(
 		Config.RidgeGenerationGapSteps,
 		0.0,
 		OutCrustId,
+		OutEventId);
+}
+
+bool FTectonicPlanetSidecar::ApplySubductionConsumptionEventForTest(
+	const FSidecarSubductionConsumptionEventInput& Input,
+	int32* OutEventId)
+{
+	if (Input.CrustId == INDEX_NONE ||
+		Input.PlateA == INDEX_NONE ||
+		Input.PlateB == INDEX_NONE ||
+		Input.PlateA == Input.PlateB ||
+		FindPlateById(Input.PlateA) == nullptr ||
+		FindPlateById(Input.PlateB) == nullptr ||
+		Input.ConsumedIntervalsBySourceEdge.IsEmpty())
+	{
+		return false;
+	}
+
+	bool bFoundCrustRecord = false;
+	for (const FSidecarOceanCrustRecord& Record : OceanCrustStore.Records)
+	{
+		if (Record.CrustId == Input.CrustId)
+		{
+			bFoundCrustRecord = true;
+			break;
+		}
+	}
+	if (!bFoundCrustRecord)
+	{
+		return false;
+	}
+
+	const double CurrentTimeMy = static_cast<double>(CurrentStep) * Config.DeltaTimeMy;
+	return ApplySubductionConsumptionEvent(
+		OceanCrustStore,
+		CrustEventLog,
+		Input,
+		CurrentStep,
+		CurrentTimeMy,
+		Config.ActiveIntervalToleranceT,
+		Config.AreaToleranceKm2,
 		OutEventId);
 }
 
