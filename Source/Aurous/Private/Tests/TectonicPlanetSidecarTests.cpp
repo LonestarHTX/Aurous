@@ -3,6 +3,7 @@
 #include "Misc/FileHelper.h"
 #include "HAL/PlatformFile.h"
 #include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformMemory.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/Paths.h"
 #include "TectonicMollweideExporter.h"
@@ -1365,6 +1366,389 @@ namespace
 		return Stats;
 	}
 
+	void AdvanceToStep(FTectonicPlanetSidecar& Sidecar, const int32 TargetStep);
+
+	FTectonicSidecarConfig MakeSidecarConfig(
+		const ETectonicSidecarProjectionMode ProjectionMode,
+		const int32 SampleCount,
+		const int32 PlateCount);
+
+	bool CheckPrototypeCProjectionValidity(
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const FTectonicPlanet& Planet,
+		const FTectonicSidecarProjectionDiagnostics& D);
+
+	bool CheckPrototypeCOwnershipGate(
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const FTectonicSidecarProjectionDiagnostics& D,
+		const double Step0BoundaryFraction);
+
+	bool CheckPrototypeCLongHorizonOwnershipGate(
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const FTectonicSidecarProjectionDiagnostics& D);
+
+	struct FDLongHorizonMemorySnapshot
+	{
+		uint64 UsedPhysicalBytes = 0;
+		uint64 UsedVirtualBytes = 0;
+
+		bool IsValid() const
+		{
+			return UsedPhysicalBytes > 0 && UsedVirtualBytes > 0;
+		}
+
+		double UsedPhysicalMb() const
+		{
+			return static_cast<double>(UsedPhysicalBytes) / (1024.0 * 1024.0);
+		}
+
+		double UsedVirtualMb() const
+		{
+			return static_cast<double>(UsedVirtualBytes) / (1024.0 * 1024.0);
+		}
+	};
+
+	FDLongHorizonMemorySnapshot CaptureLongHorizonMemorySnapshot()
+	{
+		const FPlatformMemoryStats MemoryStats = FPlatformMemory::GetStats();
+		FDLongHorizonMemorySnapshot Snapshot;
+		Snapshot.UsedPhysicalBytes = MemoryStats.UsedPhysical;
+		Snapshot.UsedVirtualBytes = MemoryStats.UsedVirtual;
+		return Snapshot;
+	}
+
+	struct FDLongHorizonScenarioConfig
+	{
+		FString Label;
+		int32 SampleCount = 60000;
+		int32 PlateCount = 40;
+		TArray<int32> Checkpoints;
+		bool bFailOnRuntimeBudget = false;
+		double RuntimeBudgetSeconds = 0.0;
+		bool bWarnOnRuntimeBudget = false;
+		double RuntimeWarningSeconds = 0.0;
+	};
+
+	bool RunSidecarDLongHorizonScenario(
+		FAutomationTestBase& Test,
+		const FDLongHorizonScenarioConfig& Scenario)
+	{
+		bool bPassed = true;
+		const double ScenarioStartSeconds = FPlatformTime::Seconds();
+
+		FTectonicSidecarConfig EventConfig = MakeSidecarConfig(
+			ETectonicSidecarProjectionMode::VoronoiOwnershipDecoupledMaterial,
+			Scenario.SampleCount,
+			Scenario.PlateCount);
+		EventConfig.bEnableDivergentSpreadingEvents = true;
+		EventConfig.bEnableDOceanCrustProjection = true;
+		EventConfig.DivergentSpreadingMinKmPerMy = 10.0;
+
+		FTectonicSidecarConfig BaselineConfig = EventConfig;
+		BaselineConfig.bEnableDivergentSpreadingEvents = false;
+
+		FTectonicPlanetSidecar EventSidecar;
+		FTectonicPlanetSidecar BaselineSidecar;
+		EventSidecar.Initialize(EventConfig);
+		BaselineSidecar.Initialize(BaselineConfig);
+
+		double PreviousTotalAreaKm2 = 0.0;
+		int32 PreviousCrustRecordCount = 0;
+		int32 PreviousEventCount = 0;
+		int32 PreviousBirthEdgeCount = 0;
+		uint64 PreviousUsedPhysicalBytes = 0;
+		TArray<int32> PreviousCrustIds;
+		TArray<double> PostZeroMismatchFractions;
+
+		FDLongHorizonMemorySnapshot InitialMemory = CaptureLongHorizonMemorySnapshot();
+		Test.TestTrue(
+			FString::Printf(TEXT("%s initial memory snapshot is valid"), *Scenario.Label),
+			InitialMemory.IsValid());
+
+		for (const int32 Checkpoint : Scenario.Checkpoints)
+		{
+			const double CheckpointStartSeconds = FPlatformTime::Seconds();
+			const double AdvanceStartSeconds = FPlatformTime::Seconds();
+			AdvanceToStep(EventSidecar, Checkpoint);
+			AdvanceToStep(BaselineSidecar, Checkpoint);
+			const double AdvanceSeconds = FPlatformTime::Seconds() - AdvanceStartSeconds;
+
+			const uint32 AuthorityHashBeforeProjection = EventSidecar.ComputeSidecarAuthorityHash();
+			const int32 CrustCountBeforeProjection = EventSidecar.GetOceanCrustStore().Num();
+			const int32 EventCountBeforeProjection = EventSidecar.GetCrustEventLog().Num();
+
+			FTectonicPlanet BaselineProjected;
+			FTectonicSidecarProjectionDiagnostics BaselineDiagnostics;
+			BaselineSidecar.ProjectToPlanet(BaselineProjected, &BaselineDiagnostics);
+
+			FTectonicPlanet Projected;
+			FTectonicSidecarProjectionDiagnostics Diagnostics;
+			EventSidecar.ProjectToPlanet(Projected, &Diagnostics);
+
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d projection preserves sidecar authority hash"), *Scenario.Label, Checkpoint),
+				AuthorityHashBeforeProjection,
+				EventSidecar.ComputeSidecarAuthorityHash());
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d projection preserves crust count"), *Scenario.Label, Checkpoint),
+				CrustCountBeforeProjection,
+				EventSidecar.GetOceanCrustStore().Num());
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d projection preserves event count"), *Scenario.Label, Checkpoint),
+				EventCountBeforeProjection,
+				EventSidecar.GetCrustEventLog().Num());
+
+			const FString StepLabel = FString::Printf(TEXT("%s_step_%04d"), *Scenario.Label, Checkpoint);
+			CheckPrototypeCProjectionValidity(Test, StepLabel, Projected, Diagnostics);
+			CheckPrototypeCIndependentOwnershipAndBoundaries(Test, StepLabel, EventSidecar, Projected);
+			CheckPrototypeCLongHorizonOwnershipGate(Test, StepLabel, Diagnostics);
+			CheckDProjectionPreservesOwnershipAndBoundaries(Test, StepLabel, Projected, BaselineProjected);
+			CheckDProjectionPreservesHighCWMaterial(
+				Test,
+				StepLabel,
+				Projected,
+				BaselineProjected,
+				EventConfig.OverlayContinentalWeightThreshold);
+
+			const FDVisualProjectionStats Stats =
+				ComputeDVisualProjectionStats(EventSidecar, Projected, BaselineProjected);
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d projected crust ids resolve"), *Scenario.Label, Checkpoint),
+				Stats.InvalidCrustIdCount,
+				0);
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d projected D fields are finite"), *Scenario.Label, Checkpoint),
+				Stats.NonFiniteDFieldCount,
+				0);
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d projected D ages match independent step math"), *Scenario.Label, Checkpoint),
+				Stats.AgeMismatchCount,
+				0);
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d projected D thickness remains in placeholder bounds"), *Scenario.Label, Checkpoint),
+				Stats.ThicknessOutOfBoundsCount,
+				0);
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d projected D elevation remains in placeholder bounds"), *Scenario.Label, Checkpoint),
+				Stats.ElevationOutOfBoundsCount,
+				0);
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d D crust avoids high-CW material samples"), *Scenario.Label, Checkpoint),
+				Stats.HighCWOverlapCount,
+				0);
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d D projection does not overwrite high-CW material"), *Scenario.Label, Checkpoint),
+				Stats.HighCWOverwriteCount,
+				0);
+			Test.TestTrue(
+				FString::Printf(TEXT("%s step %d material-owner mismatch overlap %.4f <= 0.1000"),
+					*Scenario.Label,
+					Checkpoint,
+					Stats.MaterialMismatchOverlapFraction),
+				Stats.MaterialMismatchOverlapFraction <= 0.10);
+
+			if (Stats.MaterialMismatchOverlapFraction > 0.10)
+			{
+				bPassed = false;
+			}
+			if (Checkpoint > 0)
+			{
+				PostZeroMismatchFractions.Add(Stats.MaterialMismatchOverlapFraction);
+			}
+
+			if (Checkpoint == 0)
+			{
+				Test.TestEqual(
+					FString::Printf(TEXT("%s step 0 has no projected D crust"), *Scenario.Label),
+					Stats.ProjectedCrustSampleCount,
+					0);
+				Test.TestEqual(
+					FString::Printf(TEXT("%s step 0 has no crust records"), *Scenario.Label),
+					EventSidecar.GetOceanCrustStore().Num(),
+					0);
+				Test.TestEqual(
+					FString::Printf(TEXT("%s step 0 has no event records"), *Scenario.Label),
+					EventSidecar.GetCrustEventLog().Num(),
+					0);
+			}
+			else
+			{
+				Test.TestTrue(
+					FString::Printf(TEXT("%s step %d projects nonzero D crust samples"), *Scenario.Label, Checkpoint),
+					Stats.ProjectedCrustSampleCount > 0);
+				Test.TestTrue(
+					FString::Printf(TEXT("%s step %d tiny crust component sample fraction %.4f <= 0.1000"),
+						*Scenario.Label,
+						Checkpoint,
+						Stats.TinyCrustComponentSampleFraction),
+					Stats.TinyCrustComponentSampleFraction <= 0.10);
+			}
+
+			Test.TestTrue(
+				FString::Printf(TEXT("%s step %d crust record count monotonic"), *Scenario.Label, Checkpoint),
+				EventSidecar.GetOceanCrustStore().Num() >= PreviousCrustRecordCount);
+			Test.TestTrue(
+				FString::Printf(TEXT("%s step %d event log count monotonic"), *Scenario.Label, Checkpoint),
+				EventSidecar.GetCrustEventLog().Num() >= PreviousEventCount);
+			const int32 BirthEdgeCount = SumOceanCrustBirthEdgeCount(EventSidecar.GetOceanCrustStore());
+			Test.TestTrue(
+				FString::Printf(TEXT("%s step %d birth-edge count monotonic"), *Scenario.Label, Checkpoint),
+				BirthEdgeCount >= PreviousBirthEdgeCount);
+			const int32 EventCap = EventSidecar.GetCurrentStep() * 4 * EventConfig.PlateCount;
+			Test.TestTrue(
+				FString::Printf(TEXT("%s step %d event log count %d <= cap %d"),
+					*Scenario.Label,
+					Checkpoint,
+					EventSidecar.GetCrustEventLog().Num(),
+					EventCap),
+				EventSidecar.GetCrustEventLog().Num() <= EventCap);
+			Test.TestTrue(
+				FString::Printf(TEXT("%s step %d crust store count <= event log count"), *Scenario.Label, Checkpoint),
+				EventSidecar.GetOceanCrustStore().Num() <= EventSidecar.GetCrustEventLog().Num());
+
+			const double TotalAreaKm2 = SumOceanCrustAreaKm2(EventSidecar.GetOceanCrustStore());
+			Test.TestTrue(
+				FString::Printf(TEXT("%s step %d total persistent crust area is finite"), *Scenario.Label, Checkpoint),
+				FMath::IsFinite(TotalAreaKm2));
+			if (Checkpoint == 0)
+			{
+				Test.TestTrue(FString::Printf(TEXT("%s step 0 persistent crust area is zero"), *Scenario.Label), TotalAreaKm2 <= 0.0);
+			}
+			else
+			{
+				Test.TestTrue(
+					FString::Printf(TEXT("%s step %d persistent crust area is positive"), *Scenario.Label, Checkpoint),
+					TotalAreaKm2 > 0.0);
+				Test.TestTrue(
+					FString::Printf(TEXT("%s step %d persistent crust area is monotonic"), *Scenario.Label, Checkpoint),
+					TotalAreaKm2 + 1.0e-6 >= PreviousTotalAreaKm2);
+			}
+
+			const TArray<int32> CurrentCrustIds = CollectSortedCrustIds(EventSidecar.GetOceanCrustStore());
+			CheckCrustIdsPersist(Test, StepLabel, PreviousCrustIds, CurrentCrustIds);
+			PreviousCrustIds = CurrentCrustIds;
+
+			Test.TestTrue(
+				FString::Printf(TEXT("%s step %d exports review maps"), *Scenario.Label, Checkpoint),
+				ExportSidecarDVisualGateMaps(Test, EventSidecar, Projected, Checkpoint, Scenario.Label));
+
+			const FDLongHorizonMemorySnapshot Memory = CaptureLongHorizonMemorySnapshot();
+			Test.TestTrue(
+				FString::Printf(TEXT("%s step %d memory snapshot is valid"), *Scenario.Label, Checkpoint),
+				Memory.IsValid());
+			if (Memory.IsValid() && InitialMemory.IsValid() && PreviousUsedPhysicalBytes > 0 && BirthEdgeCount > PreviousBirthEdgeCount)
+			{
+				const double PreviousMemoryGrowthMb =
+					FMath::Max(0.0, static_cast<double>(PreviousUsedPhysicalBytes) - static_cast<double>(InitialMemory.UsedPhysicalBytes)) /
+					(1024.0 * 1024.0);
+				const double CurrentMemoryGrowthMb =
+					FMath::Max(0.0, static_cast<double>(Memory.UsedPhysicalBytes) - static_cast<double>(InitialMemory.UsedPhysicalBytes)) /
+					(1024.0 * 1024.0);
+				const double MemoryGrowthRatio = (CurrentMemoryGrowthMb + 1.0) / (PreviousMemoryGrowthMb + 1.0);
+				const double BirthEdgeGrowthRatio =
+					static_cast<double>(BirthEdgeCount + 1) / static_cast<double>(PreviousBirthEdgeCount + 1);
+				if (MemoryGrowthRatio > BirthEdgeGrowthRatio * 2.0 && CurrentMemoryGrowthMb > PreviousMemoryGrowthMb + 256.0)
+				{
+					Test.AddWarning(FString::Printf(
+						TEXT("%s step %d memory growth looks superlinear: memory_ratio=%.3f birth_edge_ratio=%.3f delta_mb=%.2f"),
+						*Scenario.Label,
+						Checkpoint,
+						MemoryGrowthRatio,
+						BirthEdgeGrowthRatio,
+						CurrentMemoryGrowthMb));
+				}
+			}
+
+			const double CheckpointSeconds = FPlatformTime::Seconds() - CheckpointStartSeconds;
+			const double ElapsedSeconds = FPlatformTime::Seconds() - ScenarioStartSeconds;
+			Test.AddInfo(FString::Printf(
+				TEXT("[SidecarPrototypeDLongHorizon] label=%s sample_count=%d step=%d advance_seconds=%.3f checkpoint_seconds=%.3f elapsed_seconds=%.3f used_physical_mb=%.2f used_virtual_mb=%.2f birth_edges=%d crust_samples=%d component_count=%d components_per_1000=%.3f top_components=%d,%d,%d largest_component_fraction=%.5f top3_component_fraction=%.5f tiny_component_max=%d tiny_component_count=%d tiny_component_samples=%d tiny_component_fraction=%.5f crust_records=%d events=%d mismatch_overlap_fraction=%.5f area_km2=%.3f mean_age_my=%.3f max_age_my=%.3f"),
+				*Scenario.Label,
+				Scenario.SampleCount,
+				Checkpoint,
+				AdvanceSeconds,
+				CheckpointSeconds,
+				ElapsedSeconds,
+				Memory.UsedPhysicalMb(),
+				Memory.UsedVirtualMb(),
+				BirthEdgeCount,
+				Stats.ProjectedCrustSampleCount,
+				Stats.CrustComponentCount,
+				Stats.CrustComponentsPerThousandSamples,
+				Stats.LargestCrustComponentSize,
+				Stats.SecondLargestCrustComponentSize,
+				Stats.ThirdLargestCrustComponentSize,
+				Stats.LargestCrustComponentFraction,
+				Stats.Top3CrustComponentFraction,
+				Stats.TinyCrustComponentMaxSize,
+				Stats.TinyCrustComponentCount,
+				Stats.TinyCrustComponentSampleCount,
+				Stats.TinyCrustComponentSampleFraction,
+				EventSidecar.GetOceanCrustStore().Num(),
+				EventSidecar.GetCrustEventLog().Num(),
+				Stats.MaterialMismatchOverlapFraction,
+				TotalAreaKm2,
+				Stats.MeanAgeMy,
+				Stats.MaxAgeMy));
+
+			PreviousTotalAreaKm2 = TotalAreaKm2;
+			PreviousCrustRecordCount = EventSidecar.GetOceanCrustStore().Num();
+			PreviousEventCount = EventSidecar.GetCrustEventLog().Num();
+			PreviousBirthEdgeCount = BirthEdgeCount;
+			PreviousUsedPhysicalBytes = Memory.UsedPhysicalBytes;
+		}
+
+		if (PostZeroMismatchFractions.Num() >= 2)
+		{
+			bool bStrictlyIncreasing = true;
+			for (int32 Index = 1; Index < PostZeroMismatchFractions.Num(); ++Index)
+			{
+				if (PostZeroMismatchFractions[Index] <= PostZeroMismatchFractions[Index - 1] + 1.0e-6)
+				{
+					bStrictlyIncreasing = false;
+					break;
+				}
+			}
+			if (bStrictlyIncreasing)
+			{
+				Test.AddWarning(FString::Printf(
+					TEXT("%s mismatch-overlap fraction increased at every post-zero checkpoint; investigate before treating this as balance evidence"),
+					*Scenario.Label));
+			}
+		}
+
+		const double TotalSeconds = FPlatformTime::Seconds() - ScenarioStartSeconds;
+		Test.AddInfo(FString::Printf(
+			TEXT("[SidecarPrototypeDLongHorizonSummary] label=%s sample_count=%d total_seconds=%.3f runtime_budget_seconds=%.3f runtime_warning_seconds=%.3f"),
+			*Scenario.Label,
+			Scenario.SampleCount,
+			TotalSeconds,
+			Scenario.RuntimeBudgetSeconds,
+			Scenario.RuntimeWarningSeconds));
+		if (Scenario.bFailOnRuntimeBudget)
+		{
+			Test.TestTrue(
+				FString::Printf(TEXT("%s runtime %.3fs <= %.3fs"), *Scenario.Label, TotalSeconds, Scenario.RuntimeBudgetSeconds),
+				TotalSeconds <= Scenario.RuntimeBudgetSeconds);
+			if (TotalSeconds > Scenario.RuntimeBudgetSeconds)
+			{
+				bPassed = false;
+			}
+		}
+		if (Scenario.bWarnOnRuntimeBudget && TotalSeconds > Scenario.RuntimeWarningSeconds)
+		{
+			Test.AddWarning(FString::Printf(
+				TEXT("%s runtime %.3fs exceeded warning budget %.3fs"),
+				*Scenario.Label,
+				TotalSeconds,
+				Scenario.RuntimeWarningSeconds));
+		}
+		return bPassed;
+	}
+
 	bool CheckSidecarADiagnosticGate(
 		FAutomationTestBase& Test,
 		const FTectonicSidecarProjectionDiagnostics& D)
@@ -1567,6 +1951,34 @@ namespace
 			FString::Printf(TEXT("%s carried continental mass relative error %.5f exceeded limit %.5f"), *Label, D.CarriedContinentalMassRelativeError, MaterialMassLimit));
 		Require(D.HighCWFragmentationDelta <= 0.05,
 			FString::Printf(TEXT("%s high-CW fragmentation delta was %.6f"), *Label, D.HighCWFragmentationDelta));
+		return bValid;
+	}
+
+	bool CheckPrototypeCLongHorizonOwnershipGate(
+		FAutomationTestBase& Test,
+		const FString& Label,
+		const FTectonicSidecarProjectionDiagnostics& D)
+	{
+		bool bValid = true;
+		auto Require = [&Test, &bValid](const bool bCondition, const FString& Message)
+		{
+			if (!bCondition)
+			{
+				Test.AddError(Message);
+				bValid = false;
+			}
+		};
+
+		Require(D.OwnershipGapSampleCount == 0 && D.OwnershipGapFraction <= 0.0,
+			FString::Printf(TEXT("%s ownership gap fraction was %.6f"), *Label, D.OwnershipGapFraction));
+		Require(D.OwnershipOverlapSampleCount == 0 && D.OwnershipOverlapFraction <= 0.0,
+			FString::Printf(TEXT("%s ownership overlap fraction was %.6f"), *Label, D.OwnershipOverlapFraction));
+		Require(D.OwnerFragmentationFraction <= 0.005,
+			FString::Printf(TEXT("%s owner fragmentation fraction was %.6f"), *Label, D.OwnerFragmentationFraction));
+		Require(D.BoundaryNoiseFraction <= 0.02,
+			FString::Printf(TEXT("%s boundary noise fraction was %.6f"), *Label, D.BoundaryNoiseFraction));
+		Require(D.MaterialFabricatedFraction <= 0.0 && D.FabricatedMaterialSampleCount == 0,
+			FString::Printf(TEXT("%s material fabricated fraction was %.6f count=%d"), *Label, D.MaterialFabricatedFraction, D.FabricatedMaterialSampleCount));
 		return bValid;
 	}
 
@@ -3507,4 +3919,66 @@ bool FTectonicPlanetSidecarPrototypeDVisualGateTest::RunTest(const FString& Para
 	}
 
 	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetSidecarPrototypeDLongHorizonTest,
+	"Aurous.TectonicPlanet.SidecarPrototypeDLongHorizon",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetSidecarPrototypeDLongHorizonTest::RunTest(const FString& Parameters)
+{
+	CheckPrototypeDSourceHygieneGate(*this);
+
+	FDLongHorizonScenarioConfig Scenario;
+	Scenario.Label = TEXT("long_horizon_60k40");
+	Scenario.SampleCount = 60000;
+	Scenario.PlateCount = 40;
+	Scenario.Checkpoints = { 0, 100, 200, 400, 800, 1000 };
+	Scenario.bFailOnRuntimeBudget = true;
+	Scenario.RuntimeBudgetSeconds = 180.0;
+
+	return RunSidecarDLongHorizonScenario(*this, Scenario);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FTectonicPlanetSidecarPrototypeDLongHorizonHighResTest,
+	"Aurous.TectonicPlanet.SidecarPrototypeDHighResLongHorizon",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FTectonicPlanetSidecarPrototypeDLongHorizonHighResTest::RunTest(const FString& Parameters)
+{
+	CheckPrototypeDSourceHygieneGate(*this);
+
+	bool bPassed = true;
+	constexpr double HighResWarningSeconds = 45.0 * 60.0;
+
+	FDLongHorizonScenarioConfig Scenario100k;
+	Scenario100k.Label = TEXT("long_horizon_100k40");
+	Scenario100k.SampleCount = 100000;
+	Scenario100k.PlateCount = 40;
+	Scenario100k.Checkpoints = { 0, 250, 500, 1000 };
+	Scenario100k.bWarnOnRuntimeBudget = true;
+	Scenario100k.RuntimeWarningSeconds = HighResWarningSeconds;
+	bPassed &= RunSidecarDLongHorizonScenario(*this, Scenario100k);
+
+	FDLongHorizonScenarioConfig Scenario250k;
+	Scenario250k.Label = TEXT("long_horizon_250k40");
+	Scenario250k.SampleCount = 250000;
+	Scenario250k.PlateCount = 40;
+	Scenario250k.Checkpoints = { 0, 250, 500, 1000 };
+	Scenario250k.bWarnOnRuntimeBudget = true;
+	Scenario250k.RuntimeWarningSeconds = HighResWarningSeconds;
+	bPassed &= RunSidecarDLongHorizonScenario(*this, Scenario250k);
+
+	FDLongHorizonScenarioConfig Scenario500k;
+	Scenario500k.Label = TEXT("long_horizon_500k40");
+	Scenario500k.SampleCount = 500000;
+	Scenario500k.PlateCount = 40;
+	Scenario500k.Checkpoints = { 0, 500, 1000 };
+	Scenario500k.bWarnOnRuntimeBudget = true;
+	Scenario500k.RuntimeWarningSeconds = HighResWarningSeconds;
+	bPassed &= RunSidecarDLongHorizonScenario(*this, Scenario500k);
+
+	return bPassed;
 }

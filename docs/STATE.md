@@ -97,6 +97,30 @@ committed repository files.
 6. Answer the Slice 4 visual checklist in
    `docs/process/prototype-d-slice-4-visual-check.md`.
 
+## Reproduce The D Long-Horizon Stress Gate
+
+Slice 5a:
+
+1. Build `AurousEditor`.
+2. Run automation group `Aurous.TectonicPlanet.SidecarPrototypeDLongHorizon`.
+3. Expected local artifact root:
+   - `Saved/MapExports/SidecarPrototypeD/long_horizon_60k40/`
+4. Generate contact sheets with `$aurous-overlay-contactsheet` for steps 0, 100,
+   200, 400, 800, and 1000.
+5. Compare drift with `$aurous-diagnostic-diff`, especially
+   `step_400 -> step_800` and `step_800 -> step_1000`.
+6. Answer the Slice 5 checklist in
+   `docs/process/prototype-d-slice-5-long-horizon-check.md`.
+
+Slice 5b:
+
+- Run automation group `Aurous.TectonicPlanet.SidecarPrototypeDHighResLongHorizon`
+  when overnight or separate-session machine time is available.
+- Expected local artifact roots:
+  - `Saved/MapExports/SidecarPrototypeD/long_horizon_100k40/`
+  - `Saved/MapExports/SidecarPrototypeD/long_horizon_250k40/`
+  - `Saved/MapExports/SidecarPrototypeD/long_horizon_500k40/`
+
 ## Repository Hygiene Snapshot
 
 Last checked: 2026-04-27.
