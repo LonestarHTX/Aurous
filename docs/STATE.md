@@ -20,7 +20,7 @@ D contracts:
 - `docs/architecture/decisions/0002-d-persistent-divergent-ocean-crust.md`
 - `docs/architecture/decisions/0003-d-oceanic-crust-cooling-law.md`
 
-Proposed next contract:
+E contract:
 
 - `docs/architecture/decisions/0004-e-subduction-crust-consumption.md`
 
@@ -82,12 +82,15 @@ Key hardening metrics:
 
 Priority order:
 
-1. Revise and accept ADR 0004 before any Prototype E code lands.
-2. Preserve C invariants while adding any E behavior.
-3. Treat D balance limits as expected until subduction exists; D creates crust
+1. Run the Prototype E adversarial ADR review and 30-day pre-mortem in
+   `docs/architecture/e-pre-mortem-prompt.md` before any Prototype E code lands.
+2. Implement Prototype E Slice 1 as a state/hash scaffold only.
+3. Preserve C invariants while adding any E behavior.
+4. Treat D balance limits as expected until subduction exists; D creates crust
    and does not consume it.
-4. Decide whether 5b high-resolution D long-horizon evidence is needed before E.
-5. Track, but do not rush, extraction of C into its own class once A/B can be deprecated.
+5. Continue 5b high-resolution D long-horizon evidence in parallel as
+   confidence evidence, not an E prerequisite.
+6. Track, but do not rush, extraction of C into its own class once A/B can be deprecated.
 
 Prototype C does not solve persistent ocean crust. Prototype D now solves the
 first persistent divergent-ocean-crust slice, including age-derived cooling, but
@@ -203,7 +206,8 @@ Last checked: 2026-04-27.
 2. `docs/architecture/decisions/0001-c-freeze-voronoi-ownership-decoupled-material.md`
 3. `docs/architecture/decisions/0002-d-persistent-divergent-ocean-crust.md`
 4. `docs/architecture/decisions/0003-d-oceanic-crust-cooling-law.md`
-5. `docs/tectonic-minimal-acceptance-tests.md`
-6. `docs/tectonic-architecture-failure-memo-2026-04.md`
-7. `docs/tectonic-architecture-reset-plate-authoritative-prototype.md`
-8. `docs/ProceduralTectonicPlanets.txt`
+5. `docs/architecture/decisions/0004-e-subduction-crust-consumption.md`
+6. `docs/tectonic-minimal-acceptance-tests.md`
+7. `docs/tectonic-architecture-failure-memo-2026-04.md`
+8. `docs/tectonic-architecture-reset-plate-authoritative-prototype.md`
+9. `docs/ProceduralTectonicPlanets.txt`

@@ -1,6 +1,6 @@
 # 0004: Subduction Crust Consumption
 
-Status: Proposed
+Status: Accepted
 Date: 2026-04-28
 Depends on: ADR 0001, ADR 0002, ADR 0003, Prototype D Slice 6
 
@@ -28,7 +28,8 @@ without breaking C ownership, C boundaries, D crust identity, or projection
 idempotence?
 ```
 
-No Prototype E code should land before this ADR is accepted.
+No Prototype E code should land before this ADR is accepted and the Prototype E
+adversarial ADR review plus 30-day pre-mortem have been completed.
 
 ## Decision
 
@@ -82,6 +83,15 @@ Minimum new fields on persistent ocean-crust records:
 - `LastConsumedStep`
 - `FullyConsumedStep`
 - `bIsFullyConsumed`
+- `ActiveIntervalsBySourceEdge`
+
+`ActiveIntervalsBySourceEdge` is the accepted first spatial-clipping
+representation. It is keyed by canonical `FSidecarBoundaryEdgeKey`, matching
+D's edge-keyed birth/support model. Values are canonical edge-local active
+intervals in normalized edge parameter space, `[0, 1]`. Consumed intervals are
+removed or shortened deterministically by subduction events. This lets E
+preserve partially consumed crust without introducing a second ownership system
+or mutating C sample ownership.
 
 Minimum new event type:
 
@@ -194,8 +204,13 @@ fully consumed record remains in the store with:
 - `FullyConsumedStep` set
 
 Projection must not render fully consumed crust. Partially consumed crust may
-project only its active support. The exact spatial clipping representation is an
-open question before E projection lands.
+project only its active support from `ActiveIntervalsBySourceEdge`.
+
+Slice 1 and Slice 2 use edge-local area accounting only. A subduction event
+consumes area against the target crust record through the accepted owner edge
+and its active interval support. Component-aware area aggregation is a later
+optimization and must not be introduced until the edge-local model is proven by
+tests.
 
 This tombstone-first rule preserves auditability and avoids changing crust ids
 or event history while E is being validated.
@@ -221,9 +236,13 @@ Potential E projection outputs:
 - trench candidate mask
 - consumed crust id/debug id
 
-Trench elevation and overriding-plate uplift are deferred. E consumption may
-produce diagnostic trench candidates, but it must not introduce mountain
-building or trench bathymetry without a later ADR.
+Trench location diagnostics are in scope for E projection. `SubductionFront.png`
+and `TrenchCandidate.png` show where accepted consumption interfaces are, so the
+reviewer can see whether E events align with convergent boundaries.
+
+Trench bathymetry, trench elevation changes, and overriding-plate uplift are
+deferred. E consumption may produce diagnostic trench locations, but it must not
+introduce mountain building or bathymetry features without a later ADR.
 
 ## Mandatory E Exports
 
@@ -305,6 +324,7 @@ Allowed:
 
 - event enum value
 - consumption fields on crust records
+- per-edge active interval state
 - `ApplySubductionConsumptionEventForTest`
 - authority hash coverage
 - idempotence tests
@@ -330,6 +350,7 @@ Allowed:
 - one guarded call site after plate transforms advance
 - deterministic component grouping over sorted owner edges
 - production `ApplySubductionConsumptionEvent`
+- edge-local area accounting through per-edge active intervals
 - analytic area tests
 
 Forbidden:
@@ -348,6 +369,7 @@ Allowed:
 
 - active/consumed masks
 - subduction-front exports
+- trench-location candidate exports
 - consumed crust debug ids
 - exclusion of fully consumed crust from D ocean projection
 
@@ -380,31 +402,32 @@ Prototype E does not implement:
 - sutures
 - uplift/orogeny
 - trench bathymetry as final terrain
-- slab pull or plate force feedback
+- slab pull or plate force feedback; slab pull belongs in a separate Prototype F
+  ADR, not a later E slice
 - erosion
 - sediment accretion
 - sea-level or global water balance
 - deletion/pruning of historical event records
 - V6/V9 remesh exclusion logic
 
-## Open Questions Before Accepted
+## Accepted Answers From Proposed Review
 
-1. Exact spatial clipping representation for partially consumed crust:
-   per-edge active intervals, per-crust consumed support fragments, or a
-   separate consumed-edge list.
-2. Whether E Slice 2 should consume by edge-local area only or by connected
-   convergent component area.
-3. Whether the first projection slice should show trench candidates only, or
-   defer all trench visuals until an uplift/trench ADR.
-4. Whether slab pull gets its own Prototype F ADR or a later E slice after
-   consumption is proven.
-5. Whether high-resolution 5b D evidence is required before accepting E.
+1. Partially consumed crust is represented by per-edge active intervals keyed by
+   canonical owner edge. This parallels D's edge-keyed support model.
+2. Slice 1 and Slice 2 use edge-local area accounting. Component-aware area is a
+   later optimization, not part of the first E proof.
+3. E projection should show trench/front locations as diagnostics. Bathymetry
+   features and uplift are deferred to a later ADR.
+4. Slab pull is Prototype F. It must not be folded into E.
+5. D high-resolution 5b evidence is not a prerequisite for E. It can run in
+   parallel as confidence evidence.
 
 ## Follow-Up Work
 
-Before marking this ADR Accepted:
+Before any Prototype E code lands:
 
-- answer the open questions above
+- run the Prototype E adversarial ADR review and 30-day pre-mortem prompt in
+  `docs/architecture/e-pre-mortem-prompt.md`
 - define Slice 1 field names against `TectonicSidecarCrust.h`
 - write a source-hygiene rule for E mutation APIs
 - define the exact test filter name, likely
