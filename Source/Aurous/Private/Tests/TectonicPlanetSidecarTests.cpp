@@ -255,6 +255,11 @@ namespace
 		MixHashUInt32(Hash, Config.bEnableDivergentSpreadingEvents ? 1u : 0u);
 		MixHashDouble(Hash, Config.DivergentSpreadingMinKmPerMy);
 		MixHashUInt32(Hash, Config.bEnableDOceanCrustProjection ? 1u : 0u);
+		MixHashUInt32(Hash, Config.bEnableDOceanCrustCoolingLaw ? 1u : 0u);
+		MixHashDouble(Hash, Config.OceanicRidgeElevationKm);
+		MixHashDouble(Hash, Config.OceanicAbyssalPlainElevationKm);
+		MixHashDouble(Hash, Config.OceanicElevationDampingKmPerMy);
+		MixHashDouble(Hash, Config.OceanicCrustThicknessKm);
 		MixHashUInt32(Hash, Config.bForceExplicitProjectionAtRestForTest ? 1u : 0u);
 		MixHashInt32(Hash, Sidecar.GetCurrentStep());
 		const FTectonicPlanet& InitialPlanet = Sidecar.GetInitialPlanet();
@@ -332,6 +337,24 @@ namespace
 		MixHashUInt32(Hash, Sidecar.GetOceanCrustStore().ComputeCanonicalHash());
 		MixHashUInt32(Hash, Sidecar.GetCrustEventLog().ComputeAppendOrderHash());
 		return Hash;
+	}
+
+	double ComputeExpectedOceanCrustElevationForTest(
+		const FTectonicSidecarConfig& Config,
+		const FSidecarOceanCrustRecord& Record)
+	{
+		if (!Config.bEnableDOceanCrustCoolingLaw)
+		{
+			return Record.ElevationSeedKm;
+		}
+
+		const double RidgeElevationKm = Config.OceanicRidgeElevationKm;
+		const double AbyssalElevationKm = Config.OceanicAbyssalPlainElevationKm;
+		const double MinElevationKm = FMath::Min(RidgeElevationKm, AbyssalElevationKm);
+		const double MaxElevationKm = FMath::Max(RidgeElevationKm, AbyssalElevationKm);
+		const double CooledElevationKm =
+			RidgeElevationKm - (Config.OceanicElevationDampingKmPerMy * FMath::Max(0.0, Record.AgeMy));
+		return FMath::Clamp(CooledElevationKm, MinElevationKm, MaxElevationKm);
 	}
 
 	uint32 HashProjectionDiagnosticsForTest(const FTectonicSidecarProjectionDiagnostics& D)
@@ -903,6 +926,14 @@ namespace
 			0.0f,
 			10.0f,
 			FPaths::Combine(OutputDirectory, TEXT("OceanCrustThickness.png")));
+		bExported &= ExportScalarOverlayFromFloats(
+			Test,
+			Prefix,
+			Planet,
+			Sidecar.GetLastOceanCrustElevationsKm(),
+			-6.0f,
+			-1.0f,
+			FPaths::Combine(OutputDirectory, TEXT("OceanCrustElevation.png")));
 		bExported &= ExportScalarOverlayFromBytes(
 			Test,
 			Prefix,
@@ -923,6 +954,7 @@ namespace
 		const TCHAR* MandatoryOverlayNames[] = {
 			TEXT("OceanCrustAge.png"),
 			TEXT("OceanCrustThickness.png"),
+			TEXT("OceanCrustElevation.png"),
 			TEXT("OceanCrustId.png"),
 			TEXT("CrustEventOverlay.png"),
 			TEXT("DivergentBoundary.png")
@@ -1171,6 +1203,7 @@ namespace
 		int32 NonFiniteDFieldCount = 0;
 		int32 AgeMismatchCount = 0;
 		int32 ThicknessOutOfBoundsCount = 0;
+		int32 ElevationMismatchCount = 0;
 		int32 ElevationOutOfBoundsCount = 0;
 		int32 HighCWOverlapCount = 0;
 		int32 HighCWOverwriteCount = 0;
@@ -1178,6 +1211,11 @@ namespace
 		double MaterialMismatchOverlapFraction = 0.0;
 		double MeanAgeMy = 0.0;
 		double MaxAgeMy = 0.0;
+		double MeanYoungElevationKm = 0.0;
+		double MeanMatureElevationKm = 0.0;
+		int32 YoungCrustSampleCount = 0;
+		int32 MatureCrustSampleCount = 0;
+		bool bAgeElevationCorrelationNegative = false;
 	};
 
 	FDVisualProjectionStats ComputeDVisualProjectionStats(
@@ -1198,11 +1236,17 @@ namespace
 		const TArray<int32>& CrustIds = Sidecar.GetLastOceanCrustIds();
 		const TArray<float>& CrustAgesMy = Sidecar.GetLastOceanCrustAgesMy();
 		const TArray<float>& CrustThicknessKm = Sidecar.GetLastOceanCrustThicknessKm();
+		const TArray<float>& CrustElevationsKm = Sidecar.GetLastOceanCrustElevationsKm();
 		const TArray<uint8>& MaterialMismatchFlags = Sidecar.GetLastMaterialOwnerMismatchFlags();
 		const double DeltaTimeMy = Sidecar.GetConfig().DeltaTimeMy;
 		const float OverlayContinentalWeightThreshold =
 			static_cast<float>(Sidecar.GetConfig().OverlayContinentalWeightThreshold);
 		double TotalAgeMy = 0.0;
+		double TotalYoungElevationKm = 0.0;
+		double TotalMatureElevationKm = 0.0;
+		double TotalElevationKm = 0.0;
+		double TotalAgeSquared = 0.0;
+		double TotalAgeElevation = 0.0;
 
 		for (int32 SampleIndex = 0; SampleIndex < Projected.Samples.Num(); ++SampleIndex)
 		{
@@ -1233,8 +1277,10 @@ namespace
 			const bool bOverlayFieldsFinite =
 				CrustAgesMy.IsValidIndex(SampleIndex) &&
 				CrustThicknessKm.IsValidIndex(SampleIndex) &&
+				CrustElevationsKm.IsValidIndex(SampleIndex) &&
 				FMath::IsFinite(CrustAgesMy[SampleIndex]) &&
-				FMath::IsFinite(CrustThicknessKm[SampleIndex]);
+				FMath::IsFinite(CrustThicknessKm[SampleIndex]) &&
+				FMath::IsFinite(CrustElevationsKm[SampleIndex]);
 			if (!bProjectedFieldsFinite || !bOverlayFieldsFinite)
 			{
 				++Stats.NonFiniteDFieldCount;
@@ -1254,7 +1300,22 @@ namespace
 			{
 				++Stats.ThicknessOutOfBoundsCount;
 			}
-			if (ProjectedSample.Elevation < -1.1f || ProjectedSample.Elevation > -0.9f)
+			const double ExpectedElevationKm =
+				ComputeExpectedOceanCrustElevationForTest(Sidecar.GetConfig(), *Record);
+			if (FMath::Abs(static_cast<double>(ProjectedSample.Elevation) - ExpectedElevationKm) >= 1.0e-6 ||
+				!CrustElevationsKm.IsValidIndex(SampleIndex) ||
+				FMath::Abs(static_cast<double>(CrustElevationsKm[SampleIndex]) - ExpectedElevationKm) >= 1.0e-6)
+			{
+				++Stats.ElevationMismatchCount;
+			}
+			const double MinCoolingElevationKm = FMath::Min(
+				Sidecar.GetConfig().OceanicRidgeElevationKm,
+				Sidecar.GetConfig().OceanicAbyssalPlainElevationKm);
+			const double MaxCoolingElevationKm = FMath::Max(
+				Sidecar.GetConfig().OceanicRidgeElevationKm,
+				Sidecar.GetConfig().OceanicAbyssalPlainElevationKm);
+			if (ProjectedSample.Elevation < static_cast<float>(MinCoolingElevationKm - 1.0e-4) ||
+				ProjectedSample.Elevation > static_cast<float>(MaxCoolingElevationKm + 1.0e-4))
 			{
 				++Stats.ElevationOutOfBoundsCount;
 			}
@@ -1275,7 +1336,20 @@ namespace
 			}
 
 			TotalAgeMy += static_cast<double>(ProjectedSample.Age);
+			TotalElevationKm += static_cast<double>(ProjectedSample.Elevation);
+			TotalAgeSquared += static_cast<double>(ProjectedSample.Age) * static_cast<double>(ProjectedSample.Age);
+			TotalAgeElevation += static_cast<double>(ProjectedSample.Age) * static_cast<double>(ProjectedSample.Elevation);
 			Stats.MaxAgeMy = FMath::Max(Stats.MaxAgeMy, static_cast<double>(ProjectedSample.Age));
+			if (ProjectedSample.Age <= 25.0f)
+			{
+				++Stats.YoungCrustSampleCount;
+				TotalYoungElevationKm += static_cast<double>(ProjectedSample.Elevation);
+			}
+			if (ProjectedSample.Age >= 125.0f)
+			{
+				++Stats.MatureCrustSampleCount;
+				TotalMatureElevationKm += static_cast<double>(ProjectedSample.Elevation);
+			}
 		}
 
 		if (Stats.ProjectedCrustSampleCount > 0)
@@ -1284,6 +1358,26 @@ namespace
 			Stats.MaterialMismatchOverlapFraction =
 				static_cast<double>(Stats.MaterialMismatchOverlapCount) /
 				static_cast<double>(Stats.ProjectedCrustSampleCount);
+			const double SampleCount = static_cast<double>(Stats.ProjectedCrustSampleCount);
+			const double AgeMean = TotalAgeMy / SampleCount;
+			const double ElevationMean = TotalElevationKm / SampleCount;
+			const double AgeElevationCovariance =
+				(TotalAgeElevation / SampleCount) - (AgeMean * ElevationMean);
+			const double AgeVariance = (TotalAgeSquared / SampleCount) - (AgeMean * AgeMean);
+			Stats.bAgeElevationCorrelationNegative =
+				Stats.ProjectedCrustSampleCount >= 2 &&
+				AgeVariance > 1.0e-9 &&
+				AgeElevationCovariance < 0.0;
+		}
+		if (Stats.YoungCrustSampleCount > 0)
+		{
+			Stats.MeanYoungElevationKm =
+				TotalYoungElevationKm / static_cast<double>(Stats.YoungCrustSampleCount);
+		}
+		if (Stats.MatureCrustSampleCount > 0)
+		{
+			Stats.MeanMatureElevationKm =
+				TotalMatureElevationKm / static_cast<double>(Stats.MatureCrustSampleCount);
 		}
 
 		TArray<uint8> Visited;
@@ -1532,8 +1626,12 @@ namespace
 				Stats.ThicknessOutOfBoundsCount,
 				0);
 			Test.TestEqual(
-				FString::Printf(TEXT("%s step %d projected D elevation remains in placeholder bounds"), *Scenario.Label, Checkpoint),
+				FString::Printf(TEXT("%s step %d projected D elevation stays in cooling bounds"), *Scenario.Label, Checkpoint),
 				Stats.ElevationOutOfBoundsCount,
+				0);
+			Test.TestEqual(
+				FString::Printf(TEXT("%s step %d projected D elevation matches independent cooling formula"), *Scenario.Label, Checkpoint),
+				Stats.ElevationMismatchCount,
 				0);
 			Test.TestEqual(
 				FString::Printf(TEXT("%s step %d D crust avoids high-CW material samples"), *Scenario.Label, Checkpoint),
@@ -1557,6 +1655,30 @@ namespace
 			if (Checkpoint > 0)
 			{
 				PostZeroMismatchFractions.Add(Stats.MaterialMismatchOverlapFraction);
+			}
+			if (Checkpoint >= 400 && Stats.ProjectedCrustSampleCount > 0)
+			{
+				Test.TestTrue(
+					FString::Printf(TEXT("%s step %d projected D age/elevation correlation is negative"), *Scenario.Label, Checkpoint),
+					Stats.bAgeElevationCorrelationNegative);
+			}
+			if (Stats.YoungCrustSampleCount > 0)
+			{
+				Test.TestTrue(
+					FString::Printf(TEXT("%s step %d young crust mean elevation %.4f is shallower than -2.25km"),
+						*Scenario.Label,
+						Checkpoint,
+						Stats.MeanYoungElevationKm),
+					Stats.MeanYoungElevationKm > -2.25);
+			}
+			if (Stats.MatureCrustSampleCount > 0)
+			{
+				Test.TestTrue(
+					FString::Printf(TEXT("%s step %d mature crust mean elevation %.4f is abyssal"),
+						*Scenario.Label,
+						Checkpoint,
+						Stats.MeanMatureElevationKm),
+					Stats.MeanMatureElevationKm < -5.75);
 			}
 
 			if (Checkpoint == 0)
@@ -1665,7 +1787,7 @@ namespace
 			const double CheckpointSeconds = FPlatformTime::Seconds() - CheckpointStartSeconds;
 			const double ElapsedSeconds = FPlatformTime::Seconds() - ScenarioStartSeconds;
 			Test.AddInfo(FString::Printf(
-				TEXT("[SidecarPrototypeDLongHorizon] label=%s sample_count=%d step=%d advance_seconds=%.3f checkpoint_seconds=%.3f elapsed_seconds=%.3f used_physical_mb=%.2f used_virtual_mb=%.2f birth_edges=%d crust_samples=%d component_count=%d components_per_1000=%.3f top_components=%d,%d,%d largest_component_fraction=%.5f top3_component_fraction=%.5f tiny_component_max=%d tiny_component_count=%d tiny_component_samples=%d tiny_component_fraction=%.5f crust_records=%d events=%d mismatch_overlap_fraction=%.5f area_km2=%.3f mean_age_my=%.3f max_age_my=%.3f"),
+				TEXT("[SidecarPrototypeDLongHorizon] label=%s sample_count=%d step=%d advance_seconds=%.3f checkpoint_seconds=%.3f elapsed_seconds=%.3f used_physical_mb=%.2f used_virtual_mb=%.2f birth_edges=%d crust_samples=%d component_count=%d components_per_1000=%.3f top_components=%d,%d,%d largest_component_fraction=%.5f top3_component_fraction=%.5f tiny_component_max=%d tiny_component_count=%d tiny_component_samples=%d tiny_component_fraction=%.5f crust_records=%d events=%d mismatch_overlap_fraction=%.5f area_km2=%.3f mean_age_my=%.3f max_age_my=%.3f young_count=%d young_mean_elev_km=%.3f mature_count=%d mature_mean_elev_km=%.3f"),
 				*Scenario.Label,
 				Scenario.SampleCount,
 				Checkpoint,
@@ -1692,7 +1814,11 @@ namespace
 				Stats.MaterialMismatchOverlapFraction,
 				TotalAreaKm2,
 				Stats.MeanAgeMy,
-				Stats.MaxAgeMy));
+				Stats.MaxAgeMy,
+				Stats.YoungCrustSampleCount,
+				Stats.MeanYoungElevationKm,
+				Stats.MatureCrustSampleCount,
+				Stats.MeanMatureElevationKm));
 
 			PreviousTotalAreaKm2 = TotalAreaKm2;
 			PreviousCrustRecordCount = EventSidecar.GetOceanCrustStore().Num();
@@ -3109,6 +3235,11 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Prototype D config ridge generation gap defaults to 5 steps"), Config.RidgeGenerationGapSteps, 5);
 	TestEqual(TEXT("Prototype D config overlay continental threshold defaults to 0.5"), Config.OverlayContinentalWeightThreshold, 0.5);
 	TestEqual(TEXT("Prototype D ocean crust projection defaults off"), Config.bEnableDOceanCrustProjection, false);
+	TestEqual(TEXT("Prototype D ocean crust cooling defaults on"), Config.bEnableDOceanCrustCoolingLaw, true);
+	TestEqual(TEXT("Prototype D ocean crust ridge elevation defaults to -1km"), Config.OceanicRidgeElevationKm, -1.0);
+	TestEqual(TEXT("Prototype D ocean crust abyssal elevation defaults to -6km"), Config.OceanicAbyssalPlainElevationKm, -6.0);
+	TestEqual(TEXT("Prototype D ocean crust cooling slope defaults to 0.04km/My"), Config.OceanicElevationDampingKmPerMy, 0.04);
+	TestEqual(TEXT("Prototype D ocean crust thickness defaults to 7km"), Config.OceanicCrustThicknessKm, 7.0);
 
 	FTectonicPlanetSidecar EmptyA;
 	FTectonicPlanetSidecar EmptyB;
@@ -3147,17 +3278,22 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 		int32 NonBackgroundCrustIds = 0;
 		int32 NonBackgroundCrustAges = 0;
 		int32 NonBackgroundCrustThickness = 0;
+		int32 NonBackgroundCrustElevation = 0;
 		int32 NonBackgroundCrustEvents = 0;
 		for (int32 SampleIndex = 0; SampleIndex < EmptyProjectedA.Samples.Num(); ++SampleIndex)
 		{
 			NonBackgroundCrustIds += EmptyA.GetLastOceanCrustIds()[SampleIndex] != INDEX_NONE ? 1 : 0;
 			NonBackgroundCrustAges += EmptyA.GetLastOceanCrustAgesMy()[SampleIndex] != 0.0f ? 1 : 0;
 			NonBackgroundCrustThickness += EmptyA.GetLastOceanCrustThicknessKm()[SampleIndex] != 0.0f ? 1 : 0;
+			NonBackgroundCrustElevation +=
+				EmptyA.GetLastOceanCrustElevationsKm()[SampleIndex] !=
+				static_cast<float>(Config.OceanicAbyssalPlainElevationKm) ? 1 : 0;
 			NonBackgroundCrustEvents += EmptyA.GetLastCrustEventOverlayFlags()[SampleIndex] != 0 ? 1 : 0;
 		}
 		TestEqual(TEXT("Prototype D empty ocean crust id overlay is uniform background"), NonBackgroundCrustIds, 0);
 		TestEqual(TEXT("Prototype D empty ocean crust age overlay is uniform background"), NonBackgroundCrustAges, 0);
 		TestEqual(TEXT("Prototype D empty ocean crust thickness overlay is uniform background"), NonBackgroundCrustThickness, 0);
+		TestEqual(TEXT("Prototype D empty ocean crust elevation overlay is uniform background"), NonBackgroundCrustElevation, 0);
 		TestEqual(TEXT("Prototype D empty crust event overlay is uniform background"), NonBackgroundCrustEvents, 0);
 	}
 
@@ -3544,8 +3680,14 @@ bool FTectonicPlanetSidecarPrototypeDTest::RunTest(const FString& Parameters)
 					TestTrue(TEXT("Prototype D thickness overlay uses Slice 2 placeholder bounds"),
 						EventSidecar.GetLastOceanCrustThicknessKm()[SampleIndex] >= 6.9f &&
 						EventSidecar.GetLastOceanCrustThicknessKm()[SampleIndex] <= 7.1f);
-					TestTrue(TEXT("Prototype D projected elevation uses Slice 2 placeholder bounds"),
-						ProjectedSample.Elevation >= -1.1f && ProjectedSample.Elevation <= -0.9f);
+					const double ExpectedElevationKm =
+						ComputeExpectedOceanCrustElevationForTest(EventConfig, *Record);
+					TestTrue(TEXT("Prototype D projected elevation matches independent cooling formula"),
+						FMath::Abs(static_cast<double>(ProjectedSample.Elevation) - ExpectedElevationKm) < 1.0e-6);
+					TestTrue(TEXT("Prototype D elevation overlay matches independent cooling formula"),
+						EventSidecar.GetLastOceanCrustElevationsKm().IsValidIndex(SampleIndex) &&
+						FMath::Abs(static_cast<double>(EventSidecar.GetLastOceanCrustElevationsKm()[SampleIndex]) -
+							ExpectedElevationKm) < 1.0e-6);
 				}
 			}
 		}
@@ -3727,8 +3869,12 @@ bool FTectonicPlanetSidecarPrototypeDVisualGateTest::RunTest(const FString& Para
 			Stats.ThicknessOutOfBoundsCount,
 			0);
 		TestEqual(
-			FString::Printf(TEXT("Prototype D visual step %d projected D elevation remains in placeholder bounds"), Checkpoint),
+			FString::Printf(TEXT("Prototype D visual step %d projected D elevation stays in cooling bounds"), Checkpoint),
 			Stats.ElevationOutOfBoundsCount,
+			0);
+		TestEqual(
+			FString::Printf(TEXT("Prototype D visual step %d projected D elevation matches independent cooling formula"), Checkpoint),
+			Stats.ElevationMismatchCount,
 			0);
 		TestEqual(
 			FString::Printf(TEXT("Prototype D visual step %d D crust avoids high-CW material samples"), Checkpoint),
@@ -3760,6 +3906,12 @@ bool FTectonicPlanetSidecarPrototypeDVisualGateTest::RunTest(const FString& Para
 					Checkpoint,
 					Stats.TinyCrustComponentSampleFraction),
 				Stats.TinyCrustComponentSampleFraction <= 0.10);
+		}
+		if (Checkpoint >= 400 && Stats.ProjectedCrustSampleCount > 0)
+		{
+			TestTrue(
+				FString::Printf(TEXT("Prototype D visual step %d projected D age/elevation correlation is negative"), Checkpoint),
+				Stats.bAgeElevationCorrelationNegative);
 		}
 
 		TestTrue(
@@ -3809,7 +3961,7 @@ bool FTectonicPlanetSidecarPrototypeDVisualGateTest::RunTest(const FString& Para
 			ExportSidecarDVisualGateMaps(*this, EventSidecar, Projected, Checkpoint, TEXT("visual_60k40")));
 
 		AddInfo(FString::Printf(
-			TEXT("[SidecarPrototypeDVisualGate] label=visual_60k40 step=%d birth_edges=%d crust_samples=%d component_count=%d components_per_1000=%.3f top_components=%d,%d,%d largest_component_fraction=%.5f top3_component_fraction=%.5f tiny_component_max=%d tiny_component_count=%d tiny_component_samples=%d tiny_component_fraction=%.5f crust_records=%d events=%d mismatch_overlap_fraction=%.5f area_km2=%.3f mean_age_my=%.3f max_age_my=%.3f"),
+			TEXT("[SidecarPrototypeDVisualGate] label=visual_60k40 step=%d birth_edges=%d crust_samples=%d component_count=%d components_per_1000=%.3f top_components=%d,%d,%d largest_component_fraction=%.5f top3_component_fraction=%.5f tiny_component_max=%d tiny_component_count=%d tiny_component_samples=%d tiny_component_fraction=%.5f crust_records=%d events=%d mismatch_overlap_fraction=%.5f area_km2=%.3f mean_age_my=%.3f max_age_my=%.3f young_count=%d young_mean_elev_km=%.3f mature_count=%d mature_mean_elev_km=%.3f"),
 			Checkpoint,
 			SumOceanCrustBirthEdgeCount(EventSidecar.GetOceanCrustStore()),
 			Stats.ProjectedCrustSampleCount,
@@ -3829,7 +3981,11 @@ bool FTectonicPlanetSidecarPrototypeDVisualGateTest::RunTest(const FString& Para
 			Stats.MaterialMismatchOverlapFraction,
 			TotalAreaKm2,
 			Stats.MeanAgeMy,
-			Stats.MaxAgeMy));
+			Stats.MaxAgeMy,
+			Stats.YoungCrustSampleCount,
+			Stats.MeanYoungElevationKm,
+			Stats.MatureCrustSampleCount,
+			Stats.MeanMatureElevationKm));
 	}
 
 	{
@@ -3873,6 +4029,7 @@ bool FTectonicPlanetSidecarPrototypeDVisualGateTest::RunTest(const FString& Para
 			int32 NonBackgroundCrustIds = 0;
 			int32 NonBackgroundCrustAges = 0;
 			int32 NonBackgroundCrustThickness = 0;
+			int32 NonBackgroundCrustElevation = 0;
 			int32 NonBackgroundCrustEvents = 0;
 			for (int32 SampleIndex = 0; SampleIndex < Projected.Samples.Num(); ++SampleIndex)
 			{
@@ -3885,6 +4042,10 @@ bool FTectonicPlanetSidecarPrototypeDVisualGateTest::RunTest(const FString& Para
 				NonBackgroundCrustThickness +=
 					BelowThresholdSidecar.GetLastOceanCrustThicknessKm().IsValidIndex(SampleIndex) &&
 					BelowThresholdSidecar.GetLastOceanCrustThicknessKm()[SampleIndex] != 0.0f ? 1 : 0;
+				NonBackgroundCrustElevation +=
+					BelowThresholdSidecar.GetLastOceanCrustElevationsKm().IsValidIndex(SampleIndex) &&
+					BelowThresholdSidecar.GetLastOceanCrustElevationsKm()[SampleIndex] !=
+					static_cast<float>(BelowThresholdConfig.OceanicAbyssalPlainElevationKm) ? 1 : 0;
 				NonBackgroundCrustEvents +=
 					BelowThresholdSidecar.GetLastCrustEventOverlayFlags().IsValidIndex(SampleIndex) &&
 					BelowThresholdSidecar.GetLastCrustEventOverlayFlags()[SampleIndex] != 0 ? 1 : 0;
@@ -3900,6 +4061,10 @@ bool FTectonicPlanetSidecarPrototypeDVisualGateTest::RunTest(const FString& Para
 			TestEqual(
 				FString::Printf(TEXT("Prototype D below-threshold visual step %d thickness overlay remains background"), Checkpoint),
 				NonBackgroundCrustThickness,
+				0);
+			TestEqual(
+				FString::Printf(TEXT("Prototype D below-threshold visual step %d elevation overlay remains background"), Checkpoint),
+				NonBackgroundCrustElevation,
 				0);
 			TestEqual(
 				FString::Printf(TEXT("Prototype D below-threshold visual step %d event overlay remains background"), Checkpoint),

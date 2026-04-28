@@ -555,6 +555,19 @@ bool ATectonicPlanetSidecarActor::ExportCurrentMaps(
 			return false;
 		}
 
+		if (!ExportScalarOverlayFromFloats(
+			ProjectedPlanet,
+			Sidecar.GetLastOceanCrustElevationsKm(),
+			-6.0f,
+			-1.0f,
+			FPaths::Combine(OutDirectory, TEXT("OceanCrustElevation.png")),
+			Width,
+			Height,
+			OutError))
+		{
+			return false;
+		}
+
 		if (!ExportScalarOverlayFromBytes(
 			ProjectedPlanet,
 			Sidecar.GetLastCrustEventOverlayFlags(),

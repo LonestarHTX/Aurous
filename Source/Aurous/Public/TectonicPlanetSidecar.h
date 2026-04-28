@@ -56,6 +56,11 @@ struct AUROUS_API FTectonicSidecarConfig
 	bool bEnableDivergentSpreadingEvents = false;
 	double DivergentSpreadingMinKmPerMy = 10.0;
 	bool bEnableDOceanCrustProjection = false;
+	bool bEnableDOceanCrustCoolingLaw = true;
+	double OceanicRidgeElevationKm = -1.0;
+	double OceanicAbyssalPlainElevationKm = -6.0;
+	double OceanicElevationDampingKmPerMy = 0.04;
+	double OceanicCrustThicknessKm = 7.0;
 	bool bForceExplicitProjectionAtRestForTest = false;
 };
 
@@ -229,6 +234,7 @@ public:
 	const TArray<int32>& GetLastOceanCrustIds() const { return LastOceanCrustIds; }
 	const TArray<float>& GetLastOceanCrustAgesMy() const { return LastOceanCrustAgesMy; }
 	const TArray<float>& GetLastOceanCrustThicknessKm() const { return LastOceanCrustThicknessKm; }
+	const TArray<float>& GetLastOceanCrustElevationsKm() const { return LastOceanCrustElevationsKm; }
 	const TArray<uint8>& GetLastCrustEventOverlayFlags() const { return LastCrustEventOverlayFlags; }
 	const FSidecarOceanCrustStore& GetOceanCrustStore() const { return OceanCrustStore; }
 	const FSidecarCrustEventLog& GetCrustEventLog() const { return CrustEventLog; }
@@ -281,6 +287,7 @@ private:
 	mutable TArray<int32> LastOceanCrustIds;
 	mutable TArray<float> LastOceanCrustAgesMy;
 	mutable TArray<float> LastOceanCrustThicknessKm;
+	mutable TArray<float> LastOceanCrustElevationsKm;
 	mutable TArray<uint8> LastCrustEventOverlayFlags;
 	int32 CurrentStep = 0;
 

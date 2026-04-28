@@ -80,6 +80,25 @@ namespace
 		double VisibleProjectedContinentalMass = 0.0;
 	};
 
+	double ComputeOceanCrustCoolingElevationKm(
+		const FTectonicSidecarConfig& Config,
+		const double AgeMy,
+		const double FallbackElevationKm)
+	{
+		if (!Config.bEnableDOceanCrustCoolingLaw)
+		{
+			return FallbackElevationKm;
+		}
+
+		const double RidgeElevationKm = Config.OceanicRidgeElevationKm;
+		const double AbyssalElevationKm = Config.OceanicAbyssalPlainElevationKm;
+		const double MinElevationKm = FMath::Min(RidgeElevationKm, AbyssalElevationKm);
+		const double MaxElevationKm = FMath::Max(RidgeElevationKm, AbyssalElevationKm);
+		const double CoolingElevationKm =
+			RidgeElevationKm - (Config.OceanicElevationDampingKmPerMy * FMath::Max(0.0, AgeMy));
+		return FMath::Clamp(CoolingElevationKm, MinElevationKm, MaxElevationKm);
+	}
+
 	double AngularDistanceRad(const FVector3d& A, const FVector3d& B)
 	{
 		const double Dot = FVector3d::DotProduct(A.GetSafeNormal(), B.GetSafeNormal());
@@ -1324,6 +1343,11 @@ uint32 FTectonicPlanetSidecar::ComputeSidecarAuthorityHash() const
 	Hash = HashSidecarValue(Hash, Config.bEnableDivergentSpreadingEvents ? 1u : 0u);
 	HashSidecarDouble(Hash, Config.DivergentSpreadingMinKmPerMy);
 	Hash = HashSidecarValue(Hash, Config.bEnableDOceanCrustProjection ? 1u : 0u);
+	Hash = HashSidecarValue(Hash, Config.bEnableDOceanCrustCoolingLaw ? 1u : 0u);
+	HashSidecarDouble(Hash, Config.OceanicRidgeElevationKm);
+	HashSidecarDouble(Hash, Config.OceanicAbyssalPlainElevationKm);
+	HashSidecarDouble(Hash, Config.OceanicElevationDampingKmPerMy);
+	HashSidecarDouble(Hash, Config.OceanicCrustThicknessKm);
 	Hash = HashSidecarValue(Hash, Config.bForceExplicitProjectionAtRestForTest ? 1u : 0u);
 	HashSidecarInt32(Hash, CurrentStep);
 
@@ -1787,6 +1811,8 @@ void FTectonicPlanetSidecar::ApplyDivergentSpreadingEventsForCurrentStep()
 			EventInput.RidgeDirection = NormalizeOrFallback(
 				WeightedRidgeDirection,
 				EventInput.BirthEdges[0].BoundaryNormal);
+			EventInput.OceanicThicknessKm = Config.OceanicCrustThicknessKm;
+			EventInput.ElevationSeedKm = Config.OceanicRidgeElevationKm;
 			ApplyDivergentSpreadingEvent(
 				OceanCrustStore,
 				CrustEventLog,
@@ -2381,7 +2407,6 @@ void FTectonicPlanetSidecar::Phase3ProjectPersistentOceanCrust(FTectonicPlanet& 
 		return;
 	}
 
-	const double CurrentTimeMy = static_cast<double>(CurrentStep) * Config.DeltaTimeMy;
 	for (const FSidecarOceanCrustRecord& Record : OceanCrustStore.Records)
 	{
 		TArray<int32> CandidateSamples = Record.DebugSampleIds;
@@ -2424,9 +2449,12 @@ void FTectonicPlanetSidecar::Phase3ProjectPersistentOceanCrust(FTectonicPlanet& 
 		}
 		CandidateSamples.SetNum(WriteIndex);
 
-		const float ProjectedAgeMy = static_cast<float>(FMath::Max(0.0, CurrentTimeMy - Record.BirthTimeMy));
-		const float ProjectedThicknessKm = static_cast<float>(Record.ThicknessKm);
-		const float ProjectedElevationKm = static_cast<float>(Record.ElevationSeedKm);
+		const float ProjectedAgeMy = static_cast<float>(FMath::Max(0.0, Record.AgeMy));
+		const float ProjectedThicknessKm = static_cast<float>(Config.OceanicCrustThicknessKm);
+		const float ProjectedElevationKm = static_cast<float>(ComputeOceanCrustCoolingElevationKm(
+			Config,
+			Record.AgeMy,
+			Record.ElevationSeedKm));
 		for (const int32 SampleIndex : CandidateSamples)
 		{
 			FSample& Sample = InOutPlanet.Samples[SampleIndex];
@@ -2461,6 +2489,10 @@ void FTectonicPlanetSidecar::Phase3ProjectPersistentOceanCrust(FTectonicPlanet& 
 			if (LastOceanCrustThicknessKm.IsValidIndex(SampleIndex))
 			{
 				LastOceanCrustThicknessKm[SampleIndex] = ProjectedThicknessKm;
+			}
+			if (LastOceanCrustElevationsKm.IsValidIndex(SampleIndex))
+			{
+				LastOceanCrustElevationsKm[SampleIndex] = ProjectedElevationKm;
 			}
 			if (LastCrustEventOverlayFlags.IsValidIndex(SampleIndex))
 			{
@@ -3321,5 +3353,6 @@ void FTectonicPlanetSidecar::ResetLastProjectionDebug(const int32 SampleCount) c
 	LastOceanCrustIds.Init(INDEX_NONE, SampleCount);
 	LastOceanCrustAgesMy.Init(0.0f, SampleCount);
 	LastOceanCrustThicknessKm.Init(0.0f, SampleCount);
+	LastOceanCrustElevationsKm.Init(static_cast<float>(Config.OceanicAbyssalPlainElevationKm), SampleCount);
 	LastCrustEventOverlayFlags.Init(0, SampleCount);
 }

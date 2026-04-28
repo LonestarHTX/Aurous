@@ -1,16 +1,24 @@
 # Aurous Project State
 
-Last update: 2026-04-27
+Last update: 2026-04-28
 Baseline commit: `0ff3ff0` (`Harden Prototype C freeze invariants`)
 Active branch at update time: `codex/sidecar-c-actor-control-panel`
 
 ## Active Architecture
 
 Prototype C is the active foundation: Voronoi ownership plus decoupled material
-inside the plate-authoritative sidecar.
+inside the plate-authoritative sidecar. Prototype D is active on top of C for
+persistent divergent ocean crust through Slice 6: event-owned crust identity,
+projection overlays, long-horizon stress evidence, and paper-cited linear
+age-derived ocean-crust cooling.
 
 Canonical contract:
 `docs/architecture/decisions/0001-c-freeze-voronoi-ownership-decoupled-material.md`
+
+D contracts:
+
+- `docs/architecture/decisions/0002-d-persistent-divergent-ocean-crust.md`
+- `docs/architecture/decisions/0003-d-oceanic-crust-cooling-law.md`
 
 Short version:
 
@@ -25,6 +33,8 @@ Short version:
 
 Prototype C freeze tests pass at the baseline commit.
 
+Prototype D Slice 6 passes local validation on the active branch.
+
 Validated evidence:
 
 - `AurousEditor` builds.
@@ -35,12 +45,25 @@ Validated evidence:
 - C exports exist for 250k/40 smoke at step 40.
 - All mandatory C overlays are exported: material classification, material source,
   material/owner mismatch, material overlap, and divergent boundary.
+- `Aurous.TectonicPlanet.SidecarPrototypeD` passes with the exact anchored
+  automation filter `^Aurous.TectonicPlanet.SidecarPrototypeD$`.
+- `Aurous.TectonicPlanet.SidecarPrototypeDVisualGate` passes and exports D
+  overlays through step 400.
+- `Aurous.TectonicPlanet.SidecarPrototypeDLongHorizon` passes 60k/40 through
+  step 1000.
+- Slice 6 exports `OceanCrustElevation.png` and validates projected D elevation
+  against `clamp(-1.0 - 0.04 * AgeMy, -6.0, -1.0)`.
+- Visual review verified the cooling gradient: young ridge crust is bright and
+  older abyssal crust darkens as expected.
 
 Key hardening metrics:
 
 | Metric | Value |
 | --- | --- |
 | C automation runtime | about 32 seconds |
+| D exact automation runtime | about 30 seconds |
+| D visual gate runtime | about 87 seconds |
+| D long-horizon 60k/40 runtime | about 110 seconds |
 | Rigid expected drift | 5600.00 km |
 | Rigid projected error | 4.88 km |
 | Rigid projected tolerance | 368.81 km |
@@ -53,16 +76,16 @@ Key hardening metrics:
 
 Priority order:
 
-1. Implement Prototype D Slice 1 from ADR 0002: persistent state model, event
-   log, authority hash, and idempotence tests only.
-2. Keep C invariants green while D state exists.
-3. Defer event detection, D projection, and D exports until later D slices.
-4. Implement persistent divergent ocean crust identity, age, and thickness only
-   after Slice 1 passes.
+1. Draft the next ADR for Prototype E: subduction / crust consumption.
+2. Preserve C invariants while adding any E behavior.
+3. Treat D balance limits as expected until subduction exists; D creates crust
+   and does not consume it.
+4. Decide whether 5b high-resolution D long-horizon evidence is needed before E.
 5. Track, but do not rush, extraction of C into its own class once A/B can be deprecated.
 
-Prototype C does not solve persistent ocean crust, age gradients, thickness
-accumulation, subduction, collision, rifting, uplift, erosion, or long-horizon
+Prototype C does not solve persistent ocean crust. Prototype D now solves the
+first persistent divergent-ocean-crust slice, including age-derived cooling, but
+does not solve subduction, collision, rifting, uplift, erosion, or long-horizon
 land/ocean balance.
 
 ## Reproduce The C Baseline
@@ -121,6 +144,24 @@ Slice 5b:
   - `Saved/MapExports/SidecarPrototypeD/long_horizon_250k40/`
   - `Saved/MapExports/SidecarPrototypeD/long_horizon_500k40/`
 
+## Reproduce The D Cooling-Law Gate
+
+1. Build `AurousEditor`.
+2. Run the exact core D filter:
+   - `^Aurous.TectonicPlanet.SidecarPrototypeD$`
+3. Run:
+   - `Aurous.TectonicPlanet.SidecarPrototypeDVisualGate`
+   - `Aurous.TectonicPlanet.SidecarPrototypeDLongHorizon`
+4. Confirm `OceanCrustElevation.png` exists in the D visual and long-horizon
+   checkpoint exports.
+5. Generate contact sheets with `$aurous-overlay-contactsheet`. The standard
+   contact sheet includes `OceanCrustElevation.png`.
+6. Interpret black in `OceanCrustElevation.png` by cross-referencing
+   `OceanCrustAge.png` or `OceanCrustId.png`: black can mean either no projected
+   D crust or abyssal D crust at `-6 km`.
+7. Verify the visual gradient: young ridge crust should be bright and old crust
+   should darken toward abyssal depth.
+
 ## Repository Hygiene Snapshot
 
 Last checked: 2026-04-27.
@@ -143,18 +184,20 @@ Last checked: 2026-04-27.
 
 ## Resolution Coverage
 
-| Resolution | Current C coverage |
+| Resolution | Current C/D coverage |
 | --- | --- |
-| 60k/40 | Freeze tests and checkpoints 0/100/200/400 exported |
+| 60k/40 | C freeze tests and D Slice 6 visual/long-horizon checkpoints exported |
 | 100k | Not yet run on C |
 | 250k/40 | Smoke step 40 exported and validated |
-| 500k | Not yet run on C |
+| 500k | D high-res long-horizon artifacts exist from Slice 5b, but 5b is confidence evidence rather than a Slice 6 blocker |
 
 ## Reading Order
 
 1. `docs/STATE.md`
 2. `docs/architecture/decisions/0001-c-freeze-voronoi-ownership-decoupled-material.md`
-3. `docs/tectonic-minimal-acceptance-tests.md`
-4. `docs/tectonic-architecture-failure-memo-2026-04.md`
-5. `docs/tectonic-architecture-reset-plate-authoritative-prototype.md`
-6. `docs/ProceduralTectonicPlanets.txt`
+3. `docs/architecture/decisions/0002-d-persistent-divergent-ocean-crust.md`
+4. `docs/architecture/decisions/0003-d-oceanic-crust-cooling-law.md`
+5. `docs/tectonic-minimal-acceptance-tests.md`
+6. `docs/tectonic-architecture-failure-memo-2026-04.md`
+7. `docs/tectonic-architecture-reset-plate-authoritative-prototype.md`
+8. `docs/ProceduralTectonicPlanets.txt`

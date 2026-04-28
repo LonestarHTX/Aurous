@@ -19,6 +19,16 @@
 - Only prune entries Git marks `prunable`.
 - Do not delete branches or worktrees unless the user explicitly asks for that destructive cleanup.
 
+### Local Codex Tooling
+
+- Normal un-escalated Codex shell commands are expected to work on this machine.
+- Prefer `rg`/`fd` for repo search and file discovery; verified tools include `rg`, `fd`, `jq`, `gh`, `clang-format`, `cmake`, `ninja`, and `7z`.
+- `pwsh` should resolve to `C:\Users\Michael\Tools\PowerShell-7.6.1\pwsh.exe`, not the WindowsApps alias.
+- If Windows sandbox execution, `pwsh`, or `rg` regresses, use the global `$codex-windows-toolchain` skill. For `rg` specifically, `$ripgrep-windows` can locate a working executable.
+- For Unreal editor builds, use the global `$unreal-build` skill; it wraps the known-good `Build.bat` command, log path, and editor-process preflight.
+- Other global Aurous/Unreal helpers: `$unreal-tests`, `$unreal-log-triage`, `$aurous-state`, `$aurous-map-exports`, `$aurous-diagnostic-diff`, `$aurous-overlay-contactsheet`, `$aurous-adr-check`, `$aurous-test-metrics`, `$aurous-slice-release`, and `$git-push-verify`.
+- Repo-mirrored copies of the Aurous-specific skills live under `tools/codex-skills/skills`; check or restore them with `tools/codex-skills/Test-AurousCodexSkills.ps1` and `tools/codex-skills/Install-AurousCodexSkills.ps1`.
+
 ### Windows Command Hygiene
 
 - This repo is usually driven from `bash`, but many commands invoke Windows tools. Be explicit about shell boundaries.
